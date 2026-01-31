@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use nimble_bencode::{decode_prefix, Value};
+use nimble_util::hash::sha1;
 
 const METADATA_PIECE_SIZE: usize = 16 * 1024;
 const MAX_METADATA_SIZE: u32 = 2 * 1024 * 1024;
@@ -86,6 +87,10 @@ pub struct UtMetadataState {
     pieces: Vec<Option<Vec<u8>>>,
     received: usize,
     complete: bool,
+}
+
+pub fn verify_metadata_infohash(metadata: &[u8], expected: [u8; 20]) -> bool {
+    sha1(metadata) == expected
 }
 
 impl UtMetadataState {

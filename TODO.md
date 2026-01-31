@@ -276,7 +276,7 @@ Leaving completed TODOs unchecked is considered a bug.
 # J. DHT (BEP-5)
 
 ## J1. Core DHT
-- [ ] J1.1 Node ID generation
+- [x] J1.1 Node ID generation
 - [ ] J1.2 Routing table (k-buckets)
 - [ ] J1.3 RPC encoding/decoding
 - [ ] J1.4 ping

@@ -46,6 +46,7 @@ pub struct MagnetState {
     pub tracker: TrackerState,
     pub peer_manager: PeerManager,
     pub stats: TorrentStats,
+    pub last_dht_query: Option<Instant>,
 }
 
 pub struct TrackerState {
@@ -86,7 +87,7 @@ impl Session {
             (None, None)
         };
 
-        Session {
+        let mut session = Session {
             torrents: HashMap::new(),
             download_dir,
             peer_id: peer_id_20(),
@@ -95,13 +96,94 @@ impl Session {
             dht_socket,
             announce_worker: AnnounceWorker::new(),
             pending_announces: HashSet::new(),
+        };
+
+        if let Err(e) = session.load_saved_torrents() {
+            eprintln!("Failed to load saved torrents: {}", e);
         }
+
+        session
+    }
+
+    fn load_saved_torrents(&mut self) -> Result<()> {
+        let entries = match fs::read_dir(&self.download_dir) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(()),
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension() {
+                if ext == "torrent" {
+                    if let Err(e) = self.load_torrent_from_file(&path) {
+                        eprintln!("Failed to load torrent from {:?}: {}", path, e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn load_torrent_from_file(&mut self, path: &PathBuf) -> Result<()> {
+        let data = fs::read(path)?;
+        let info = parse_torrent(&data)?;
+        let infohash = info.infohash.to_hex();
+
+        if self.torrents.contains_key(&infohash) {
+            return Ok(());
+        }
+
+        let storage = DiskStorage::new(&info, self.download_dir.clone())?;
+
+        let tracker = TrackerState {
+            last_announce: None,
+            next_announce: Some(Instant::now()),
+            interval: Duration::from_secs(1800),
+            peers: Vec::new(),
+        };
+
+        let mut peer_manager = PeerManager::new(
+            *info.infohash.as_bytes(),
+            self.peer_id,
+            info.pieces.len(),
+            info.piece_length,
+            info.total_length,
+        );
+
+        peer_manager.sync_completed_pieces(storage.bitfield());
+
+        let stats = TorrentStats {
+            pieces_total: info.pieces.len() as u32,
+            pieces_completed: storage.bitfield().count_ones() as u32,
+            ..Default::default()
+        };
+
+        let state = ActiveTorrent {
+            info,
+            storage,
+            paused: false,
+            tracker,
+            peer_manager,
+            stats,
+        };
+
+        self.torrents
+            .insert(infohash, TorrentEntry::Active(state));
+        Ok(())
     }
 
     pub fn add_torrent_file(&mut self, path: &str) -> Result<String> {
         let data = fs::read(path)?;
         let info = parse_torrent(&data)?;
         let infohash = info.infohash.to_hex();
+
+        let torrent_save_path = self
+            .download_dir
+            .join(format!("{}.torrent", infohash));
+        if !torrent_save_path.exists() {
+            fs::write(&torrent_save_path, &data)?;
+        }
 
         let storage = DiskStorage::new(&info, self.download_dir.clone())?;
 
@@ -170,6 +252,7 @@ impl Session {
             tracker,
             peer_manager,
             stats,
+            last_dht_query: None,
         };
 
         self.torrents
@@ -272,19 +355,27 @@ impl Session {
         if let Some(dht) = self.dht.as_mut() {
             log_lines.extend(dht.tick());
 
-            for (infohash_hex, torrent) in self.torrents.iter() {
-                let info_hash = match torrent {
-                    TorrentEntry::Active(t) => *t.info.infohash.as_bytes(),
-                    TorrentEntry::Magnet(t) => t.info_hash,
-                };
+            let dht_nodes = dht.known_nodes();
+            for (_infohash_hex, torrent) in self.torrents.iter_mut() {
+                match torrent {
+                    TorrentEntry::Active(t) => {
+                        if !t.paused && t.stats.connected_peers < 10 {
+                            dht.announce_peer(*t.info.infohash.as_bytes());
+                        }
+                    }
+                    TorrentEntry::Magnet(t) => {
+                        if !t.paused && dht_nodes > 0 {
+                            let should_query = match t.last_dht_query {
+                                None => true,
+                                Some(last) => now.duration_since(last) >= Duration::from_secs(5),
+                            };
 
-                let needs_peers = match torrent {
-                    TorrentEntry::Active(t) => !t.paused && t.stats.connected_peers < 10,
-                    TorrentEntry::Magnet(t) => !t.paused && t.stats.connected_peers < 10,
-                };
-
-                if needs_peers {
-                    dht.announce_peer(info_hash);
+                            if should_query {
+                                dht.announce_peer(t.info_hash);
+                                t.last_dht_query = Some(now);
+                            }
+                        }
+                    }
                 }
             }
 

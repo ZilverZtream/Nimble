@@ -6,3 +6,4 @@ pub mod tracker_http;
 pub mod tracker_udp;
 pub mod utp;
 pub mod ut_metadata;
+pub mod ut_pex;

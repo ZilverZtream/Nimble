@@ -83,12 +83,23 @@ impl PeerManager {
 
         let mut pieces_received = Vec::new();
         let mut peers_to_remove = Vec::new();
+        let mut pex_added = HashSet::new();
+        let mut pex_dropped = HashSet::new();
 
         for (&addr, peer) in self.peers.iter_mut() {
             match peer.connection.state() {
                 PeerState::Connected => {
                     match Self::handle_peer_messages(peer, storage, &mut self.piece_picker) {
                         Ok(blocks) => {
+                            if let Some(update) = peer.connection.take_pex_updates() {
+                                for addr in update.added {
+                                    pex_added.insert(addr);
+                                }
+                                for addr in update.dropped {
+                                    pex_dropped.insert(addr);
+                                }
+                            }
+
                             for (index, begin, data) in blocks {
                                 match storage.write_block(index as u64, begin, &data) {
                                     Ok(true) => {
@@ -149,6 +160,14 @@ impl PeerManager {
             }
         }
 
+        if !pex_added.is_empty() {
+            let addrs: Vec<_> = pex_added.into_iter().collect();
+            self.add_peers(&addrs);
+        }
+        if !pex_dropped.is_empty() {
+            self.apply_pex_dropped(&pex_dropped);
+        }
+
         stats.connected_peers = self.peers.len() as u32;
         stats.candidate_peers = self.candidate_peers.len() as u32;
         stats.pieces_completed = storage.bitfield().count_ones() as u32;
@@ -187,6 +206,13 @@ impl PeerManager {
                 }
             }
         }
+    }
+
+    fn apply_pex_dropped(&mut self, dropped: &HashSet<SocketAddrV4>) {
+        if dropped.is_empty() {
+            return;
+        }
+        self.candidate_peers.retain(|addr| !dropped.contains(addr));
     }
 
     fn handle_peer_messages(

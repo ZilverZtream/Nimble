@@ -5,12 +5,13 @@ use std::time::{Duration, Instant};
 
 use crate::extension::{
     create_nimble_handshake, has_extension_bit, set_extension_bit, ExtendedMessage,
-    ExtensionHandshake, ExtensionState, EXTENSION_UT_METADATA,
+    ExtensionHandshake, ExtensionState, EXTENSION_UT_METADATA, EXTENSION_UT_PEX,
 };
 use crate::sockets::TcpSocket;
 use crate::ut_metadata::{
     verify_metadata_infohash, UtMetadataMessage, UtMetadataMessageType, UtMetadataState,
 };
+use crate::ut_pex::parse_pex;
 
 const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
 const HANDSHAKE_LENGTH: usize = 68;
@@ -20,6 +21,7 @@ const BLOCK_SIZE: u32 = 16384;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 const MAX_PENDING_REQUESTS: usize = 16;
 const EXTENDED_MESSAGE_ID: u8 = 20;
+const PEX_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerMessageId {
@@ -214,6 +216,12 @@ pub struct PendingRequest {
     pub sent_at: Instant,
 }
 
+#[derive(Debug, Default)]
+pub struct PexUpdate {
+    pub added: Vec<SocketAddrV4>,
+    pub dropped: Vec<SocketAddrV4>,
+}
+
 pub struct PeerConnection {
     socket: TcpSocket,
     addr: SocketAddrV4,
@@ -239,6 +247,9 @@ pub struct PeerConnection {
     metadata_size: Option<u32>,
     metadata_state: Option<UtMetadataState>,
     metadata: Option<Vec<u8>>,
+    pex_added: Vec<SocketAddrV4>,
+    pex_dropped: Vec<SocketAddrV4>,
+    last_pex_received: Option<Instant>,
 }
 
 impl PeerConnection {
@@ -285,6 +296,9 @@ impl PeerConnection {
             metadata_size,
             metadata_state: None,
             metadata: None,
+            pex_added: Vec::new(),
+            pex_dropped: Vec::new(),
+            last_pex_received: None,
         }
     }
 
@@ -467,6 +481,13 @@ impl PeerConnection {
         if let Some(ut_metadata_id) = self.ut_metadata_peer_id() {
             if ext_type == ut_metadata_id {
                 self.handle_ut_metadata(payload);
+                return;
+            }
+        }
+
+        if let Some(ut_pex_id) = self.ut_pex_peer_id() {
+            if ext_type == ut_pex_id {
+                self.handle_ut_pex(payload);
             }
         }
     }
@@ -475,6 +496,12 @@ impl PeerConnection {
         self.extension_state
             .as_ref()
             .and_then(|state| state.their_id_for(EXTENSION_UT_METADATA))
+    }
+
+    fn ut_pex_peer_id(&self) -> Option<u8> {
+        self.extension_state
+            .as_ref()
+            .and_then(|state| state.their_id_for(EXTENSION_UT_PEX))
     }
 
     fn init_metadata_state(&mut self, size: u32) {
@@ -512,6 +539,29 @@ impl PeerConnection {
                     }
                 }
             }
+        }
+    }
+
+    fn handle_ut_pex(&mut self, payload: &[u8]) {
+        let now = Instant::now();
+        if let Some(last) = self.last_pex_received {
+            if now.duration_since(last) < PEX_MIN_INTERVAL {
+                return;
+            }
+        }
+
+        let msg = match parse_pex(payload) {
+            Ok(msg) => msg,
+            Err(_) => return,
+        };
+
+        self.last_pex_received = Some(now);
+
+        if !msg.added.is_empty() {
+            self.pex_added.extend(msg.added);
+        }
+        if !msg.dropped.is_empty() {
+            self.pex_dropped.extend(msg.dropped);
         }
     }
 
@@ -670,6 +720,17 @@ impl PeerConnection {
             payload: payload.to_vec(),
         };
         self.send_message(&msg)
+    }
+
+    pub fn take_pex_updates(&mut self) -> Option<PexUpdate> {
+        if self.pex_added.is_empty() && self.pex_dropped.is_empty() {
+            return None;
+        }
+
+        Some(PexUpdate {
+            added: std::mem::take(&mut self.pex_added),
+            dropped: std::mem::take(&mut self.pex_dropped),
+        })
     }
 
     pub fn disconnect(&mut self) {

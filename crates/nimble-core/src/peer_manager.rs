@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 const MAX_PEERS_PER_TORRENT: usize = 50;
 const MAX_CONNECT_ATTEMPTS: usize = 5;
+const MAX_CONNECT_PER_TICK: usize = 5;
 const BLOCK_SIZE: u32 = 16384;
 const MAX_PENDING_PER_PEER: usize = 5;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(60);
@@ -211,11 +212,14 @@ impl PeerManager {
     }
 
     fn connect_to_candidates(&mut self) {
-        while self.peers.len() < MAX_PEERS_PER_TORRENT {
+        let mut attempts = 0;
+        while self.peers.len() < MAX_PEERS_PER_TORRENT && attempts < MAX_CONNECT_PER_TICK {
             let addr = match self.candidate_peers.pop_front() {
                 Some(a) => a,
                 None => break,
             };
+
+            attempts += 1;
 
             let mut conn =
                 PeerConnection::new(addr, self.info_hash, self.peer_id, self.piece_count);

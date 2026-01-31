@@ -22,6 +22,12 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 const MAX_PENDING_REQUESTS: usize = 16;
 const EXTENDED_MESSAGE_ID: u8 = 20;
 const PEX_MIN_INTERVAL: Duration = Duration::from_secs(30);
+const TEMP_RECV_BUFFER_SIZE: usize = 8192;
+
+fn is_timeout_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("timed out") || msg.contains("WSAETIMEDOUT") || msg.contains("10060")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecvState {
@@ -290,6 +296,7 @@ pub struct PeerConnection {
     uploaded: u64,
     recv_buffer: Vec<u8>,
     recv_state: RecvState,
+    temp_recv_buf: [u8; TEMP_RECV_BUFFER_SIZE],
     extensions_enabled: bool,
     extension_state: Option<ExtensionState>,
     listen_port: u16,
@@ -341,6 +348,7 @@ impl PeerConnection {
             uploaded: 0,
             recv_buffer: Vec::new(),
             recv_state: RecvState::ReadingLength,
+            temp_recv_buf: [0u8; TEMP_RECV_BUFFER_SIZE],
             extensions_enabled: false,
             extension_state: None,
             listen_port,
@@ -454,18 +462,16 @@ impl PeerConnection {
                 RecvState::ReadingLength => {
                     let needed = 4 - self.recv_buffer.len();
                     if needed > 0 {
-                        let mut temp_buf = vec![0u8; needed];
-                        match self.socket.recv(&mut temp_buf) {
+                        let read_len = needed.min(TEMP_RECV_BUFFER_SIZE);
+                        match self.socket.recv(&mut self.temp_recv_buf[..read_len]) {
                             Ok(0) => {
                                 anyhow::bail!("connection closed");
                             }
                             Ok(n) => {
-                                self.recv_buffer.extend_from_slice(&temp_buf[..n]);
+                                self.recv_buffer.extend_from_slice(&self.temp_recv_buf[..n]);
                             }
                             Err(e) => {
-                                if e.to_string().contains("timed out")
-                                    || e.to_string().contains("WSAETIMEDOUT")
-                                {
+                                if is_timeout_error(&e) {
                                     return Ok(None);
                                 }
                                 return Err(e);
@@ -497,18 +503,16 @@ impl PeerConnection {
                 RecvState::ReadingMessage { msg_len } => {
                     let needed = msg_len as usize - self.recv_buffer.len();
                     if needed > 0 {
-                        let mut temp_buf = vec![0u8; needed.min(8192)];
-                        match self.socket.recv(&mut temp_buf) {
+                        let read_len = needed.min(TEMP_RECV_BUFFER_SIZE);
+                        match self.socket.recv(&mut self.temp_recv_buf[..read_len]) {
                             Ok(0) => {
                                 anyhow::bail!("connection closed");
                             }
                             Ok(n) => {
-                                self.recv_buffer.extend_from_slice(&temp_buf[..n]);
+                                self.recv_buffer.extend_from_slice(&self.temp_recv_buf[..n]);
                             }
                             Err(e) => {
-                                if e.to_string().contains("timed out")
-                                    || e.to_string().contains("WSAETIMEDOUT")
-                                {
+                                if is_timeout_error(&e) {
                                     return Ok(None);
                                 }
                                 return Err(e);

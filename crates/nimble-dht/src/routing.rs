@@ -1,17 +1,34 @@
 use std::collections::VecDeque;
 use std::net::SocketAddrV4;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const NODE_ID_LEN: usize = 20;
 const K_BUCKET_SIZE: usize = 8;
 const BUCKET_COUNT: usize = NODE_ID_LEN * 8;
 const REPLACEMENT_CACHE_SIZE: usize = 8;
+const NODE_STALE_TIMEOUT: Duration = Duration::from_secs(900);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InsertResult {
+    Inserted,
+    Updated,
+    Cached,
+    Rejected,
+    PingOldest { addr: SocketAddrV4, id: [u8; NODE_ID_LEN] },
+}
+
+impl InsertResult {
+    pub fn was_inserted(&self) -> bool {
+        matches!(self, InsertResult::Inserted)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeInfo {
     pub id: [u8; NODE_ID_LEN],
     pub addr: SocketAddrV4,
     last_seen: Instant,
+    pending_ping: bool,
 }
 
 impl NodeInfo {
@@ -20,12 +37,18 @@ impl NodeInfo {
             id,
             addr,
             last_seen: Instant::now(),
+            pending_ping: false,
         }
     }
 
     fn touch(&mut self, addr: SocketAddrV4) {
         self.addr = addr;
         self.last_seen = Instant::now();
+        self.pending_ping = false;
+    }
+
+    fn is_questionable(&self) -> bool {
+        self.last_seen.elapsed() > NODE_STALE_TIMEOUT
     }
 }
 
@@ -65,14 +88,14 @@ impl RoutingTable {
         self.len() == 0
     }
 
-    pub fn insert(&mut self, id: [u8; NODE_ID_LEN], addr: SocketAddrV4) -> bool {
+    pub fn insert(&mut self, id: [u8; NODE_ID_LEN], addr: SocketAddrV4) -> InsertResult {
         if id == self.self_id {
-            return false;
+            return InsertResult::Rejected;
         }
 
         let bucket_index = match bucket_index(&self.self_id, &id) {
             Some(index) => index,
-            None => return false,
+            None => return InsertResult::Rejected,
         };
 
         let bucket = &mut self.buckets[bucket_index];
@@ -83,7 +106,7 @@ impl RoutingTable {
                 bucket.nodes.push_back(node);
             }
             bucket.replacement_cache.retain(|node| node.id != id);
-            return false;
+            return InsertResult::Updated;
         }
 
         if let Some(pos) = bucket.replacement_cache.iter().position(|node| node.id == id) {
@@ -91,11 +114,30 @@ impl RoutingTable {
                 node.touch(addr);
                 bucket.replacement_cache.push_back(node);
             }
+            return InsertResult::Updated;
         }
 
         if bucket.nodes.len() < K_BUCKET_SIZE {
             bucket.nodes.push_back(NodeInfo::new(id, addr));
-            return true;
+            return InsertResult::Inserted;
+        }
+
+        if let Some(oldest) = bucket.nodes.front() {
+            if oldest.is_questionable() && !oldest.pending_ping {
+                let oldest_addr = oldest.addr;
+                let oldest_id = oldest.id;
+
+                if bucket.replacement_cache.len() >= REPLACEMENT_CACHE_SIZE {
+                    bucket.replacement_cache.pop_front();
+                }
+                bucket.replacement_cache.push_back(NodeInfo::new(id, addr));
+
+                if let Some(node) = bucket.nodes.front_mut() {
+                    node.pending_ping = true;
+                }
+
+                return InsertResult::PingOldest { addr: oldest_addr, id: oldest_id };
+            }
         }
 
         if bucket.replacement_cache.len() >= REPLACEMENT_CACHE_SIZE {
@@ -103,7 +145,57 @@ impl RoutingTable {
         }
         bucket.replacement_cache.push_back(NodeInfo::new(id, addr));
 
-        false
+        InsertResult::Cached
+    }
+
+    pub fn mark_node_good(&mut self, id: &[u8; NODE_ID_LEN]) {
+        let bucket_index = match bucket_index(&self.self_id, id) {
+            Some(index) => index,
+            None => return,
+        };
+
+        let bucket = &mut self.buckets[bucket_index];
+        if let Some(pos) = bucket.nodes.iter().position(|node| &node.id == id) {
+            if let Some(mut node) = bucket.nodes.remove(pos) {
+                node.last_seen = Instant::now();
+                node.pending_ping = false;
+                bucket.nodes.push_back(node);
+            }
+        }
+    }
+
+    pub fn handle_ping_timeout(&mut self, id: &[u8; NODE_ID_LEN]) {
+        let bucket_index = match bucket_index(&self.self_id, id) {
+            Some(index) => index,
+            None => return,
+        };
+
+        let bucket = &mut self.buckets[bucket_index];
+
+        if let Some(pos) = bucket.nodes.iter().position(|node| &node.id == id && node.pending_ping) {
+            bucket.nodes.remove(pos);
+
+            if let Some(replacement) = bucket.replacement_cache.pop_front() {
+                bucket.nodes.push_back(replacement);
+            }
+        }
+    }
+
+    pub fn get_stale_nodes(&self, limit: usize) -> Vec<(SocketAddrV4, [u8; NODE_ID_LEN])> {
+        let mut stale = Vec::new();
+
+        for bucket in &self.buckets {
+            for node in &bucket.nodes {
+                if node.is_questionable() && !node.pending_ping {
+                    stale.push((node.addr, node.id));
+                    if stale.len() >= limit {
+                        return stale;
+                    }
+                }
+            }
+        }
+
+        stale
     }
 
     pub fn find_closest(&self, target: [u8; NODE_ID_LEN], limit: usize) -> Vec<NodeInfo> {

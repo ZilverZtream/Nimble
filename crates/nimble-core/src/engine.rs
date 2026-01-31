@@ -2,11 +2,14 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::session::Session;
 use crate::settings::EngineSettings;
 use crate::types::{Command, CommandSender, EngineStats, Event, EventReceiver};
+
+const TICK_INTERVAL_MS: u64 = 20;
+const STATS_UPDATE_INTERVAL_MS: u64 = 1000;
 
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -24,7 +27,9 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
         let mut session = Session::new(download_dir, settings.listen_port, settings.enable_dht);
         let mut stats = EngineStats::default();
 
-        let tick_interval = Duration::from_secs(1);
+        let tick_interval = Duration::from_millis(TICK_INTERVAL_MS);
+        let stats_interval = Duration::from_millis(STATS_UPDATE_INTERVAL_MS);
+        let mut last_stats_update = Instant::now();
 
         loop {
             match cmd_rx.recv_timeout(tick_interval) {
@@ -69,9 +74,12 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
                 let _ = evt_tx.send(Event::LogLine(log_line));
             }
 
-            stats.active_torrents = session.active_count();
-            stats.dht_nodes = session.dht_nodes();
-            let _ = evt_tx.send(Event::Stats(stats.clone()));
+            if last_stats_update.elapsed() >= stats_interval {
+                stats.active_torrents = session.active_count();
+                stats.dht_nodes = session.dht_nodes();
+                let _ = evt_tx.send(Event::Stats(stats.clone()));
+                last_stats_update = Instant::now();
+            }
         }
 
         if let Err(e) = session.shutdown() {

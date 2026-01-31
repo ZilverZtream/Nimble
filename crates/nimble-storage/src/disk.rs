@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use nimble_bencode::torrent::TorrentInfo;
 use nimble_util::bitfield::Bitfield;
-use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
+use crate::hasher::{HashVerifier, VerifyRequest};
 use crate::layout::FileLayout;
 use crate::resume::ResumeData;
 
@@ -19,14 +19,15 @@ pub struct DiskStorage {
     bitfield: Bitfield,
     file_handles: HashMap<usize, File>,
     pending_pieces: HashMap<u64, PendingPiece>,
+    verifying_pieces: HashMap<u64, ()>,
     info_hash: [u8; 20],
     download_dir: PathBuf,
+    hasher: HashVerifier,
 }
 
 struct PendingPiece {
     data: Vec<u8>,
     received_blocks: Bitfield,
-    block_count: u32,
 }
 
 impl DiskStorage {
@@ -58,8 +59,10 @@ impl DiskStorage {
             bitfield,
             file_handles: HashMap::new(),
             pending_pieces: HashMap::new(),
+            verifying_pieces: HashMap::new(),
             info_hash,
             download_dir,
+            hasher: HashVerifier::new(),
         })
     }
 
@@ -84,6 +87,10 @@ impl DiskStorage {
             return Ok(false);
         }
 
+        if self.verifying_pieces.contains_key(&piece_index) {
+            return Ok(false);
+        }
+
         let piece_len = self.get_piece_length(piece_index);
         let block_count = ((piece_len + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64) as u32;
         let block_index = block_offset / BLOCK_SIZE;
@@ -96,7 +103,6 @@ impl DiskStorage {
             PendingPiece {
                 data: vec![0u8; piece_len as usize],
                 received_blocks: Bitfield::new(block_count as usize),
-                block_count,
             }
         });
 
@@ -110,36 +116,49 @@ impl DiskStorage {
         pending.received_blocks.set(block_index as usize, true);
 
         if pending.received_blocks.count_ones() == block_count as usize {
-            self.complete_piece(piece_index)?;
-            Ok(true)
+            self.submit_piece_for_verification(piece_index);
+            Ok(false)
         } else {
             Ok(false)
         }
     }
 
-    fn complete_piece(&mut self, piece_index: u64) -> Result<()> {
-        let pending = self.pending_pieces.remove(&piece_index)
-            .context("pending piece not found")?;
-
-        let expected_hash = &self.pieces[piece_index as usize];
-        let mut hasher = Sha1::new();
-        hasher.update(&pending.data);
-        let computed_hash: [u8; 20] = hasher.finalize().into();
-
-        if &computed_hash != expected_hash {
-            anyhow::bail!(
-                "piece {} hash mismatch: expected {:?}, got {:?}",
+    fn submit_piece_for_verification(&mut self, piece_index: u64) {
+        if let Some(pending) = self.pending_pieces.remove(&piece_index) {
+            let expected_hash = self.pieces[piece_index as usize];
+            let request = VerifyRequest {
                 piece_index,
+                data: pending.data,
                 expected_hash,
-                computed_hash
-            );
+            };
+            if self.hasher.submit(request) {
+                self.verifying_pieces.insert(piece_index, ());
+            }
+        }
+    }
+
+    pub fn poll_verifications(&mut self) -> Vec<u64> {
+        let mut completed = Vec::new();
+
+        while let Some(result) = self.hasher.try_recv() {
+            self.verifying_pieces.remove(&result.piece_index);
+
+            if result.hash_matches {
+                if let Err(e) = self.finalize_verified_piece(result.piece_index, &result.data) {
+                    eprintln!("Failed to finalize piece {}: {}", result.piece_index, e);
+                    continue;
+                }
+                completed.push(result.piece_index);
+            }
         }
 
-        self.write_piece_to_disk(piece_index, &pending.data)?;
+        completed
+    }
+
+    fn finalize_verified_piece(&mut self, piece_index: u64, data: &[u8]) -> Result<()> {
+        self.write_piece_to_disk(piece_index, data)?;
         self.bitfield.set(piece_index as usize, true);
-
         self.save_resume_data()?;
-
         Ok(())
     }
 
@@ -220,6 +239,7 @@ impl DiskStorage {
 mod tests {
     use super::*;
     use nimble_bencode::torrent::{InfoHash, TorrentMode};
+    use sha1::{Digest, Sha1};
     use tempfile::TempDir;
 
     fn make_test_info() -> TorrentInfo {
@@ -249,9 +269,13 @@ mod tests {
         let mut storage = DiskStorage::new(&info, temp_dir.path().to_path_buf()).unwrap();
 
         let data = vec![0u8; 16384];
-        let completed = storage.write_block(0, 0, &data).unwrap();
+        storage.write_block(0, 0, &data).unwrap();
 
-        assert!(completed);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let completed = storage.poll_verifications();
+
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0], 0);
         assert!(storage.has_piece(0));
     }
 
@@ -273,11 +297,16 @@ mod tests {
         let block1 = vec![0u8; 16384];
         let block2 = vec![0u8; 16384];
 
-        let completed = storage.write_block(0, 0, &block1).unwrap();
-        assert!(!completed);
+        storage.write_block(0, 0, &block1).unwrap();
+        let completed = storage.poll_verifications();
+        assert!(completed.is_empty());
 
-        let completed = storage.write_block(0, 16384, &block2).unwrap();
-        assert!(completed);
+        storage.write_block(0, 16384, &block2).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let completed = storage.poll_verifications();
+
+        assert_eq!(completed.len(), 1);
         assert!(storage.has_piece(0));
     }
 }

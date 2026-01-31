@@ -3,6 +3,7 @@ mod magnet;
 pub mod peer_manager;
 pub mod session;
 pub mod settings;
+mod tracker_worker;
 pub mod types;
 
 pub use engine::EngineHandle;

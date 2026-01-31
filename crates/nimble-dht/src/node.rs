@@ -1,6 +1,7 @@
 use nimble_util::ids::dht_node_id_20;
 use std::collections::HashMap;
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::time::Instant;
 
 use crate::rpc::{
     decode_message, ErrorMessage, Message, NodeEntry, Query, QueryKind, Response, ResponseKind,
@@ -12,6 +13,10 @@ use crate::tokens::TokenIssuer;
 const MAX_RESPONSE_NODES: usize = 16;
 const MAX_PEERS_PER_INFOHASH: usize = 32;
 const MAX_INFOHASHES: usize = 128;
+const RATE_LIMIT_WINDOW_MS: u64 = 1_000;
+const RATE_LIMIT_MAX_QUERIES: u32 = 32;
+const RATE_LIMIT_MAX_CLIENTS: usize = 1_024;
+const RATE_LIMIT_STALE_MS: u64 = 60_000;
 
 pub struct DhtNode {
     node_id: [u8; 20],
@@ -19,6 +24,7 @@ pub struct DhtNode {
     routing: RoutingTable,
     tokens: TokenIssuer,
     peers: HashMap<[u8; 20], Vec<SocketAddrV4>>,
+    rate_limiter: RateLimiter,
 }
 
 pub struct PacketOutcome {
@@ -36,6 +42,7 @@ impl DhtNode {
             routing,
             tokens: TokenIssuer::new(),
             peers: HashMap::new(),
+            rate_limiter: RateLimiter::new(RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_QUERIES),
         }
     }
 
@@ -62,6 +69,19 @@ impl DhtNode {
         payload: &[u8],
     ) -> Result<PacketOutcome, RpcError> {
         let message = decode_message(payload)?;
+        if let Message::Query(query) = &message {
+            if !self.rate_limiter.allow(*source.ip()) {
+                let transaction_id = query.transaction_id.clone();
+                return Ok(PacketOutcome {
+                    message,
+                    response: Some(Message::Error(ErrorMessage {
+                        transaction_id,
+                        code: 202,
+                        message: b"rate limited".to_vec(),
+                    })),
+                });
+            }
+        }
         if let Some(id) = message.sender_id() {
             self.observe_node(id, source);
         }
@@ -170,6 +190,70 @@ fn limit_peers(peers: &[SocketAddrV4]) -> Vec<SocketAddrV4> {
     let mut out = Vec::with_capacity(peers.len().min(MAX_PEERS_PER_INFOHASH));
     out.extend(peers.iter().take(MAX_PEERS_PER_INFOHASH).copied());
     out
+}
+
+struct RateLimiter {
+    window_ms: u64,
+    max_hits: u32,
+    start: Instant,
+    entries: HashMap<Ipv4Addr, RateEntry>,
+}
+
+struct RateEntry {
+    window_start_ms: u64,
+    hits: u32,
+    last_seen_ms: u64,
+}
+
+impl RateLimiter {
+    fn new(window_ms: u64, max_hits: u32) -> Self {
+        Self {
+            window_ms,
+            max_hits,
+            start: Instant::now(),
+            entries: HashMap::new(),
+        }
+    }
+
+    fn allow(&mut self, ip: Ipv4Addr) -> bool {
+        let now_ms = self.start.elapsed().as_millis() as u64;
+        self.allow_at(ip, now_ms)
+    }
+
+    fn allow_at(&mut self, ip: Ipv4Addr, now_ms: u64) -> bool {
+        self.cleanup(now_ms);
+        let entry = self.entries.entry(ip).or_insert(RateEntry {
+            window_start_ms: now_ms,
+            hits: 0,
+            last_seen_ms: now_ms,
+        });
+        if now_ms.saturating_sub(entry.window_start_ms) >= self.window_ms {
+            entry.window_start_ms = now_ms;
+            entry.hits = 0;
+        }
+        entry.last_seen_ms = now_ms;
+        if entry.hits >= self.max_hits {
+            return false;
+        }
+        entry.hits += 1;
+        true
+    }
+
+    fn cleanup(&mut self, now_ms: u64) {
+        self.entries
+            .retain(|_, entry| now_ms.saturating_sub(entry.last_seen_ms) <= RATE_LIMIT_STALE_MS);
+        if self.entries.len() <= RATE_LIMIT_MAX_CLIENTS {
+            return;
+        }
+        if let Some((oldest_ip, _)) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_seen_ms)
+            .map(|(ip, entry)| (*ip, entry.last_seen_ms))
+        {
+            self.entries.remove(&oldest_ip);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -332,5 +416,40 @@ mod tests {
             }
             _ => panic!("missing get_peers values"),
         }
+    }
+
+    #[test]
+    fn rate_limited_queries_return_error() {
+        let mut node = DhtNode::new();
+        let source = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 4), 6881);
+        let mut sender_id = [0u8; 20];
+        sender_id[0] = 1;
+
+        for index in 0..RATE_LIMIT_MAX_QUERIES {
+            let message = Message::Query(Query {
+                transaction_id: vec![index as u8],
+                kind: QueryKind::Ping { id: sender_id },
+            });
+            let payload = encode_message(&message);
+            let outcome = node.handle_packet(source, &payload).unwrap();
+            assert!(matches!(
+                outcome.response,
+                Some(Message::Response(Response {
+                    kind: ResponseKind::Ping { .. },
+                    ..
+                }))
+            ));
+        }
+
+        let message = Message::Query(Query {
+            transaction_id: b"rl".to_vec(),
+            kind: QueryKind::Ping { id: sender_id },
+        });
+        let payload = encode_message(&message);
+        let outcome = node.handle_packet(source, &payload).unwrap();
+        assert!(matches!(
+            outcome.response,
+            Some(Message::Error(ErrorMessage { code, .. })) if code == 202
+        ));
     }
 }

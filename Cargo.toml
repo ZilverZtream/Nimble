@@ -28,8 +28,8 @@ thiserror = { version = "1", default-features = false }
 # Windows bindings: prefer windows-sys for footprint.
 windows-sys = { version = "0.52", default-features = false }
 
-# Optional: for fast hashing during development; production may switch to Windows CNG.
-sha1 = { version = "0.10", default-features = false, optional = true }
+# Fast hashing; production may switch to Windows CNG if needed.
+sha1 = { version = "0.10", default-features = false }
 
 [profile.release]
 opt-level = "z"

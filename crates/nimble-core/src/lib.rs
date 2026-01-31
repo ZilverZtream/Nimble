@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod session;
 pub mod settings;
 pub mod types;
 

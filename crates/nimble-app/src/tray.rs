@@ -8,21 +8,21 @@ use windows_sys::Win32::{
     UI::Shell::*,
     UI::WindowsAndMessaging::*,
     System::LibraryLoader::*,
+    UI::Controls::Dialogs::*,
 };
 
 #[cfg(windows)]
 const WM_APP: u32 = 0x8000;
-
-// NOTE:
-// This is a minimal placeholder tray loop. It establishes a hidden window
-// and registers a tray icon. Menu actions are wired but most commands are stubs.
 
 #[cfg(windows)]
 const WM_TRAYICON: u32 = WM_APP + 1;
 #[cfg(windows)]
 const TRAY_UID: u32 = 1;
 
-pub fn run_tray_loop(_engine: EngineHandle, _events: EventReceiver) -> Result<()> {
+#[cfg(windows)]
+const GWLP_USERDATA: i32 = -21;
+
+pub fn run_tray_loop(engine: EngineHandle, _events: EventReceiver) -> Result<()> {
     #[cfg(not(windows))]
     {
         anyhow::bail!("Windows-only.");
@@ -72,6 +72,10 @@ pub fn run_tray_loop(_engine: EngineHandle, _events: EventReceiver) -> Result<()
             anyhow::bail!("CreateWindowExW failed");
         }
 
+        // Store engine handle in window user data
+        let engine_ptr = Box::into_raw(Box::new(engine));
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, engine_ptr as isize);
+
         add_tray_icon(hwnd)?;
 
         log::info("Nimble tray started.");
@@ -83,6 +87,13 @@ pub fn run_tray_loop(_engine: EngineHandle, _events: EventReceiver) -> Result<()
         }
 
         remove_tray_icon(hwnd);
+
+        // Clean up engine handle
+        let engine_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EngineHandle;
+        if !engine_ptr.is_null() {
+            let _ = Box::from_raw(engine_ptr);
+        }
+
         Ok(())
     }
 }
@@ -91,7 +102,6 @@ pub fn run_tray_loop(_engine: EngineHandle, _events: EventReceiver) -> Result<()
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TRAYICON => {
-            // Placeholder: right-click opens menu.
             if lparam as u32 == WM_RBUTTONUP {
                 show_tray_menu(hwnd);
                 return 0;
@@ -99,17 +109,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
         WM_COMMAND => {
-            // Placeholder: handle menu selections.
             let cmd_id = (wparam & 0xffff) as u16;
             match cmd_id {
-                1001 => { /* Add Torrent File... */ }
-                1002 => { /* Add Magnet Link... */ }
-                1003 => { /* Open Downloads Folder */ }
+                1001 => { handle_add_torrent_file(hwnd); }
+                1002 => { handle_add_magnet(hwnd); }
+                1003 => { handle_open_downloads(hwnd); }
                 1004 => { /* Status Window... */ }
-                1005 => { /* Pause All */ }
-                1006 => { /* Resume All */ }
+                1005 => { handle_pause_all(hwnd); }
+                1006 => { handle_resume_all(hwnd); }
                 1007 => { /* Settings... */ }
-                1099 => { PostQuitMessage(0); }
+                1099 => { handle_quit(hwnd); }
                 _ => {}
             }
             0
@@ -182,6 +191,81 @@ unsafe fn show_tray_menu(hwnd: HWND) {
 
     let _ = TrackPopupMenu(hmenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, std::ptr::null());
     DestroyMenu(hmenu);
+}
+
+#[cfg(windows)]
+unsafe fn get_engine(hwnd: HWND) -> Option<&'static EngineHandle> {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EngineHandle;
+    if ptr.is_null() {
+        None
+    } else {
+        Some(&*ptr)
+    }
+}
+
+#[cfg(windows)]
+unsafe fn handle_add_torrent_file(hwnd: HWND) {
+    use nimble_core::types::Command;
+
+    let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+    let mut filename_buf = vec![0u16; 260];
+
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFile = filename_buf.as_mut_ptr();
+    ofn.nMaxFile = 260;
+    ofn.lpstrFilter = widestr("Torrent Files\0*.torrent\0All Files\0*.*\0").as_ptr();
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+
+    if GetOpenFileNameW(&mut ofn) != 0 {
+        let len = filename_buf.iter().position(|&c| c == 0).unwrap_or(filename_buf.len());
+        let path = String::from_utf16_lossy(&filename_buf[..len]);
+
+        if let Some(engine) = get_engine(hwnd) {
+            let _ = engine.tx.send(Command::AddTorrentFile { path });
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe fn handle_add_magnet(_hwnd: HWND) {
+    // TODO: Implement magnet input dialog
+    log::info("Add Magnet not yet implemented");
+}
+
+#[cfg(windows)]
+unsafe fn handle_open_downloads(_hwnd: HWND) {
+    // TODO: Open downloads folder
+    log::info("Open Downloads not yet implemented");
+}
+
+#[cfg(windows)]
+unsafe fn handle_pause_all(hwnd: HWND) {
+    use nimble_core::types::Command;
+
+    if let Some(engine) = get_engine(hwnd) {
+        let _ = engine.tx.send(Command::PauseAll);
+    }
+}
+
+#[cfg(windows)]
+unsafe fn handle_resume_all(hwnd: HWND) {
+    use nimble_core::types::Command;
+
+    if let Some(engine) = get_engine(hwnd) {
+        let _ = engine.tx.send(Command::ResumeAll);
+    }
+}
+
+#[cfg(windows)]
+unsafe fn handle_quit(hwnd: HWND) {
+    use nimble_core::types::Command;
+
+    if let Some(engine) = get_engine(hwnd) {
+        let _ = engine.tx.send(Command::Shutdown);
+    }
+    PostQuitMessage(0);
 }
 
 #[cfg(windows)]

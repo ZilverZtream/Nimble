@@ -14,3 +14,8 @@ prealloc = []
         anyhow = { workspace = true }
         thiserror = { workspace = true }
         nimble-util = { path = "../nimble-util" }
+        nimble-bencode = { path = "../nimble-bencode" }
+        sha1 = { workspace = true }
+
+        [dev-dependencies]
+        tempfile = "3"

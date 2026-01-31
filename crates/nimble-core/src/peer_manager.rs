@@ -161,8 +161,8 @@ impl PeerManager {
                                 );
                             }
 
-                            stats.downloaded += peer.connection.downloaded();
-                            stats.uploaded += peer.connection.uploaded();
+                            stats.downloaded = stats.downloaded.saturating_add(peer.connection.downloaded());
+                            stats.uploaded = stats.uploaded.saturating_add(peer.connection.uploaded());
                         }
                         Err(_) => {
                             peers_to_remove.push(addr);
@@ -257,6 +257,15 @@ impl PeerManager {
         self.candidate_peers.retain(|addr| !dropped.contains(addr));
     }
 
+    fn is_fatal_error(e: &anyhow::Error) -> bool {
+        let error_msg = e.to_string();
+        error_msg.contains("connection closed")
+            || error_msg.contains("not connected")
+            || error_msg.contains("info hash mismatch")
+            || error_msg.contains("invalid protocol")
+            || error_msg.contains("message too large")
+    }
+
     fn handle_peer_messages(
         peer: &mut ManagedPeer,
         picker: &mut PiecePicker,
@@ -301,7 +310,10 @@ impl PeerManager {
                     {
                         break;
                     }
-                    return Err(e);
+                    if Self::is_fatal_error(&e) {
+                        return Err(e);
+                    }
+                    break;
                 }
             }
         }

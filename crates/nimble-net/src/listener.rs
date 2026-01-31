@@ -14,7 +14,10 @@ mod windows_impl {
     const MAX_PENDING_HANDSHAKES: usize = 32;
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
     const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
+    const PROTOCOL_STRING_LENGTH: u8 = 19;
     const HANDSHAKE_LENGTH: usize = 68;
+    const WSAEWOULDBLOCK: i32 = 10035;
+    const WSAEINPROGRESS: i32 = 10036;
 
     struct SafeSocket(SOCKET);
 
@@ -217,7 +220,7 @@ mod windows_impl {
                         continue;
                     } else {
                         let err = get_last_error();
-                        if err != 10035 && err != 10036 {
+                        if err != WSAEWOULDBLOCK && err != WSAEINPROGRESS {
                             failed.push(sock);
                         }
                         continue;
@@ -259,7 +262,7 @@ mod windows_impl {
         ) -> Result<AcceptedPeer> {
             let data = &pending.recv_buffer;
 
-            if data[0] != 19 {
+            if data[0] != PROTOCOL_STRING_LENGTH {
                 return Err(anyhow!("invalid protocol string length"));
             }
 
@@ -280,7 +283,7 @@ mod windows_impl {
                 .ok_or_else(|| anyhow!("unknown infohash"))?;
 
             let mut response = Vec::with_capacity(HANDSHAKE_LENGTH);
-            response.push(19);
+            response.push(PROTOCOL_STRING_LENGTH);
             response.extend_from_slice(PROTOCOL_STRING);
 
             let mut reserved = [0u8; 8];
@@ -392,6 +395,7 @@ mod unix_impl {
     const MAX_PENDING_HANDSHAKES: usize = 32;
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
     const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
+    const PROTOCOL_STRING_LENGTH: u8 = 19;
     const HANDSHAKE_LENGTH: usize = 68;
 
     pub struct PeerListener {
@@ -521,7 +525,7 @@ mod unix_impl {
                     match Self::validate_handshake(&pending.recv_buffer, &self.infohash_registry) {
                         Ok((info_hash, their_peer_id, our_peer_id)) => {
                             let mut response = Vec::with_capacity(HANDSHAKE_LENGTH);
-                            response.push(19);
+                            response.push(PROTOCOL_STRING_LENGTH);
                             response.extend_from_slice(PROTOCOL_STRING);
                             let mut reserved = [0u8; 8];
                             reserved[5] |= 0x10;
@@ -564,7 +568,7 @@ mod unix_impl {
             data: &[u8],
             registry: &HashMap<[u8; 20], InfoHashEntry>,
         ) -> Result<([u8; 20], [u8; 20], [u8; 20])> {
-            if data[0] != 19 {
+            if data[0] != PROTOCOL_STRING_LENGTH {
                 return Err(anyhow!("invalid protocol string length"));
             }
 

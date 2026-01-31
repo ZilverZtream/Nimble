@@ -107,6 +107,26 @@ impl RoutingTable {
         }
         nodes
     }
+
+    pub fn oldest_nodes(&self, limit: usize) -> Vec<SocketAddrV4> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut nodes = Vec::new();
+        for bucket in &self.buckets {
+            for node in &bucket.nodes {
+                nodes.push(node);
+            }
+        }
+
+        nodes.sort_by_key(|node| node.last_seen);
+        let mut out = Vec::with_capacity(limit.min(nodes.len()));
+        for node in nodes.into_iter().take(limit) {
+            out.push(node.addr);
+        }
+        out
+    }
 }
 
 fn bucket_index(self_id: &[u8; NODE_ID_LEN], node_id: &[u8; NODE_ID_LEN]) -> Option<usize> {
@@ -206,5 +226,23 @@ mod tests {
         assert_eq!(closest[0].id, near);
         assert_eq!(closest[1].id, mid);
         assert_eq!(closest[2].id, far);
+    }
+
+    #[test]
+    fn oldest_nodes_returns_addresses() {
+        let self_id = [0u8; NODE_ID_LEN];
+        let mut table = RoutingTable::new(self_id);
+        let addr1 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 6881);
+        let addr2 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 6881);
+
+        let id1 = id_with_last_byte(0x10);
+        let id2 = id_with_last_byte(0x20);
+
+        table.insert(id1, addr1);
+        table.insert(id2, addr2);
+
+        let nodes = table.oldest_nodes(1);
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0] == addr1 || nodes[0] == addr2);
     }
 }

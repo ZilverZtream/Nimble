@@ -290,9 +290,9 @@ Leaving completed TODOs unchecked is considered a bug.
 - [x] J2.3 Rate limiting
 
 ## J3. Bootstrap
-- [ ] J3.1 Default router list
-- [ ] J3.2 Initial crawl
-- [ ] J3.3 Node refresh logic
+- [x] J3.1 Default router list
+- [x] J3.2 Initial crawl
+- [x] J3.3 Node refresh logic
 
 ## J4. DHT for magnets
 - [ ] J4.1 get_peers for infohash

@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+nimble.toml
+/crates/**/nimble.toml
+/crates/**/res/*.ico

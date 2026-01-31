@@ -1,0 +1,29 @@
+[package]
+name = "nimble-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["win_tray"]
+win_tray = []
+status_window = []
+settings_dialog = []
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
+  "Win32_System_WindowsProgramming",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Controls",
+  "Win32_Graphics_Gdi",
+] }
+
+nimble-core = { path = "../nimble-core" }
+nimble-util = { path = "../nimble-util" }

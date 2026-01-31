@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/nimble-app",
+  "crates/nimble-core",
+  "crates/nimble-net",
+  "crates/nimble-dht",
+  "crates/nimble-nat",
+  "crates/nimble-lsd",
+  "crates/nimble-storage",
+  "crates/nimble-bencode",
+  "crates/nimble-util",
+]
+
+[workspace.package]
+name = "nimble"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://example.invalid/nimble"
+rust-version = "1.76"
+
+[workspace.dependencies]
+# Keep dependencies lean; default-features are OFF unless justified.
+anyhow = { version = "1", default-features = false }
+thiserror = { version = "1", default-features = false }
+
+# Windows bindings: prefer windows-sys for footprint.
+windows-sys = { version = "0.52", default-features = false }
+
+# Optional: for fast hashing during development; production may switch to Windows CNG.
+sha1 = { version = "0.10", default-features = false, optional = true }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.dev]
+# Keep dev builds reasonably fast.
+opt-level = 0

@@ -1,0 +1,19 @@
+        [package]
+        name = "nimble-util"
+        version.workspace = true
+        edition.workspace = true
+        license.workspace = true
+        rust-version.workspace = true
+
+        [features]
+default = []
+sha1_crate = ["dep:sha1"]
+
+        [dependencies]
+        anyhow = { workspace = true }
+        thiserror = { workspace = true }
+        windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_System_SystemInformation",
+] }
+sha1 = { workspace = true, optional = true }

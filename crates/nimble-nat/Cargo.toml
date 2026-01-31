@@ -1,0 +1,16 @@
+        [package]
+        name = "nimble-nat"
+        version.workspace = true
+        edition.workspace = true
+        license.workspace = true
+        rust-version.workspace = true
+
+        [features]
+default = []
+upnp = []
+nat_pmp = []
+
+        [dependencies]
+        anyhow = { workspace = true }
+        thiserror = { workspace = true }
+        nimble-util = { path = "../nimble-util" }

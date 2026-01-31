@@ -1,10 +1,10 @@
 use anyhow::Result;
 use nimble_bencode::torrent::{parse_info_dict, parse_torrent, InfoHash, TorrentInfo};
 use nimble_dht::node::{DhtNode, DhtQuery};
-use nimble_net::tracker_http::{announce, AnnounceRequest, TrackerEvent};
+use nimble_net::tracker_http::TrackerEvent;
 use nimble_storage::disk::DiskStorage;
 use nimble_util::ids::peer_id_20;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::magnet::parse_magnet;
 use crate::peer_manager::PeerManager;
+use crate::tracker_worker::{AnnounceTask, AnnounceWorker};
 
 pub struct Session {
     torrents: HashMap<String, TorrentEntry>,
@@ -19,6 +20,8 @@ pub struct Session {
     peer_id: [u8; 20],
     listen_port: u16,
     dht: Option<DhtNode>,
+    announce_worker: AnnounceWorker,
+    pending_announces: HashSet<String>,
 }
 
 pub enum TorrentEntry {
@@ -82,6 +85,8 @@ impl Session {
             peer_id: peer_id_20(),
             listen_port,
             dht,
+            announce_worker: AnnounceWorker::new(),
+            pending_announces: HashSet::new(),
         }
     }
 
@@ -193,6 +198,67 @@ impl Session {
         let listen_port = self.listen_port;
         let mut upgrades = Vec::new();
 
+        while let Some(result) = self.announce_worker.try_recv_result() {
+            self.pending_announces.remove(&result.infohash_hex);
+
+            if let Some(torrent) = self.torrents.get_mut(&result.infohash_hex) {
+                match torrent {
+                    TorrentEntry::Active(torrent) => {
+                        if result.success {
+                            torrent.tracker.last_announce = Some(now);
+                            if let Some(interval) = result.interval {
+                                torrent.tracker.interval = Duration::from_secs(interval as u64);
+                            }
+                            torrent.tracker.next_announce = Some(now + torrent.tracker.interval);
+                            torrent.tracker.peers = result.peers.clone();
+                            torrent.peer_manager.add_peers(&result.peers);
+
+                            log_lines.push(format!(
+                                "Tracker announce for {}: {} peers",
+                                &result.infohash_hex[..8],
+                                result.peers.len()
+                            ));
+                        } else {
+                            torrent.tracker.next_announce = Some(now + Duration::from_secs(60));
+                            if let Some(error) = &result.error {
+                                log_lines.push(format!(
+                                    "Tracker announce failed for {}: {}",
+                                    &result.infohash_hex[..8],
+                                    error
+                                ));
+                            }
+                        }
+                    }
+                    TorrentEntry::Magnet(torrent) => {
+                        if result.success {
+                            torrent.tracker.last_announce = Some(now);
+                            if let Some(interval) = result.interval {
+                                torrent.tracker.interval = Duration::from_secs(interval as u64);
+                            }
+                            torrent.tracker.next_announce = Some(now + torrent.tracker.interval);
+                            torrent.tracker.peers = result.peers.clone();
+                            torrent.peer_manager.add_peers(&result.peers);
+
+                            log_lines.push(format!(
+                                "Magnet announce for {}: {} peers",
+                                &result.infohash_hex[..8],
+                                result.peers.len()
+                            ));
+                        } else {
+                            torrent.tracker.next_announce = Some(now + Duration::from_secs(60));
+                            if let Some(error) = &result.error {
+                                log_lines.push(format!(
+                                    "Magnet announce failed for {}: {}",
+                                    &result.infohash_hex[..8],
+                                    error
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(dht) = self.dht.as_mut() {
             log_lines.extend(dht.tick());
             for query in dht.take_pending_queries() {
@@ -220,32 +286,23 @@ impl Session {
                         .map(|next| now >= next)
                         .unwrap_or(false);
 
-                    if should_announce {
+                    if should_announce && !self.pending_announces.contains(infohash) {
                         if let Some(announce_url) = torrent.info.announce.clone() {
-                            match Self::announce_tracker(
-                                torrent,
-                                &announce_url,
-                                TrackerEvent::None,
-                                &peer_id,
-                                listen_port,
-                            ) {
-                                Ok(peer_count) => {
-                                    log_lines.push(format!(
-                                        "Tracker announce for {}: {} peers",
-                                        &infohash[..8],
-                                        peer_count
-                                    ));
-
-                                    torrent.peer_manager.add_peers(&torrent.tracker.peers);
-                                }
-                                Err(e) => {
-                                    log_lines.push(format!(
-                                        "Tracker announce failed for {}: {}",
-                                        &infohash[..8],
-                                        e
-                                    ));
-                                }
-                            }
+                            self.pending_announces.insert(infohash.clone());
+                            let task = AnnounceTask {
+                                infohash_hex: infohash.clone(),
+                                url: announce_url,
+                                info_hash: *torrent.info.infohash.as_bytes(),
+                                peer_id,
+                                port: listen_port,
+                                uploaded: torrent.stats.uploaded,
+                                downloaded: torrent.stats.downloaded,
+                                left: torrent.info.total_length.saturating_sub(
+                                    (torrent.stats.pieces_completed as u64) * torrent.info.piece_length,
+                                ),
+                                event: TrackerEvent::None,
+                            };
+                            self.announce_worker.submit_announce(task);
                         }
                     }
 
@@ -287,31 +344,21 @@ impl Session {
                         .map(|next| now >= next)
                         .unwrap_or(false);
 
-                    if should_announce {
+                    if should_announce && !self.pending_announces.contains(infohash) {
                         if let Some(announce_url) = torrent.trackers.first().cloned() {
-                            match Self::announce_tracker_magnet(
-                                torrent,
-                                &announce_url,
-                                TrackerEvent::None,
-                                &peer_id,
-                                listen_port,
-                            ) {
-                                Ok(peer_count) => {
-                                    log_lines.push(format!(
-                                        "Magnet announce for {}: {} peers",
-                                        &infohash[..8],
-                                        peer_count
-                                    ));
-                                    torrent.peer_manager.add_peers(&torrent.tracker.peers);
-                                }
-                                Err(e) => {
-                                    log_lines.push(format!(
-                                        "Magnet announce failed for {}: {}",
-                                        &infohash[..8],
-                                        e
-                                    ));
-                                }
-                            }
+                            self.pending_announces.insert(infohash.clone());
+                            let task = AnnounceTask {
+                                infohash_hex: infohash.clone(),
+                                url: announce_url,
+                                info_hash: torrent.info_hash,
+                                peer_id,
+                                port: listen_port,
+                                uploaded: torrent.stats.uploaded,
+                                downloaded: torrent.stats.downloaded,
+                                left: 0,
+                                event: TrackerEvent::None,
+                            };
+                            self.announce_worker.submit_announce(task);
                         }
                     }
 
@@ -376,77 +423,6 @@ impl Session {
 
     pub fn dht_nodes(&self) -> u32 {
         self.dht.as_ref().map(|dht| dht.known_nodes()).unwrap_or(0)
-    }
-
-    fn announce_tracker(
-        torrent: &mut ActiveTorrent,
-        url: &str,
-        event: TrackerEvent,
-        peer_id: &[u8; 20],
-        listen_port: u16,
-    ) -> Result<usize> {
-        let downloaded = torrent.stats.downloaded;
-        let uploaded = torrent.stats.uploaded;
-        let left = torrent
-            .info
-            .total_length
-            .saturating_sub((torrent.stats.pieces_completed as u64) * torrent.info.piece_length);
-
-        let request = AnnounceRequest {
-            info_hash: torrent.info.infohash.as_bytes(),
-            peer_id,
-            port: listen_port,
-            uploaded,
-            downloaded,
-            left,
-            compact: true,
-            event,
-        };
-
-        let response = announce(url, &request)?;
-
-        if let Some(failure) = response.failure_reason {
-            return Err(anyhow::anyhow!("Tracker failure: {}", failure));
-        }
-
-        torrent.tracker.last_announce = Some(Instant::now());
-        torrent.tracker.interval = Duration::from_secs(response.interval as u64);
-        torrent.tracker.next_announce = Some(Instant::now() + torrent.tracker.interval);
-        torrent.tracker.peers = response.peers.clone();
-
-        Ok(response.peers.len())
-    }
-
-    fn announce_tracker_magnet(
-        torrent: &mut MagnetState,
-        url: &str,
-        event: TrackerEvent,
-        peer_id: &[u8; 20],
-        listen_port: u16,
-    ) -> Result<usize> {
-        let request = AnnounceRequest {
-            info_hash: &torrent.info_hash,
-            peer_id,
-            port: listen_port,
-            uploaded: torrent.stats.uploaded,
-            downloaded: torrent.stats.downloaded,
-            left: 0,
-            compact: true,
-            event,
-        };
-
-        let response = announce(url, &request)?;
-
-        if let Some(failure) = response.failure_reason {
-            return Err(anyhow::anyhow!("Tracker failure: {}", failure));
-        }
-
-        torrent.tracker.last_announce = Some(Instant::now());
-        torrent.tracker.interval = Duration::from_secs(response.interval as u64);
-        torrent.tracker.next_announce = Some(Instant::now() + torrent.tracker.interval);
-        torrent.tracker.peers = response.peers.clone();
-
-        Ok(response.peers.len())
     }
 
     fn promote_magnet(

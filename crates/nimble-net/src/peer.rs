@@ -3,14 +3,20 @@ use nimble_util::bitfield::Bitfield;
 use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
 
+use crate::extension::{
+    create_nimble_handshake, has_extension_bit, set_extension_bit, ExtendedMessage,
+    ExtensionHandshake, ExtensionState,
+};
 use crate::sockets::TcpSocket;
 
 const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
 const HANDSHAKE_LENGTH: usize = 68;
 const MAX_MESSAGE_LENGTH: u32 = 32768 + 9;
+const MAX_EXTENDED_MESSAGE_LENGTH: u32 = 1024 * 1024;
 const BLOCK_SIZE: u32 = 16384;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 const MAX_PENDING_REQUESTS: usize = 16;
+const EXTENDED_MESSAGE_ID: u8 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerMessageId {
@@ -23,6 +29,7 @@ pub enum PeerMessageId {
     Request = 6,
     Piece = 7,
     Cancel = 8,
+    Extended = 20,
 }
 
 impl PeerMessageId {
@@ -37,6 +44,7 @@ impl PeerMessageId {
             6 => Some(PeerMessageId::Request),
             7 => Some(PeerMessageId::Piece),
             8 => Some(PeerMessageId::Cancel),
+            20 => Some(PeerMessageId::Extended),
             _ => None,
         }
     }
@@ -54,6 +62,7 @@ pub enum PeerMessage {
     Request { index: u32, begin: u32, length: u32 },
     Piece { index: u32, begin: u32, block: Vec<u8> },
     Cancel { index: u32, begin: u32, length: u32 },
+    Extended { ext_type: u8, payload: Vec<u8> },
 }
 
 impl PeerMessage {
@@ -111,6 +120,15 @@ impl PeerMessage {
                 buf.extend_from_slice(&length.to_be_bytes());
                 buf
             }
+            PeerMessage::Extended { ext_type, payload } => {
+                let len = 2 + payload.len() as u32;
+                let mut buf = Vec::with_capacity(4 + len as usize);
+                buf.extend_from_slice(&len.to_be_bytes());
+                buf.push(EXTENDED_MESSAGE_ID);
+                buf.push(*ext_type);
+                buf.extend_from_slice(payload);
+                buf
+            }
         }
     }
 
@@ -165,6 +183,14 @@ impl PeerMessage {
                 let length = u32::from_be_bytes([data[9], data[10], data[11], data[12]]);
                 Ok(PeerMessage::Cancel { index, begin, length })
             }
+            PeerMessageId::Extended => {
+                if data.len() < 2 {
+                    anyhow::bail!("extended message too short");
+                }
+                let ext_type = data[1];
+                let payload = data[2..].to_vec();
+                Ok(PeerMessage::Extended { ext_type, payload })
+            }
         }
     }
 }
@@ -204,6 +230,10 @@ pub struct PeerConnection {
     downloaded: u64,
     uploaded: u64,
     recv_buffer: Vec<u8>,
+    extensions_enabled: bool,
+    extension_state: Option<ExtensionState>,
+    listen_port: u16,
+    metadata_size: Option<u32>,
 }
 
 impl PeerConnection {
@@ -212,6 +242,17 @@ impl PeerConnection {
         info_hash: [u8; 20],
         our_peer_id: [u8; 20],
         piece_count: usize,
+    ) -> Self {
+        Self::with_options(addr, info_hash, our_peer_id, piece_count, 6881, None)
+    }
+
+    pub fn with_options(
+        addr: SocketAddrV4,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        piece_count: usize,
+        listen_port: u16,
+        metadata_size: Option<u32>,
     ) -> Self {
         let now = Instant::now();
         PeerConnection {
@@ -233,6 +274,10 @@ impl PeerConnection {
             downloaded: 0,
             uploaded: 0,
             recv_buffer: Vec::with_capacity(MAX_MESSAGE_LENGTH as usize + 4),
+            extensions_enabled: false,
+            extension_state: None,
+            listen_port,
+            metadata_size,
         }
     }
 
@@ -243,10 +288,13 @@ impl PeerConnection {
     }
 
     fn do_handshake(&mut self) -> Result<()> {
+        let mut reserved = [0u8; 8];
+        set_extension_bit(&mut reserved);
+
         let mut handshake = Vec::with_capacity(HANDSHAKE_LENGTH);
         handshake.push(19);
         handshake.extend_from_slice(PROTOCOL_STRING);
-        handshake.extend_from_slice(&[0u8; 8]);
+        handshake.extend_from_slice(&reserved);
         handshake.extend_from_slice(&self.info_hash);
         handshake.extend_from_slice(&self.our_peer_id);
 
@@ -263,6 +311,7 @@ impl PeerConnection {
             anyhow::bail!("invalid protocol string");
         }
 
+        let their_reserved: [u8; 8] = response[20..28].try_into().unwrap();
         let their_info_hash: [u8; 20] = response[28..48].try_into().unwrap();
         if their_info_hash != self.info_hash {
             anyhow::bail!("info hash mismatch");
@@ -273,6 +322,33 @@ impl PeerConnection {
         self.state = PeerState::Connected;
         self.last_message_received = Instant::now();
 
+        self.extensions_enabled = has_extension_bit(&their_reserved);
+
+        if self.extensions_enabled {
+            self.init_extension_state();
+            self.send_extension_handshake()?;
+        }
+
+        Ok(())
+    }
+
+    fn init_extension_state(&mut self) {
+        let our_hs = create_nimble_handshake(self.listen_port, self.metadata_size);
+        self.extension_state = Some(ExtensionState::new(our_hs));
+    }
+
+    fn send_extension_handshake(&mut self) -> Result<()> {
+        if let Some(ref mut ext_state) = self.extension_state {
+            if ext_state.handshake_sent {
+                return Ok(());
+            }
+
+            let msg = ExtendedMessage::Handshake(ext_state.our_handshake.clone());
+            let data = msg.serialize();
+            self.socket.send_all(&data)?;
+            ext_state.handshake_sent = true;
+            self.last_message_sent = Instant::now();
+        }
         Ok(())
     }
 
@@ -360,7 +436,21 @@ impl PeerConnection {
             PeerMessage::Piece { block, .. } => {
                 self.downloaded += block.len() as u64;
             }
+            PeerMessage::Extended { ext_type, payload } => {
+                self.handle_extended_message(*ext_type, payload);
+            }
             _ => {}
+        }
+    }
+
+    fn handle_extended_message(&mut self, ext_type: u8, payload: &[u8]) {
+        if ext_type == 0 {
+            if let Ok(their_hs) = ExtensionHandshake::parse(payload) {
+                if let Some(ref mut ext_state) = self.extension_state {
+                    ext_state.their_handshake = Some(their_hs);
+                    ext_state.handshake_received = true;
+                }
+            }
         }
     }
 
@@ -486,6 +576,39 @@ impl PeerConnection {
 
     pub fn peer_id(&self) -> Option<&[u8; 20]> {
         self.their_peer_id.as_ref()
+    }
+
+    pub fn extensions_enabled(&self) -> bool {
+        self.extensions_enabled
+    }
+
+    pub fn extension_state(&self) -> Option<&ExtensionState> {
+        self.extension_state.as_ref()
+    }
+
+    pub fn extension_state_mut(&mut self) -> Option<&mut ExtensionState> {
+        self.extension_state.as_mut()
+    }
+
+    pub fn peer_supports_extension(&self, name: &str) -> bool {
+        self.extension_state
+            .as_ref()
+            .map(|s| s.peer_supports(name))
+            .unwrap_or(false)
+    }
+
+    pub fn peer_metadata_size(&self) -> Option<u32> {
+        self.extension_state
+            .as_ref()
+            .and_then(|s| s.metadata_size())
+    }
+
+    pub fn send_extended_message(&mut self, ext_id: u8, payload: &[u8]) -> Result<()> {
+        let msg = PeerMessage::Extended {
+            ext_type: ext_id,
+            payload: payload.to_vec(),
+        };
+        self.send_message(&msg)
     }
 
     pub fn disconnect(&mut self) {
@@ -615,5 +738,31 @@ mod tests {
         let bytes = bitfield_to_bytes(&bf);
         assert_eq!(bytes[0], 0x81);
         assert_eq!(bytes[1], 0x40);
+    }
+
+    #[test]
+    fn test_extended_serialize() {
+        let msg = PeerMessage::Extended {
+            ext_type: 0,
+            payload: vec![b'd', b'e'],
+        };
+        let data = msg.serialize();
+        assert_eq!(data[0..4], [0, 0, 0, 4]);
+        assert_eq!(data[4], 20);
+        assert_eq!(data[5], 0);
+        assert_eq!(&data[6..], &[b'd', b'e']);
+    }
+
+    #[test]
+    fn test_parse_extended() {
+        let data = vec![20, 1, b'd', b'e'];
+        let msg = PeerMessage::parse(&data).unwrap();
+        match msg {
+            PeerMessage::Extended { ext_type, payload } => {
+                assert_eq!(ext_type, 1);
+                assert_eq!(payload, vec![b'd', b'e']);
+            }
+            _ => panic!("expected Extended"),
+        }
     }
 }

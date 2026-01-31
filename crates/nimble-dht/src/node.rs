@@ -1,13 +1,18 @@
 use nimble_util::ids::dht_node_id_20;
 use std::net::SocketAddrV4;
 
-use crate::rpc::{decode_message, Message, RpcError};
+use crate::rpc::{decode_message, Message, Query, QueryKind, Response, ResponseKind, RpcError};
 use crate::routing::RoutingTable;
 
 pub struct DhtNode {
     node_id: [u8; 20],
     logged_startup: bool,
     routing: RoutingTable,
+}
+
+pub struct PacketOutcome {
+    pub message: Message,
+    pub response: Option<Message>,
 }
 
 impl DhtNode {
@@ -42,16 +47,30 @@ impl DhtNode {
         &mut self,
         source: SocketAddrV4,
         payload: &[u8],
-    ) -> Result<Message, RpcError> {
+    ) -> Result<PacketOutcome, RpcError> {
         let message = decode_message(payload)?;
         if let Some(id) = message.sender_id() {
             self.observe_node(id, source);
         }
-        Ok(message)
+        let response = match &message {
+            Message::Query(query) => self.handle_query(query),
+            _ => None,
+        };
+        Ok(PacketOutcome { message, response })
     }
 
     pub fn observe_node(&mut self, id: [u8; 20], addr: SocketAddrV4) -> bool {
         self.routing.insert(id, addr)
+    }
+
+    fn handle_query(&self, query: &Query) -> Option<Message> {
+        match &query.kind {
+            QueryKind::Ping { .. } => Some(Message::Response(Response {
+                transaction_id: query.transaction_id.clone(),
+                kind: ResponseKind::Ping { id: self.node_id },
+            })),
+            _ => None,
+        }
     }
 }
 
@@ -89,8 +108,30 @@ mod tests {
         let payload = encode_message(&message);
         let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 6881);
 
-        let decoded = node.handle_packet(addr, &payload).unwrap();
-        assert_eq!(decoded, message);
+        let outcome = node.handle_packet(addr, &payload).unwrap();
+        assert_eq!(outcome.message, message);
         assert_eq!(node.known_nodes(), 1);
+    }
+
+    #[test]
+    fn handle_ping_returns_response() {
+        let mut node = DhtNode::new();
+        let mut sender_id = [0u8; 20];
+        sender_id[19] = 2;
+        let message = Message::Query(Query {
+            transaction_id: b"aa".to_vec(),
+            kind: QueryKind::Ping { id: sender_id },
+        });
+        let payload = encode_message(&message);
+        let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 10), 6881);
+
+        let outcome = node.handle_packet(addr, &payload).unwrap();
+        assert!(matches!(
+            outcome.response,
+            Some(Message::Response(Response {
+                transaction_id,
+                kind: ResponseKind::Ping { id },
+            })) if transaction_id == b"aa".to_vec() && id == *node.node_id()
+        ));
     }
 }

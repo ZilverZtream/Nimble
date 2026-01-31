@@ -287,7 +287,7 @@ Leaving completed TODOs unchecked is considered a bug.
 ## J2. Tokens & safety
 - [x] J2.1 Token generation
 - [x] J2.2 Token validation
-- [ ] J2.3 Rate limiting
+- [x] J2.3 Rate limiting
 
 ## J3. Bootstrap
 - [ ] J3.1 Default router list

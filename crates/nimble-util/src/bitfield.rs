@@ -25,4 +25,22 @@ impl Bitfield {
         let mask = 1u8 << (7 - (idx % 8));
         (self.bytes[byte] & mask) != 0
     }
+
+    pub fn count_ones(&self) -> usize {
+        let mut count = 0;
+        for i in 0..self.bits {
+            if self.get(i) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn len(&self) -> usize {
+        self.bits
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bits == 0
+    }
 }

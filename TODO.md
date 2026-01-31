@@ -134,15 +134,15 @@ Leaving completed TODOs unchecked is considered a bug.
 # E. Storage & Resume
 
 ## E1. File layout
-- [ ] E1.1 Global offset mapping
-- [ ] E1.2 Multi-file boundary handling
-- [ ] E1.3 File creation policy
+- [x] E1.1 Global offset mapping
+- [x] E1.2 Multi-file boundary handling
+- [x] E1.3 File creation policy
 
 ## E2. Piece storage
-- [ ] E2.1 Block receipt tracking
-- [ ] E2.2 Piece completion detection
-- [ ] E2.3 SHA-1 verification
-- [ ] E2.4 Piece invalidation on mismatch
+- [x] E2.1 Block receipt tracking
+- [x] E2.2 Piece completion detection
+- [x] E2.3 SHA-1 verification
+- [x] E2.4 Piece invalidation on mismatch
 
 ## E3. Disk cache
 - [ ] E3.1 Cache data structures

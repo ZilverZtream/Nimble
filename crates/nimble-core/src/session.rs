@@ -1,12 +1,13 @@
 use anyhow::Result;
 use nimble_bencode::torrent::{parse_info_dict, parse_torrent, InfoHash, TorrentInfo};
 use nimble_dht::node::{DhtNode, DhtQuery};
+use nimble_dht::rpc::{encode_message, Message, Query, QueryKind};
 use nimble_net::tracker_http::TrackerEvent;
 use nimble_storage::disk::DiskStorage;
 use nimble_util::ids::peer_id_20;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::SocketAddrV4;
+use std::net::{SocketAddrV4, UdpSocket};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,7 @@ pub struct Session {
     peer_id: [u8; 20],
     listen_port: u16,
     dht: Option<DhtNode>,
+    dht_socket: Option<UdpSocket>,
     announce_worker: AnnounceWorker,
     pending_announces: HashSet<String>,
 }
@@ -73,10 +75,16 @@ pub struct SessionStats {
 
 impl Session {
     pub fn new(download_dir: PathBuf, listen_port: u16, enable_dht: bool) -> Self {
-        let dht = if enable_dht {
-            Some(DhtNode::new())
+        let (dht, dht_socket) = if enable_dht {
+            let socket = UdpSocket::bind(("0.0.0.0", listen_port))
+                .ok()
+                .and_then(|s| {
+                    s.set_nonblocking(true).ok()?;
+                    Some(s)
+                });
+            (Some(DhtNode::new()), socket)
         } else {
-            None
+            (None, None)
         };
 
         Session {
@@ -85,6 +93,7 @@ impl Session {
             peer_id: peer_id_20(),
             listen_port,
             dht,
+            dht_socket,
             announce_worker: AnnounceWorker::new(),
             pending_announces: HashSet::new(),
         }
@@ -198,6 +207,8 @@ impl Session {
         let listen_port = self.listen_port;
         let mut upgrades = Vec::new();
 
+        log_lines.extend(self.process_dht_incoming());
+
         while let Some(result) = self.announce_worker.try_recv_result() {
             self.pending_announces.remove(&result.infohash_hex);
 
@@ -261,13 +272,23 @@ impl Session {
 
         if let Some(dht) = self.dht.as_mut() {
             log_lines.extend(dht.tick());
-            for query in dht.take_pending_queries() {
-                match query {
-                    DhtQuery::BootstrapPing(addr) => {
-                        log_lines.push(format!("DHT bootstrap ping queued: {}", addr));
-                    }
-                    DhtQuery::RefreshPing(addr) => {
-                        log_lines.push(format!("DHT refresh ping queued: {}", addr));
+
+            if let Some(socket) = self.dht_socket.as_ref() {
+                for query in dht.take_pending_queries() {
+                    let (addr, description) = match query {
+                        DhtQuery::BootstrapPing(addr) => (addr, "bootstrap"),
+                        DhtQuery::RefreshPing(addr) => (addr, "refresh"),
+                    };
+
+                    let transaction_id = generate_transaction_id();
+                    let message = Message::Query(Query {
+                        transaction_id,
+                        kind: QueryKind::Ping { id: *dht.node_id() },
+                    });
+                    let payload = encode_message(&message);
+
+                    if socket.send_to(&payload, addr).is_ok() {
+                        log_lines.push(format!("DHT {} ping sent: {}", description, addr));
                     }
                 }
             }
@@ -517,4 +538,43 @@ impl Session {
             None => None,
         }
     }
+
+    fn process_dht_incoming(&mut self) -> Vec<String> {
+        let mut log_lines = Vec::new();
+        let Some(socket) = self.dht_socket.as_ref() else {
+            return log_lines;
+        };
+        let Some(dht) = self.dht.as_mut() else {
+            return log_lines;
+        };
+
+        let mut buf = [0u8; 4096];
+        loop {
+            match socket.recv_from(&mut buf) {
+                Ok((len, addr)) => {
+                    if let std::net::SocketAddr::V4(v4_addr) = addr {
+                        match dht.handle_packet(v4_addr, &buf[..len]) {
+                            Ok(outcome) => {
+                                if let Some(response_msg) = outcome.response {
+                                    let response_payload = encode_message(&response_msg);
+                                    let _ = socket.send_to(&response_payload, v4_addr);
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        log_lines
+    }
+}
+
+fn generate_transaction_id() -> Vec<u8> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let value = COUNTER.fetch_add(1, Ordering::Relaxed);
+    value.to_be_bytes().to_vec()
 }

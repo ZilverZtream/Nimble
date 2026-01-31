@@ -9,7 +9,8 @@
 default = []
 ipv6 = []
 
-        [dependencies]
-        anyhow = { workspace = true }
-        thiserror = { workspace = true }
-        nimble-util = { path = "../nimble-util" }
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+nimble-bencode = { path = "../nimble-bencode" }
+nimble-util = { path = "../nimble-util" }

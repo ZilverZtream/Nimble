@@ -148,6 +148,7 @@ name = "nimble-dht"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nimble-bencode",
  "nimble-util",
  "thiserror",
 ]

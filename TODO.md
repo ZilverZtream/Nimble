@@ -60,7 +60,7 @@ Leaving completed TODOs unchecked is considered a bug.
 - [x] B2.1 Add Torrent File menu item
 - [x] B2.2 Add Magnet Link menu item
 - [x] B2.3 Open Downloads Folder menu item
-- [ ] B2.4 Status Window menu item
+- [x] B2.4 Status Window menu item
 - [x] B2.5 Pause All menu item
 - [x] B2.6 Resume All menu item
 - [ ] B2.7 Settings menu item
@@ -358,7 +358,7 @@ Leaving completed TODOs unchecked is considered a bug.
 # O. UI – Status & Settings
 
 ## O1. Status window
-- [ ] O1.1 Window creation
+- [x] O1.1 Window creation
 - [ ] O1.2 Torrent list view
 - [ ] O1.3 Live stats updates
 - [ ] O1.4 Per-torrent context menu

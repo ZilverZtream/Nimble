@@ -1,4 +1,5 @@
 use anyhow::Result;
+use crate::ui_status;
 use nimble_core::{EngineHandle, EventReceiver};
 use nimble_util::log;
 
@@ -114,7 +115,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 1001 => { handle_add_torrent_file(hwnd); }
                 1002 => { handle_add_magnet(hwnd); }
                 1003 => { handle_open_downloads(hwnd); }
-                1004 => { /* Status Window... */ }
+                1004 => { handle_status_window(hwnd); }
                 1005 => { handle_pause_all(hwnd); }
                 1006 => { handle_resume_all(hwnd); }
                 1007 => { /* Settings... */ }
@@ -238,6 +239,13 @@ unsafe fn handle_add_magnet(_hwnd: HWND) {
 unsafe fn handle_open_downloads(_hwnd: HWND) {
     // TODO: Open downloads folder
     log::info("Open Downloads not yet implemented");
+}
+
+#[cfg(windows)]
+unsafe fn handle_status_window(hwnd: HWND) {
+    if let Err(err) = ui_status::open_status_window(hwnd) {
+        log::info(&format!("Status window failed: {err:?}"));
+    }
 }
 
 #[cfg(windows)]

@@ -266,10 +266,10 @@ Leaving completed TODOs unchecked is considered a bug.
 - [ ] I2.5 Transition to full torrent
 
 ## I3. PEX (ut_pex)
-- [ ] I3.1 Parse added peers
-- [ ] I3.2 Parse dropped peers
-- [ ] I3.3 Rate limit PEX updates
-- [ ] I3.4 Feed peer candidate queue
+- [x] I3.1 Parse added peers
+- [x] I3.2 Parse dropped peers
+- [x] I3.3 Rate limit PEX updates
+- [x] I3.4 Feed peer candidate queue
 
 -------------------------------------------------------------------------------
 

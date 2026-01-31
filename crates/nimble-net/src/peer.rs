@@ -5,9 +5,10 @@ use std::time::{Duration, Instant};
 
 use crate::extension::{
     create_nimble_handshake, has_extension_bit, set_extension_bit, ExtendedMessage,
-    ExtensionHandshake, ExtensionState,
+    ExtensionHandshake, ExtensionState, EXTENSION_UT_METADATA,
 };
 use crate::sockets::TcpSocket;
+use crate::ut_metadata::{UtMetadataMessage, UtMetadataMessageType, UtMetadataState};
 
 const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
 const HANDSHAKE_LENGTH: usize = 68;
@@ -234,6 +235,8 @@ pub struct PeerConnection {
     extension_state: Option<ExtensionState>,
     listen_port: u16,
     metadata_size: Option<u32>,
+    metadata_state: Option<UtMetadataState>,
+    metadata: Option<Vec<u8>>,
 }
 
 impl PeerConnection {
@@ -278,6 +281,8 @@ impl PeerConnection {
             extension_state: None,
             listen_port,
             metadata_size,
+            metadata_state: None,
+            metadata: None,
         }
     }
 
@@ -449,6 +454,55 @@ impl PeerConnection {
                 if let Some(ref mut ext_state) = self.extension_state {
                     ext_state.their_handshake = Some(their_hs);
                     ext_state.handshake_received = true;
+                    if let Some(size) = ext_state.metadata_size() {
+                        self.init_metadata_state(size);
+                    }
+                }
+            }
+            return;
+        }
+
+        if let Some(ut_metadata_id) = self.ut_metadata_peer_id() {
+            if ext_type == ut_metadata_id {
+                self.handle_ut_metadata(payload);
+            }
+        }
+    }
+
+    fn ut_metadata_peer_id(&self) -> Option<u8> {
+        self.extension_state
+            .as_ref()
+            .and_then(|state| state.their_id_for(EXTENSION_UT_METADATA))
+    }
+
+    fn init_metadata_state(&mut self, size: u32) {
+        if self.metadata_state.is_none() {
+            if let Ok(state) = UtMetadataState::new(size) {
+                self.metadata_state = Some(state);
+            }
+        }
+    }
+
+    fn handle_ut_metadata(&mut self, payload: &[u8]) {
+        let msg = match UtMetadataMessage::parse(payload) {
+            Ok(msg) => msg,
+            Err(_) => return,
+        };
+
+        match msg.msg_type {
+            UtMetadataMessageType::Request => {}
+            UtMetadataMessageType::Reject => {}
+            UtMetadataMessageType::Data => {
+                if self.metadata_state.is_none() {
+                    if let Some(size) = msg.total_size {
+                        self.init_metadata_state(size);
+                    }
+                }
+
+                if let Some(state) = self.metadata_state.as_mut() {
+                    if let Ok(Some(metadata)) = state.insert_piece(msg.piece, &msg.data) {
+                        self.metadata = Some(metadata);
+                    }
                 }
             }
         }

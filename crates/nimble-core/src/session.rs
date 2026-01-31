@@ -1,5 +1,6 @@
 use anyhow::Result;
 use nimble_bencode::torrent::{parse_info_dict, parse_torrent, InfoHash, TorrentInfo};
+use nimble_dht::node::DhtNode;
 use nimble_net::tracker_http::{announce, AnnounceRequest, TrackerEvent};
 use nimble_storage::disk::DiskStorage;
 use nimble_util::ids::peer_id_20;
@@ -17,6 +18,7 @@ pub struct Session {
     download_dir: PathBuf,
     peer_id: [u8; 20],
     listen_port: u16,
+    dht: Option<DhtNode>,
 }
 
 pub enum TorrentEntry {
@@ -67,12 +69,19 @@ pub struct SessionStats {
 }
 
 impl Session {
-    pub fn new(download_dir: PathBuf, listen_port: u16) -> Self {
+    pub fn new(download_dir: PathBuf, listen_port: u16, enable_dht: bool) -> Self {
+        let dht = if enable_dht {
+            Some(DhtNode::new())
+        } else {
+            None
+        };
+
         Session {
             torrents: HashMap::new(),
             download_dir,
             peer_id: peer_id_20(),
             listen_port,
+            dht,
         }
     }
 
@@ -183,6 +192,12 @@ impl Session {
         let peer_id = self.peer_id;
         let listen_port = self.listen_port;
         let mut upgrades = Vec::new();
+
+        if let Some(dht) = self.dht.as_mut() {
+            if let Some(log_line) = dht.tick() {
+                log_lines.push(log_line);
+            }
+        }
 
         for (infohash, torrent) in self.torrents.iter_mut() {
             match torrent {
@@ -349,6 +364,10 @@ impl Session {
         }
 
         log_lines
+    }
+
+    pub fn dht_nodes(&self) -> u32 {
+        self.dht.as_ref().map(|dht| dht.known_nodes()).unwrap_or(0)
     }
 
     fn announce_tracker(

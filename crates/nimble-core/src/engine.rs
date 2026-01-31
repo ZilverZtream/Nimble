@@ -21,7 +21,7 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
         let _ = evt_tx.send(Event::Started);
 
         let download_dir = PathBuf::from(&settings.download_dir);
-        let mut session = Session::new(download_dir, settings.listen_port);
+        let mut session = Session::new(download_dir, settings.listen_port, settings.enable_dht);
         let mut stats = EngineStats::default();
 
         let tick_interval = Duration::from_secs(1);
@@ -70,6 +70,7 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
             }
 
             stats.active_torrents = session.active_count();
+            stats.dht_nodes = session.dht_nodes();
             let _ = evt_tx.send(Event::Stats(stats.clone()));
         }
 

@@ -227,12 +227,12 @@ Leaving completed TODOs unchecked is considered a bug.
 # H. Trackers
 
 ## H1. HTTP trackers (WinHTTP)
-- [ ] H1.1 Announce URL builder
-- [ ] H1.2 started event
-- [ ] H1.3 stopped event
-- [ ] H1.4 completed event
-- [ ] H1.5 Compact peer parsing
-- [ ] H1.6 Failure reason handling
+- [x] H1.1 Announce URL builder
+- [x] H1.2 started event
+- [x] H1.3 stopped event
+- [x] H1.4 completed event
+- [x] H1.5 Compact peer parsing
+- [x] H1.6 Failure reason handling
 
 ## H2. HTTPS trackers (WinHTTP + SChannel)
 - [ ] H2.1 TLS via SChannel

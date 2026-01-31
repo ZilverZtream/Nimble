@@ -164,30 +164,30 @@ Leaving completed TODOs unchecked is considered a bug.
 # F. Peer Protocol (TCP)
 
 ## F1. Connection handling
-- [ ] F1.1 Outbound peer connections
+- [x] F1.1 Outbound peer connections
 - [ ] F1.2 Inbound peer listener
-- [ ] F1.3 Connection caps (global/per-torrent)
-- [ ] F1.4 Backoff on failures
+- [x] F1.3 Connection caps (global/per-torrent)
+- [x] F1.4 Backoff on failures
 
 ## F2. Handshake
-- [ ] F2.1 Peer ID generation
-- [ ] F2.2 Reserved bits handling
-- [ ] F2.3 Protocol validation
+- [x] F2.1 Peer ID generation
+- [x] F2.2 Reserved bits handling
+- [x] F2.3 Protocol validation
 
 ## F3. Core messages
-- [ ] F3.1 keep-alive
-- [ ] F3.2 choke / unchoke
-- [ ] F3.3 interested / not interested
-- [ ] F3.4 have
-- [ ] F3.5 bitfield
-- [ ] F3.6 request
-- [ ] F3.7 piece
-- [ ] F3.8 cancel
+- [x] F3.1 keep-alive
+- [x] F3.2 choke / unchoke
+- [x] F3.3 interested / not interested
+- [x] F3.4 have
+- [x] F3.5 bitfield
+- [x] F3.6 request
+- [x] F3.7 piece
+- [x] F3.8 cancel
 
 ## F4. Safety caps
-- [ ] F4.1 Max message length
-- [ ] F4.2 Block size validation
-- [ ] F4.3 Piece index validation
+- [x] F4.1 Max message length
+- [x] F4.2 Block size validation
+- [x] F4.3 Piece index validation
 
 -------------------------------------------------------------------------------
 
@@ -205,8 +205,8 @@ Leaving completed TODOs unchecked is considered a bug.
 - [ ] G2.3 Seed vs leecher behavior
 
 ## G3. Piece picker
-- [ ] G3.1 Rarest-first algorithm
-- [ ] G3.2 Availability tracking
+- [x] G3.1 Rarest-first algorithm
+- [x] G3.2 Availability tracking
 - [ ] G3.3 Sequential mode
 - [ ] G3.4 File priority integration
 
@@ -387,9 +387,9 @@ Leaving completed TODOs unchecked is considered a bug.
 # P. Reliability & Testing
 
 ## P1. Unit tests
-- [ ] P1.1 Bencode decoder tests
-- [ ] P1.2 Torrent parser tests
-- [ ] P1.3 Piece picker tests
+- [x] P1.1 Bencode decoder tests
+- [x] P1.2 Torrent parser tests
+- [x] P1.3 Piece picker tests
 - [ ] P1.4 Bandwidth limiter tests
 
 ## P2. Integration tests

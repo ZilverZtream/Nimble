@@ -1,8 +1,9 @@
 use nimble_util::ids::dht_node_id_20;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use crate::bootstrap::default_bootstrap_nodes;
 use crate::rpc::{
     decode_message, ErrorMessage, Message, NodeEntry, Query, QueryKind, Response, ResponseKind,
     RpcError,
@@ -17,6 +18,9 @@ const RATE_LIMIT_WINDOW_MS: u64 = 1_000;
 const RATE_LIMIT_MAX_QUERIES: u32 = 32;
 const RATE_LIMIT_MAX_CLIENTS: usize = 1_024;
 const RATE_LIMIT_STALE_MS: u64 = 60_000;
+const BOOTSTRAP_RETRY_MS: u64 = 60_000;
+const REFRESH_INTERVAL_MS: u64 = 300_000;
+const REFRESH_BATCH_SIZE: usize = 8;
 
 pub struct DhtNode {
     node_id: [u8; 20],
@@ -25,6 +29,11 @@ pub struct DhtNode {
     tokens: TokenIssuer,
     peers: HashMap<[u8; 20], Vec<SocketAddrV4>>,
     rate_limiter: RateLimiter,
+    pending_queries: Vec<DhtQuery>,
+    bootstrap_done: bool,
+    last_bootstrap_ms: Option<u64>,
+    next_refresh_ms: u64,
+    clock_start: Instant,
 }
 
 pub struct PacketOutcome {
@@ -32,10 +41,17 @@ pub struct PacketOutcome {
     pub response: Option<Message>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DhtQuery {
+    BootstrapPing(SocketAddrV4),
+    RefreshPing(SocketAddrV4),
+}
+
 impl DhtNode {
     pub fn new() -> Self {
         let node_id = dht_node_id_20();
         let routing = RoutingTable::new(node_id);
+        let clock_start = Instant::now();
         Self {
             node_id,
             logged_startup: false,
@@ -43,6 +59,11 @@ impl DhtNode {
             tokens: TokenIssuer::new(),
             peers: HashMap::new(),
             rate_limiter: RateLimiter::new(RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_QUERIES),
+            pending_queries: Vec::new(),
+            bootstrap_done: false,
+            last_bootstrap_ms: None,
+            next_refresh_ms: REFRESH_INTERVAL_MS,
+            clock_start,
         }
     }
 
@@ -54,13 +75,63 @@ impl DhtNode {
         self.routing.len() as u32
     }
 
-    pub fn tick(&mut self) -> Option<String> {
-        if self.logged_startup {
-            return None;
+    pub fn tick(&mut self) -> Vec<String> {
+        let now = Instant::now();
+        self.tick_at(now)
+    }
+
+    pub fn tick_at(&mut self, now: Instant) -> Vec<String> {
+        let mut log_lines = Vec::new();
+
+        if !self.logged_startup {
+            self.logged_startup = true;
+            log_lines.push("DHT node initialized".to_string());
         }
 
-        self.logged_startup = true;
-        Some("DHT node initialized".to_string())
+        let now_ms = now
+            .checked_duration_since(self.clock_start)
+            .unwrap_or(Duration::from_millis(0))
+            .as_millis() as u64;
+
+        if !self.bootstrap_done {
+            if self.routing.is_empty() {
+                if self
+                    .last_bootstrap_ms
+                    .map(|last| now_ms.saturating_sub(last) >= BOOTSTRAP_RETRY_MS)
+                    .unwrap_or(true)
+                {
+                    for node in default_bootstrap_nodes() {
+                        self.pending_queries.push(DhtQuery::BootstrapPing(*node));
+                    }
+                    self.last_bootstrap_ms = Some(now_ms);
+                    log_lines.push(format!(
+                        "DHT bootstrap queued: {} nodes",
+                        default_bootstrap_nodes().len()
+                    ));
+                }
+            } else {
+                self.bootstrap_done = true;
+            }
+        }
+
+        if now_ms >= self.next_refresh_ms {
+            let mut refresh_targets = self.routing.oldest_nodes(REFRESH_BATCH_SIZE);
+            if refresh_targets.is_empty() {
+                refresh_targets = default_bootstrap_nodes().to_vec();
+            }
+            for addr in refresh_targets.iter().copied() {
+                self.pending_queries.push(DhtQuery::RefreshPing(addr));
+            }
+            if !refresh_targets.is_empty() {
+                log_lines.push(format!(
+                    "DHT refresh queued: {} nodes",
+                    refresh_targets.len()
+                ));
+            }
+            self.next_refresh_ms = now_ms.saturating_add(REFRESH_INTERVAL_MS);
+        }
+
+        log_lines
     }
 
     pub fn handle_packet(
@@ -94,6 +165,10 @@ impl DhtNode {
 
     pub fn observe_node(&mut self, id: [u8; 20], addr: SocketAddrV4) -> bool {
         self.routing.insert(id, addr)
+    }
+
+    pub fn take_pending_queries(&mut self) -> Vec<DhtQuery> {
+        std::mem::take(&mut self.pending_queries)
     }
 
     fn handle_query(&mut self, source: SocketAddrV4, query: &Query) -> Option<Message> {
@@ -451,5 +526,35 @@ mod tests {
             outcome.response,
             Some(Message::Error(ErrorMessage { code, .. })) if code == 202
         ));
+    }
+
+    #[test]
+    fn tick_queues_bootstrap_queries_on_startup() {
+        let mut node = DhtNode::new();
+        let now = node.clock_start;
+        let logs = node.tick_at(now);
+        assert!(logs.iter().any(|line| line.contains("DHT bootstrap queued")));
+        let queued = node.take_pending_queries();
+        assert!(!queued.is_empty());
+        assert!(queued.iter().all(|query| matches!(query, DhtQuery::BootstrapPing(_))));
+    }
+
+    #[test]
+    fn tick_queues_refresh_queries_after_interval() {
+        let mut node = DhtNode::new();
+        let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 8), 6881);
+        let mut other_id = [0u8; 20];
+        other_id[0] = 42;
+        node.observe_node(other_id, addr);
+
+        let now = node
+            .clock_start
+            .checked_add(Duration::from_millis(REFRESH_INTERVAL_MS))
+            .unwrap();
+        let logs = node.tick_at(now);
+        assert!(logs.iter().any(|line| line.contains("DHT refresh queued")));
+        let queued = node.take_pending_queries();
+        assert!(!queued.is_empty());
+        assert!(queued.iter().all(|query| matches!(query, DhtQuery::RefreshPing(_))));
     }
 }

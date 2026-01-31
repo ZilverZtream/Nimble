@@ -1,6 +1,6 @@
 use anyhow::Result;
 use nimble_bencode::torrent::{parse_info_dict, parse_torrent, InfoHash, TorrentInfo};
-use nimble_dht::node::DhtNode;
+use nimble_dht::node::{DhtNode, DhtQuery};
 use nimble_net::tracker_http::{announce, AnnounceRequest, TrackerEvent};
 use nimble_storage::disk::DiskStorage;
 use nimble_util::ids::peer_id_20;
@@ -194,8 +194,16 @@ impl Session {
         let mut upgrades = Vec::new();
 
         if let Some(dht) = self.dht.as_mut() {
-            if let Some(log_line) = dht.tick() {
-                log_lines.push(log_line);
+            log_lines.extend(dht.tick());
+            for query in dht.take_pending_queries() {
+                match query {
+                    DhtQuery::BootstrapPing(addr) => {
+                        log_lines.push(format!("DHT bootstrap ping queued: {}", addr));
+                    }
+                    DhtQuery::RefreshPing(addr) => {
+                        log_lines.push(format!("DHT refresh ping queued: {}", addr));
+                    }
+                }
             }
         }
 

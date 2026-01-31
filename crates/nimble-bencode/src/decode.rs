@@ -252,6 +252,12 @@ pub fn decode(input: &[u8]) -> Result<Value> {
     Ok(value)
 }
 
+pub fn decode_prefix(input: &[u8]) -> Result<(Value, usize)> {
+    let mut decoder = Decoder::new(input)?;
+    let value = decoder.decode_value()?;
+    Ok((value, decoder.pos))
+}
+
 impl<'a> Value<'a> {
     pub fn as_integer(&self) -> Option<i64> {
         match self {
@@ -291,5 +297,20 @@ impl<'a> Value<'a> {
 
     pub fn dict_get_str(&self, key: &str) -> Option<&Value<'a>> {
         self.dict_get(key.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_prefix_allows_trailing_data() {
+        let payload = b"d3:foo3:barextra";
+        let (value, consumed) = decode_prefix(payload).unwrap();
+        let dict = value.as_dict().unwrap();
+        assert_eq!(dict.get(b"foo".as_ref()).unwrap().as_str(), Some("bar"));
+        assert_eq!(consumed, 12);
+        assert_eq!(&payload[consumed..], b"xtra");
     }
 }

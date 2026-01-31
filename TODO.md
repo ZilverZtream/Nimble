@@ -259,9 +259,9 @@ Leaving completed TODOs unchecked is considered a bug.
 - [x] I1.2 Extension ID negotiation
 
 ## I2. ut_metadata
-- [ ] I2.1 Metadata request
-- [ ] I2.2 Piece assembly
-- [ ] I2.3 Size cap enforcement
+- [x] I2.1 Metadata request
+- [x] I2.2 Piece assembly
+- [x] I2.3 Size cap enforcement
 - [ ] I2.4 Infohash verification
 - [ ] I2.5 Transition to full torrent
 

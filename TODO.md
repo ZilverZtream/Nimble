@@ -280,13 +280,13 @@ Leaving completed TODOs unchecked is considered a bug.
 - [x] J1.2 Routing table (k-buckets)
 - [x] J1.3 RPC encoding/decoding
 - [x] J1.4 ping
-- [ ] J1.5 find_node
-- [ ] J1.6 get_peers
-- [ ] J1.7 announce_peer
+- [x] J1.5 find_node
+- [x] J1.6 get_peers
+- [x] J1.7 announce_peer
 
 ## J2. Tokens & safety
-- [ ] J2.1 Token generation
-- [ ] J2.2 Token validation
+- [x] J2.1 Token generation
+- [x] J2.2 Token validation
 - [ ] J2.3 Rate limiting
 
 ## J3. Bootstrap

@@ -62,12 +62,31 @@ pub enum PeerMessage {
     Unchoke,
     Interested,
     NotInterested,
-    Have { piece_index: u32 },
-    Bitfield { bitfield: Vec<u8> },
-    Request { index: u32, begin: u32, length: u32 },
-    Piece { index: u32, begin: u32, block: Vec<u8> },
-    Cancel { index: u32, begin: u32, length: u32 },
-    Extended { ext_type: u8, payload: Vec<u8> },
+    Have {
+        piece_index: u32,
+    },
+    Bitfield {
+        bitfield: Vec<u8>,
+    },
+    Request {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    Piece {
+        index: u32,
+        begin: u32,
+        block: Vec<u8>,
+    },
+    Cancel {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    Extended {
+        ext_type: u8,
+        payload: Vec<u8>,
+    },
 }
 
 impl PeerMessage {
@@ -101,14 +120,22 @@ impl PeerMessage {
                 buf.extend_from_slice(bitfield);
                 buf
             }
-            PeerMessage::Request { index, begin, length } => {
+            PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } => {
                 let mut buf = vec![0, 0, 0, 13, PeerMessageId::Request as u8];
                 buf.extend_from_slice(&index.to_be_bytes());
                 buf.extend_from_slice(&begin.to_be_bytes());
                 buf.extend_from_slice(&length.to_be_bytes());
                 buf
             }
-            PeerMessage::Piece { index, begin, block } => {
+            PeerMessage::Piece {
+                index,
+                begin,
+                block,
+            } => {
                 let len = 9 + block.len() as u32;
                 let mut buf = Vec::with_capacity(4 + len as usize);
                 buf.extend_from_slice(&len.to_be_bytes());
@@ -118,7 +145,11 @@ impl PeerMessage {
                 buf.extend_from_slice(block);
                 buf
             }
-            PeerMessage::Cancel { index, begin, length } => {
+            PeerMessage::Cancel {
+                index,
+                begin,
+                length,
+            } => {
                 let mut buf = vec![0, 0, 0, 13, PeerMessageId::Cancel as u8];
                 buf.extend_from_slice(&index.to_be_bytes());
                 buf.extend_from_slice(&begin.to_be_bytes());
@@ -142,8 +173,7 @@ impl PeerMessage {
             return Ok(PeerMessage::KeepAlive);
         }
 
-        let msg_id = PeerMessageId::from_u8(data[0])
-            .context("invalid message id")?;
+        let msg_id = PeerMessageId::from_u8(data[0]).context("invalid message id")?;
 
         match msg_id {
             PeerMessageId::Choke => Ok(PeerMessage::Choke),
@@ -168,7 +198,11 @@ impl PeerMessage {
                 let index = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
                 let begin = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
                 let length = u32::from_be_bytes([data[9], data[10], data[11], data[12]]);
-                Ok(PeerMessage::Request { index, begin, length })
+                Ok(PeerMessage::Request {
+                    index,
+                    begin,
+                    length,
+                })
             }
             PeerMessageId::Piece => {
                 if data.len() < 9 {
@@ -177,7 +211,11 @@ impl PeerMessage {
                 let index = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
                 let begin = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
                 let block = data[9..].to_vec();
-                Ok(PeerMessage::Piece { index, begin, block })
+                Ok(PeerMessage::Piece {
+                    index,
+                    begin,
+                    block,
+                })
             }
             PeerMessageId::Cancel => {
                 if data.len() < 13 {
@@ -186,7 +224,11 @@ impl PeerMessage {
                 let index = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
                 let begin = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
                 let length = u32::from_be_bytes([data[9], data[10], data[11], data[12]]);
-                Ok(PeerMessage::Cancel { index, begin, length })
+                Ok(PeerMessage::Cancel {
+                    index,
+                    begin,
+                    length,
+                })
             }
             PeerMessageId::Extended => {
                 if data.len() < 2 {
@@ -247,6 +289,7 @@ pub struct PeerConnection {
     metadata_size: Option<u32>,
     metadata_state: Option<UtMetadataState>,
     metadata: Option<Vec<u8>>,
+    metadata_requests_sent: bool,
     pex_added: Vec<SocketAddrV4>,
     pex_dropped: Vec<SocketAddrV4>,
     last_pex_received: Option<Instant>,
@@ -296,6 +339,7 @@ impl PeerConnection {
             metadata_size,
             metadata_state: None,
             metadata: None,
+            metadata_requests_sent: false,
             pex_added: Vec::new(),
             pex_dropped: Vec::new(),
             last_pex_received: None,
@@ -473,6 +517,7 @@ impl PeerConnection {
                     if let Some(size) = ext_state.metadata_size() {
                         self.init_metadata_state(size);
                     }
+                    self.maybe_request_metadata();
                 }
             }
             return;
@@ -508,8 +553,10 @@ impl PeerConnection {
         if self.metadata_state.is_none() {
             if let Ok(state) = UtMetadataState::new(size) {
                 self.metadata_state = Some(state);
+                self.metadata_requests_sent = false;
             }
         }
+        self.maybe_request_metadata();
     }
 
     fn handle_ut_metadata(&mut self, payload: &[u8]) {
@@ -532,14 +579,37 @@ impl PeerConnection {
                     if let Ok(Some(metadata)) = state.insert_piece(msg.piece, &msg.data) {
                         if verify_metadata_infohash(&metadata, self.info_hash) {
                             self.metadata = Some(metadata);
+                            self.metadata_state = None;
+                            self.metadata_requests_sent = true;
                         } else {
                             self.metadata_state = None;
                             self.metadata = None;
+                            self.metadata_requests_sent = false;
                         }
                     }
                 }
             }
         }
+        self.maybe_request_metadata();
+    }
+
+    fn maybe_request_metadata(&mut self) {
+        if self.metadata_requests_sent {
+            return;
+        }
+
+        let (state, ut_metadata_id) =
+            match (self.metadata_state.as_ref(), self.ut_metadata_peer_id()) {
+                (Some(state), Some(id)) => (state, id),
+                _ => return,
+            };
+
+        for piece in 0..state.piece_count() as u32 {
+            let payload = UtMetadataMessage::build_request(piece);
+            let _ = self.send_extended_message(ut_metadata_id, &payload);
+        }
+
+        self.metadata_requests_sent = true;
     }
 
     fn handle_ut_pex(&mut self, payload: &[u8]) {
@@ -602,7 +672,11 @@ impl PeerConnection {
             anyhow::bail!("block size too large: {}", length);
         }
 
-        self.send_message(&PeerMessage::Request { index, begin, length })?;
+        self.send_message(&PeerMessage::Request {
+            index,
+            begin,
+            length,
+        })?;
 
         self.pending_requests.push(PendingRequest {
             index,
@@ -615,16 +689,18 @@ impl PeerConnection {
     }
 
     pub fn cancel_request(&mut self, index: u32, begin: u32, length: u32) -> Result<()> {
-        self.pending_requests.retain(|r| {
-            !(r.index == index && r.begin == begin && r.length == length)
-        });
-        self.send_message(&PeerMessage::Cancel { index, begin, length })
+        self.pending_requests
+            .retain(|r| !(r.index == index && r.begin == begin && r.length == length));
+        self.send_message(&PeerMessage::Cancel {
+            index,
+            begin,
+            length,
+        })
     }
 
     pub fn complete_request(&mut self, index: u32, begin: u32) {
-        self.pending_requests.retain(|r| {
-            !(r.index == index && r.begin == begin)
-        });
+        self.pending_requests
+            .retain(|r| !(r.index == index && r.begin == begin));
     }
 
     pub fn send_keepalive(&mut self) -> Result<()> {
@@ -644,7 +720,8 @@ impl PeerConnection {
     }
 
     pub fn has_piece(&self, index: u32) -> bool {
-        self.bitfield.as_ref()
+        self.bitfield
+            .as_ref()
             .map(|bf| bf.get(index as usize))
             .unwrap_or(false)
     }
@@ -731,6 +808,10 @@ impl PeerConnection {
             added: std::mem::take(&mut self.pex_added),
             dropped: std::mem::take(&mut self.pex_dropped),
         })
+    }
+
+    pub fn take_metadata(&mut self) -> Option<Vec<u8>> {
+        self.metadata.take()
     }
 
     pub fn disconnect(&mut self) {
@@ -842,7 +923,11 @@ mod tests {
         let data = vec![6, 0, 0, 0, 5, 0, 0, 64, 0, 0, 0, 64, 0];
         let msg = PeerMessage::parse(&data).unwrap();
         match msg {
-            PeerMessage::Request { index, begin, length } => {
+            PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } => {
                 assert_eq!(index, 5);
                 assert_eq!(begin, 16384);
                 assert_eq!(length, 16384);

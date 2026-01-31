@@ -40,14 +40,8 @@ pub struct FileInfo {
 
 #[derive(Debug, Clone)]
 pub enum TorrentMode {
-    SingleFile {
-        name: String,
-        length: u64,
-    },
-    MultiFile {
-        name: String,
-        files: Vec<FileInfo>,
-    },
+    SingleFile { name: String, length: u64 },
+    MultiFile { name: String, files: Vec<FileInfo> },
 }
 
 #[derive(Debug, Clone)]
@@ -113,13 +107,24 @@ fn extract_file_path(path_value: &Value) -> Result<Vec<String>> {
     for component_val in path_list {
         let component_str = component_val
             .as_str()
-            .ok_or(TorrentError::InvalidFieldType("path component must be string"))?;
+            .ok_or(TorrentError::InvalidFieldType(
+                "path component must be string",
+            ))?;
 
         let sanitized_component = sanitize_path_component(component_str)?;
         sanitized.push(sanitized_component);
     }
 
     Ok(sanitized)
+}
+
+pub fn parse_info_dict(info_bencoded: &[u8]) -> Result<TorrentInfo> {
+    let value = decode(info_bencoded)?;
+    let info_dict = value
+        .as_dict()
+        .ok_or(TorrentError::InvalidFieldType("info must be dict"))?;
+
+    parse_info_dict_fields(info_dict, info_bencoded, None, Vec::new())
 }
 
 pub fn parse_torrent(data: &[u8]) -> Result<TorrentInfo> {
@@ -160,13 +165,28 @@ pub fn parse_torrent(data: &[u8]) -> Result<TorrentInfo> {
         .as_dict()
         .ok_or(TorrentError::InvalidFieldType("info must be dict"))?;
 
+    let info_range =
+        find_info_dict_range(data).ok_or(TorrentError::MissingField("info dict not found"))?;
+    let info_bencoded = &data[info_range.0..info_range.1];
+
+    parse_info_dict_fields(info_dict, info_bencoded, announce, announce_list)
+}
+
+fn parse_info_dict_fields(
+    info_dict: &std::collections::BTreeMap<&[u8], Value>,
+    info_bencoded: &[u8],
+    announce: Option<String>,
+    announce_list: Vec<Vec<String>>,
+) -> Result<TorrentInfo> {
     let piece_length = info_dict
         .get(b"piece length".as_ref())
         .and_then(|v| v.as_integer())
         .ok_or(TorrentError::MissingField("piece length"))?;
 
     if piece_length <= 0 {
-        return Err(TorrentError::InvalidFieldType("piece length must be positive"));
+        return Err(TorrentError::InvalidFieldType(
+            "piece length must be positive",
+        ));
     }
 
     let pieces_bytes = info_dict
@@ -199,7 +219,9 @@ pub fn parse_torrent(data: &[u8]) -> Result<TorrentInfo> {
             .ok_or(TorrentError::InvalidFieldType("length must be integer"))?;
 
         if length < 0 {
-            return Err(TorrentError::InvalidFieldType("length must be non-negative"));
+            return Err(TorrentError::InvalidFieldType(
+                "length must be non-negative",
+            ));
         }
 
         (
@@ -228,7 +250,9 @@ pub fn parse_torrent(data: &[u8]) -> Result<TorrentInfo> {
                 .ok_or(TorrentError::MissingField("file length"))?;
 
             if length < 0 {
-                return Err(TorrentError::InvalidFieldType("file length must be non-negative"));
+                return Err(TorrentError::InvalidFieldType(
+                    "file length must be non-negative",
+                ));
             }
 
             let path_val = file_dict
@@ -250,7 +274,7 @@ pub fn parse_torrent(data: &[u8]) -> Result<TorrentInfo> {
         return Err(TorrentError::MissingField("length or files"));
     };
 
-    let infohash = compute_infohash(data)?;
+    let infohash = compute_infohash(info_bencoded);
 
     Ok(TorrentInfo {
         announce,
@@ -263,14 +287,10 @@ pub fn parse_torrent(data: &[u8]) -> Result<TorrentInfo> {
     })
 }
 
-fn compute_infohash(torrent_data: &[u8]) -> Result<InfoHash> {
-    let info_start = find_info_dict_range(torrent_data)
-        .ok_or(TorrentError::MissingField("info dict not found"))?;
-
-    let info_bencoded = &torrent_data[info_start.0..info_start.1];
+fn compute_infohash(info_bencoded: &[u8]) -> InfoHash {
     let hash = nimble_util::hash::sha1(info_bencoded);
 
-    Ok(InfoHash(hash))
+    InfoHash(hash)
 }
 
 fn find_info_dict_range(data: &[u8]) -> Option<(usize, usize)> {
@@ -413,5 +433,19 @@ mod tests {
             }
             _ => panic!("expected single file mode"),
         }
+    }
+
+    #[test]
+    fn test_parse_info_dict() {
+        let info = b"d6:lengthi1024e4:name8:test.txt12:piece lengthi262144e6:pieces20:\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13e";
+        let parsed = parse_info_dict(info).unwrap();
+
+        assert_eq!(parsed.announce, None);
+        assert_eq!(parsed.piece_length, 262144);
+        assert_eq!(parsed.pieces.len(), 1);
+        assert_eq!(parsed.total_length, 1024);
+
+        let expected_hash = nimble_util::hash::sha1(info);
+        assert_eq!(*parsed.infohash.as_bytes(), expected_hash);
     }
 }

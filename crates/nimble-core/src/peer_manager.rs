@@ -18,6 +18,8 @@ pub struct PeerManager {
     piece_count: usize,
     piece_length: u64,
     total_length: u64,
+    metadata_only: bool,
+    pending_metadata: Option<Vec<u8>>,
     peers: HashMap<SocketAddrV4, ManagedPeer>,
     candidate_peers: VecDeque<SocketAddrV4>,
     failed_peers: HashMap<SocketAddrV4, (Instant, usize)>,
@@ -50,6 +52,8 @@ impl PeerManager {
             piece_count,
             piece_length,
             total_length,
+            metadata_only: false,
+            pending_metadata: None,
             peers: HashMap::new(),
             candidate_peers: VecDeque::new(),
             failed_peers: HashMap::new(),
@@ -57,15 +61,30 @@ impl PeerManager {
         }
     }
 
+    pub fn new_metadata_only(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
+        PeerManager {
+            info_hash,
+            peer_id,
+            piece_count: 0,
+            piece_length: 0,
+            total_length: 0,
+            metadata_only: true,
+            pending_metadata: None,
+            peers: HashMap::new(),
+            candidate_peers: VecDeque::new(),
+            failed_peers: HashMap::new(),
+            piece_picker: PiecePicker::new(0),
+        }
+    }
+
     pub fn add_peers(&mut self, addrs: &[SocketAddrV4]) {
         for &addr in addrs {
-            if !self.peers.contains_key(&addr)
-                && !self.candidate_peers.contains(&addr)
-            {
-                let should_add = self.failed_peers.get(&addr)
+            if !self.peers.contains_key(&addr) && !self.candidate_peers.contains(&addr) {
+                let should_add = self
+                    .failed_peers
+                    .get(&addr)
                     .map(|(time, count)| {
-                        *count < MAX_CONNECT_ATTEMPTS
-                            && time.elapsed() >= CONNECT_RETRY_DELAY
+                        *count < MAX_CONNECT_ATTEMPTS && time.elapsed() >= CONNECT_RETRY_DELAY
                     })
                     .unwrap_or(true);
 
@@ -76,7 +95,7 @@ impl PeerManager {
         }
     }
 
-    pub fn tick(&mut self, storage: &mut DiskStorage) -> Result<PeerManagerStats> {
+    pub fn tick(&mut self, mut storage: Option<&mut DiskStorage>) -> Result<PeerManagerStats> {
         let mut stats = PeerManagerStats::default();
 
         self.connect_to_candidates();
@@ -89,7 +108,7 @@ impl PeerManager {
         for (&addr, peer) in self.peers.iter_mut() {
             match peer.connection.state() {
                 PeerState::Connected => {
-                    match Self::handle_peer_messages(peer, storage, &mut self.piece_picker) {
+                    match Self::handle_peer_messages(peer, &mut self.piece_picker) {
                         Ok(blocks) => {
                             if let Some(update) = peer.connection.take_pex_updates() {
                                 for addr in update.added {
@@ -100,20 +119,31 @@ impl PeerManager {
                                 }
                             }
 
-                            for (index, begin, data) in blocks {
-                                match storage.write_block(index as u64, begin, &data) {
-                                    Ok(true) => {
-                                        pieces_received.push(index);
-                                        self.piece_picker.mark_completed(index as usize);
-                                    }
-                                    Ok(false) => {}
-                                    Err(_) => {
-                                        self.piece_picker.cancel_piece(index as usize);
+                            if !self.metadata_only {
+                                if let Some(storage) = storage.as_mut() {
+                                    for (index, begin, data) in blocks {
+                                        match storage.write_block(index as u64, begin, &data) {
+                                            Ok(true) => {
+                                                pieces_received.push(index);
+                                                self.piece_picker.mark_completed(index as usize);
+                                            }
+                                            Ok(false) => {}
+                                            Err(_) => {
+                                                self.piece_picker.cancel_piece(index as usize);
+                                            }
+                                        }
                                     }
                                 }
                             }
 
-                            if !peer.connection.is_choking()
+                            if self.metadata_only && self.pending_metadata.is_none() {
+                                if let Some(metadata) = peer.connection.take_metadata() {
+                                    self.pending_metadata = Some(metadata);
+                                }
+                            }
+
+                            if !self.metadata_only
+                                && !peer.connection.is_choking()
                                 && peer.pending_blocks.len() < MAX_PENDING_PER_PEER
                             {
                                 Self::request_blocks(
@@ -151,7 +181,8 @@ impl PeerManager {
         for addr in peers_to_remove {
             if let Some(peer) = self.peers.remove(&addr) {
                 for block in peer.pending_blocks {
-                    self.piece_picker.cancel_block(block.piece as usize, block.offset);
+                    self.piece_picker
+                        .cancel_block(block.piece as usize, block.offset);
                 }
 
                 let entry = self.failed_peers.entry(addr).or_insert((Instant::now(), 0));
@@ -170,7 +201,10 @@ impl PeerManager {
 
         stats.connected_peers = self.peers.len() as u32;
         stats.candidate_peers = self.candidate_peers.len() as u32;
-        stats.pieces_completed = storage.bitfield().count_ones() as u32;
+        stats.pieces_completed = storage
+            .as_deref()
+            .map(|storage| storage.bitfield().count_ones() as u32)
+            .unwrap_or(0);
         stats.pieces_total = self.piece_count as u32;
 
         Ok(stats)
@@ -183,21 +217,20 @@ impl PeerManager {
                 None => break,
             };
 
-            let mut conn = PeerConnection::new(
-                addr,
-                self.info_hash,
-                self.peer_id,
-                self.piece_count,
-            );
+            let mut conn =
+                PeerConnection::new(addr, self.info_hash, self.peer_id, self.piece_count);
 
             match conn.connect() {
                 Ok(()) => {
                     let _ = conn.set_interested(true);
 
-                    self.peers.insert(addr, ManagedPeer {
-                        connection: conn,
-                        pending_blocks: Vec::new(),
-                    });
+                    self.peers.insert(
+                        addr,
+                        ManagedPeer {
+                            connection: conn,
+                            pending_blocks: Vec::new(),
+                        },
+                    );
                 }
                 Err(_) => {
                     let entry = self.failed_peers.entry(addr).or_insert((Instant::now(), 0));
@@ -217,46 +250,46 @@ impl PeerManager {
 
     fn handle_peer_messages(
         peer: &mut ManagedPeer,
-        _storage: &mut DiskStorage,
         picker: &mut PiecePicker,
     ) -> Result<Vec<(u32, u32, Vec<u8>)>> {
         let mut received_blocks = Vec::new();
 
         loop {
             match peer.connection.recv_message() {
-                Ok(Some(msg)) => {
-                    match msg {
-                        PeerMessage::Piece { index, begin, block } => {
-                            peer.pending_blocks.retain(|r| {
-                                !(r.piece == index && r.offset == begin)
-                            });
-                            peer.connection.complete_request(index, begin);
-                            received_blocks.push((index, begin, block));
-                        }
-                        PeerMessage::Unchoke => {
-                        }
-                        PeerMessage::Choke => {
-                            for block in peer.pending_blocks.drain(..) {
-                                picker.cancel_block(block.piece as usize, block.offset);
-                            }
-                        }
-                        PeerMessage::Have { piece_index } => {
-                            picker.update_availability(piece_index as usize, true);
-                        }
-                        PeerMessage::Bitfield { bitfield } => {
-                            let bf = Bitfield::from_bytes(&bitfield, picker.piece_count());
-                            for i in 0..bf.len() {
-                                if bf.get(i) {
-                                    picker.update_availability(i, true);
-                                }
-                            }
-                        }
-                        _ => {}
+                Ok(Some(msg)) => match msg {
+                    PeerMessage::Piece {
+                        index,
+                        begin,
+                        block,
+                    } => {
+                        peer.pending_blocks
+                            .retain(|r| !(r.piece == index && r.offset == begin));
+                        peer.connection.complete_request(index, begin);
+                        received_blocks.push((index, begin, block));
                     }
-                }
+                    PeerMessage::Unchoke => {}
+                    PeerMessage::Choke => {
+                        for block in peer.pending_blocks.drain(..) {
+                            picker.cancel_block(block.piece as usize, block.offset);
+                        }
+                    }
+                    PeerMessage::Have { piece_index } => {
+                        picker.update_availability(piece_index as usize, true);
+                    }
+                    PeerMessage::Bitfield { bitfield } => {
+                        let bf = Bitfield::from_bytes(&bitfield, picker.piece_count());
+                        for i in 0..bf.len() {
+                            if bf.get(i) {
+                                picker.update_availability(i, true);
+                            }
+                        }
+                    }
+                    _ => {}
+                },
                 Ok(None) => break,
                 Err(e) => {
-                    if e.to_string().contains("timed out") || e.to_string().contains("WSAETIMEDOUT") {
+                    if e.to_string().contains("timed out") || e.to_string().contains("WSAETIMEDOUT")
+                    {
                         break;
                     }
                     return Err(e);
@@ -282,7 +315,11 @@ impl PeerManager {
 
             let piece_len = if piece_index == piece_count - 1 {
                 let remainder = total_length % piece_length;
-                if remainder == 0 { piece_length } else { remainder }
+                if remainder == 0 {
+                    piece_length
+                } else {
+                    remainder
+                }
             } else {
                 piece_length
             };
@@ -312,7 +349,11 @@ impl PeerManager {
                     length,
                 };
 
-                if peer.connection.request_block(req.piece, req.offset, req.length).is_ok() {
+                if peer
+                    .connection
+                    .request_block(req.piece, req.offset, req.length)
+                    .is_ok()
+                {
                     peer.pending_blocks.push(req);
                     picker.mark_block_pending(piece_index, offset);
                 }
@@ -336,6 +377,10 @@ impl PeerManager {
                 self.piece_picker.mark_completed(i);
             }
         }
+    }
+
+    pub fn take_metadata(&mut self) -> Option<Vec<u8>> {
+        self.pending_metadata.take()
     }
 }
 

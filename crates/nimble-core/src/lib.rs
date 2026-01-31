@@ -1,4 +1,5 @@
 pub mod engine;
+mod magnet;
 pub mod peer_manager;
 pub mod session;
 pub mod settings;

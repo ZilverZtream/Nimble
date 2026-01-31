@@ -58,6 +58,7 @@ struct PendingQuery {
 enum QueryType {
     BootstrapPing,
     RefreshPing,
+    VerificationPing([u8; 20]),
     GetPeers([u8; 20]),
 }
 
@@ -196,7 +197,13 @@ impl DhtNode {
                                 }
                             }
                         }
-                        ResponseKind::Ping { .. } => {}
+                        ResponseKind::Ping { id } => {
+                            if let QueryType::VerificationPing(expected_id) = pending.query_type {
+                                if *id == expected_id {
+                                    self.routing.mark_node_good(&expected_id);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -217,7 +224,18 @@ impl DhtNode {
     }
 
     pub fn observe_node(&mut self, id: [u8; 20], addr: SocketAddrV4) -> bool {
-        self.routing.insert(id, addr)
+        use crate::routing::InsertResult;
+        let result = self.routing.insert(id, addr);
+
+        if let InsertResult::PingOldest { addr: ping_addr, id: ping_id } = result {
+            let now_ms = Instant::now()
+                .checked_duration_since(self.clock_start)
+                .unwrap_or(Duration::from_millis(0))
+                .as_millis() as u64;
+            self.queue_verification_ping(ping_addr, ping_id, now_ms);
+        }
+
+        result.was_inserted()
     }
 
     pub fn take_pending_packets(&mut self) -> Vec<(SocketAddrV4, Vec<u8>)> {
@@ -272,6 +290,10 @@ impl DhtNode {
         self.pending_outbound.push((addr, payload));
     }
 
+    fn queue_verification_ping(&mut self, addr: SocketAddrV4, node_id: [u8; 20], now_ms: u64) {
+        self.queue_ping(addr, QueryType::VerificationPing(node_id), now_ms);
+    }
+
     fn queue_get_peers(&mut self, addr: SocketAddrV4, info_hash: [u8; 20], now_ms: u64) {
         if self.pending_queries.len() >= MAX_PENDING_QUERIES {
             return;
@@ -300,8 +322,21 @@ impl DhtNode {
     }
 
     fn cleanup_stale_queries(&mut self, now_ms: u64) {
-        self.pending_queries
-            .retain(|_, query| now_ms.saturating_sub(query.sent_at_ms) < QUERY_TIMEOUT_MS);
+        let mut timed_out_verifications = Vec::new();
+
+        self.pending_queries.retain(|_, query| {
+            let is_stale = now_ms.saturating_sub(query.sent_at_ms) >= QUERY_TIMEOUT_MS;
+            if is_stale {
+                if let QueryType::VerificationPing(node_id) = query.query_type {
+                    timed_out_verifications.push(node_id);
+                }
+            }
+            !is_stale
+        });
+
+        for node_id in timed_out_verifications {
+            self.routing.handle_ping_timeout(&node_id);
+        }
     }
 
     fn handle_query(&mut self, source: SocketAddrV4, query: &Query) -> Option<Message> {

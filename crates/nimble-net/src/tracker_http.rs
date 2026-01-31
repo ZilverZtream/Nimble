@@ -195,7 +195,8 @@ unsafe fn http_get_inner(h_session: *mut std::ffi::c_void, url: &str) -> Result<
     }
 
     let mut response_data = Vec::new();
-    let mut buffer = vec![0u8; 4096];
+    const READ_BUFFER_SIZE: usize = 4096;
+    let mut buffer = [0u8; READ_BUFFER_SIZE];
 
     loop {
         let mut bytes_read: u32 = 0;
@@ -203,7 +204,7 @@ unsafe fn http_get_inner(h_session: *mut std::ffi::c_void, url: &str) -> Result<
         let read_result = WinHttpReadData(
             h_request,
             buffer.as_mut_ptr() as *mut _,
-            buffer.len() as u32,
+            READ_BUFFER_SIZE as u32,
             &mut bytes_read,
         );
 

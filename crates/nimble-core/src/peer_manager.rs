@@ -128,15 +128,8 @@ impl PeerManager {
                             if !self.metadata_only {
                                 if let Some(storage) = storage.as_mut() {
                                     for (index, begin, data) in blocks {
-                                        match storage.write_block(index as u64, begin, &data) {
-                                            Ok(true) => {
-                                                pieces_received.push(index);
-                                                self.piece_picker.mark_completed(index as usize);
-                                            }
-                                            Ok(false) => {}
-                                            Err(_) => {
-                                                self.piece_picker.cancel_piece(index as usize);
-                                            }
+                                        if let Err(_) = storage.write_block(index as u64, begin, &data) {
+                                            self.piece_picker.cancel_piece(index as usize);
                                         }
                                     }
                                 }
@@ -173,6 +166,13 @@ impl PeerManager {
                     peers_to_remove.push(addr);
                 }
                 _ => {}
+            }
+        }
+
+        if let Some(storage) = storage.as_mut() {
+            for piece_index in storage.poll_verifications() {
+                pieces_received.push(piece_index as u32);
+                self.piece_picker.mark_completed(piece_index as usize);
             }
         }
 
@@ -257,7 +257,33 @@ impl PeerManager {
         self.candidate_peers.retain(|addr| !dropped.contains(addr));
     }
 
+    fn is_timeout_error(e: &anyhow::Error) -> bool {
+        use std::io::ErrorKind;
+
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            return matches!(io_err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock);
+        }
+
+        let error_msg = e.to_string();
+        error_msg.contains("timed out")
+            || error_msg.contains("WSAETIMEDOUT")
+            || error_msg.contains("10060")
+    }
+
     fn is_fatal_error(e: &anyhow::Error) -> bool {
+        use std::io::ErrorKind;
+
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io_err.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::NotConnected
+                    | ErrorKind::ConnectionRefused
+            );
+        }
+
         let error_msg = e.to_string();
         error_msg.contains("connection closed")
             || error_msg.contains("not connected")
@@ -306,8 +332,7 @@ impl PeerManager {
                 },
                 Ok(None) => break,
                 Err(e) => {
-                    if e.to_string().contains("timed out") || e.to_string().contains("WSAETIMEDOUT")
-                    {
+                    if Self::is_timeout_error(&e) {
                         break;
                     }
                     if Self::is_fatal_error(&e) {

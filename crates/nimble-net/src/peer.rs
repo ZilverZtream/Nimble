@@ -24,6 +24,12 @@ const EXTENDED_MESSAGE_ID: u8 = 20;
 const PEX_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecvState {
+    ReadingLength,
+    ReadingMessage { msg_len: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerMessageId {
     Choke = 0,
     Unchoke = 1,
@@ -283,6 +289,7 @@ pub struct PeerConnection {
     downloaded: u64,
     uploaded: u64,
     recv_buffer: Vec<u8>,
+    recv_state: RecvState,
     extensions_enabled: bool,
     extension_state: Option<ExtensionState>,
     listen_port: u16,
@@ -332,7 +339,8 @@ impl PeerConnection {
             last_message_received: now,
             downloaded: 0,
             uploaded: 0,
-            recv_buffer: Vec::with_capacity(MAX_MESSAGE_LENGTH as usize + 4),
+            recv_buffer: Vec::new(),
+            recv_state: RecvState::ReadingLength,
             extensions_enabled: false,
             extension_state: None,
             listen_port,
@@ -441,29 +449,86 @@ impl PeerConnection {
             anyhow::bail!("not connected");
         }
 
-        let mut len_buf = [0u8; 4];
-        self.socket.recv_exact(&mut len_buf)?;
-        let msg_len = u32::from_be_bytes(len_buf);
+        loop {
+            match self.recv_state {
+                RecvState::ReadingLength => {
+                    let needed = 4 - self.recv_buffer.len();
+                    if needed > 0 {
+                        let mut temp_buf = vec![0u8; needed];
+                        match self.socket.recv(&mut temp_buf) {
+                            Ok(0) => {
+                                anyhow::bail!("connection closed");
+                            }
+                            Ok(n) => {
+                                self.recv_buffer.extend_from_slice(&temp_buf[..n]);
+                            }
+                            Err(e) => {
+                                if e.to_string().contains("timed out")
+                                    || e.to_string().contains("WSAETIMEDOUT")
+                                {
+                                    return Ok(None);
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
 
-        if msg_len > MAX_MESSAGE_LENGTH {
-            anyhow::bail!("message too large: {} bytes", msg_len);
+                    if self.recv_buffer.len() == 4 {
+                        let msg_len =
+                            u32::from_be_bytes([self.recv_buffer[0], self.recv_buffer[1], self.recv_buffer[2], self.recv_buffer[3]]);
+
+                        if msg_len > MAX_MESSAGE_LENGTH {
+                            anyhow::bail!("message too large: {} bytes", msg_len);
+                        }
+
+                        if msg_len == 0 {
+                            self.recv_buffer.clear();
+                            self.recv_state = RecvState::ReadingLength;
+                            self.last_message_received = Instant::now();
+                            return Ok(Some(PeerMessage::KeepAlive));
+                        }
+
+                        self.recv_buffer.clear();
+                        self.recv_state = RecvState::ReadingMessage { msg_len };
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                RecvState::ReadingMessage { msg_len } => {
+                    let needed = msg_len as usize - self.recv_buffer.len();
+                    if needed > 0 {
+                        let mut temp_buf = vec![0u8; needed.min(8192)];
+                        match self.socket.recv(&mut temp_buf) {
+                            Ok(0) => {
+                                anyhow::bail!("connection closed");
+                            }
+                            Ok(n) => {
+                                self.recv_buffer.extend_from_slice(&temp_buf[..n]);
+                            }
+                            Err(e) => {
+                                if e.to_string().contains("timed out")
+                                    || e.to_string().contains("WSAETIMEDOUT")
+                                {
+                                    return Ok(None);
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+
+                    if self.recv_buffer.len() == msg_len as usize {
+                        let msg = PeerMessage::parse(&self.recv_buffer)?;
+                        self.apply_incoming_message(&msg);
+                        self.recv_buffer.clear();
+                        self.recv_state = RecvState::ReadingLength;
+                        self.last_message_received = Instant::now();
+                        return Ok(Some(msg));
+                    } else {
+                        return Ok(None);
+                    }
+                }
+            }
         }
-
-        if msg_len == 0 {
-            self.last_message_received = Instant::now();
-            return Ok(Some(PeerMessage::KeepAlive));
-        }
-
-        self.recv_buffer.clear();
-        self.recv_buffer.resize(msg_len as usize, 0);
-        self.socket.recv_exact(&mut self.recv_buffer)?;
-
-        self.last_message_received = Instant::now();
-
-        let msg = PeerMessage::parse(&self.recv_buffer)?;
-        self.apply_incoming_message(&msg);
-
-        Ok(Some(msg))
     }
 
     fn apply_incoming_message(&mut self, msg: &PeerMessage) {

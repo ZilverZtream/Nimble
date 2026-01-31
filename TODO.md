@@ -51,20 +51,20 @@ Leaving completed TODOs unchecked is considered a bug.
 # B. Win32 Tray Application
 
 ## B1. Tray lifecycle
-- [ ] B1.1 Hidden window creation
-- [ ] B1.2 Shell_NotifyIcon registration
-- [ ] B1.3 Tray icon removal on shutdown
-- [ ] B1.4 Clean shutdown on WM_DESTROY
+- [x] B1.1 Hidden window creation
+- [x] B1.2 Shell_NotifyIcon registration
+- [x] B1.3 Tray icon removal on shutdown
+- [x] B1.4 Clean shutdown on WM_DESTROY
 
 ## B2. Tray menu
-- [ ] B2.1 Add Torrent File menu item
-- [ ] B2.2 Add Magnet Link menu item
-- [ ] B2.3 Open Downloads Folder menu item
+- [x] B2.1 Add Torrent File menu item
+- [x] B2.2 Add Magnet Link menu item
+- [x] B2.3 Open Downloads Folder menu item
 - [ ] B2.4 Status Window menu item
-- [ ] B2.5 Pause All menu item
-- [ ] B2.6 Resume All menu item
+- [x] B2.5 Pause All menu item
+- [x] B2.6 Resume All menu item
 - [ ] B2.7 Settings menu item
-- [ ] B2.8 Quit menu item
+- [x] B2.8 Quit menu item
 
 ## B3. Tray icon state
 - [ ] B3.1 Idle icon
@@ -78,22 +78,22 @@ Leaving completed TODOs unchecked is considered a bug.
 # C. Engine Core & Wiring
 
 ## C1. Engine lifecycle
-- [ ] C1.1 Engine thread startup
-- [ ] C1.2 Engine shutdown handling
-- [ ] C1.3 Command channel processing
-- [ ] C1.4 Event emission channel
+- [x] C1.1 Engine thread startup
+- [x] C1.2 Engine shutdown handling
+- [x] C1.3 Command channel processing
+- [x] C1.4 Event emission channel
 
 ## C2. Command wiring
-- [ ] C2.1 AddTorrentFile command wired
-- [ ] C2.2 AddMagnet command wired
-- [ ] C2.3 PauseAll command wired
-- [ ] C2.4 ResumeAll command wired
-- [ ] C2.5 Shutdown command wired
+- [x] C2.1 AddTorrentFile command wired
+- [x] C2.2 AddMagnet command wired
+- [x] C2.3 PauseAll command wired
+- [x] C2.4 ResumeAll command wired
+- [x] C2.5 Shutdown command wired
 
 ## C3. Session manager
-- [ ] C3.1 Torrent registry
+- [x] C3.1 Torrent registry
 - [ ] C3.2 Max active torrents enforcement
-- [ ] C3.3 Torrent lifecycle states
+- [x] C3.3 Torrent lifecycle states
 - [ ] C3.4 Graceful stop/start transitions
 
 -------------------------------------------------------------------------------

@@ -16,6 +16,37 @@ mod windows_impl {
     const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
     const HANDSHAKE_LENGTH: usize = 68;
 
+    struct SafeSocket(SOCKET);
+
+    impl SafeSocket {
+        fn new(socket: SOCKET) -> Result<Self> {
+            if socket == INVALID_SOCKET {
+                return Err(anyhow!("invalid socket"));
+            }
+            Ok(SafeSocket(socket))
+        }
+
+        fn raw(&self) -> SOCKET {
+            self.0
+        }
+
+        fn into_raw(self) -> SOCKET {
+            let socket = self.0;
+            std::mem::forget(self);
+            socket
+        }
+    }
+
+    impl Drop for SafeSocket {
+        fn drop(&mut self) {
+            if self.0 != INVALID_SOCKET {
+                unsafe {
+                    WinSock::closesocket(self.0);
+                }
+            }
+        }
+    }
+
     pub struct PeerListener {
         socket: SOCKET,
         port: u16,
@@ -47,16 +78,13 @@ mod windows_impl {
         pub fn new(port: u16) -> Result<Self> {
             init_winsock()?;
 
-            let socket = unsafe { WinSock::socket(AF_INET as i32, SOCK_STREAM, IPPROTO_TCP) };
-
-            if socket == INVALID_SOCKET {
-                return Err(anyhow!("socket() failed: {}", get_last_error()));
-            }
+            let raw_socket = unsafe { WinSock::socket(AF_INET as i32, SOCK_STREAM, IPPROTO_TCP) };
+            let socket = SafeSocket::new(raw_socket)?;
 
             let enable: i32 = 1;
             unsafe {
                 WinSock::setsockopt(
-                    socket,
+                    socket.raw(),
                     SOL_SOCKET,
                     SO_REUSEADDR,
                     &enable as *const i32 as *const u8,
@@ -77,32 +105,26 @@ mod windows_impl {
 
             let bind_result = unsafe {
                 WinSock::bind(
-                    socket,
+                    socket.raw(),
                     &sockaddr as *const SOCKADDR_IN as *const WinSock::SOCKADDR,
                     std::mem::size_of::<SOCKADDR_IN>() as i32,
                 )
             };
 
             if bind_result == SOCKET_ERROR {
-                unsafe {
-                    WinSock::closesocket(socket);
-                }
                 return Err(anyhow!("bind() failed: {}", get_last_error()));
             }
 
-            let listen_result = unsafe { WinSock::listen(socket, 16) };
+            let listen_result = unsafe { WinSock::listen(socket.raw(), 16) };
 
             if listen_result == SOCKET_ERROR {
-                unsafe {
-                    WinSock::closesocket(socket);
-                }
                 return Err(anyhow!("listen() failed: {}", get_last_error()));
             }
 
-            set_nonblocking(socket)?;
+            set_nonblocking(socket.raw())?;
 
             Ok(PeerListener {
-                socket,
+                socket: socket.into_raw(),
                 port,
                 pending: HashMap::new(),
                 infohash_registry: HashMap::new(),
@@ -245,8 +267,12 @@ mod windows_impl {
                 return Err(anyhow!("invalid protocol string"));
             }
 
-            let their_info_hash: [u8; 20] = data[28..48].try_into().unwrap();
-            let their_peer_id: [u8; 20] = data[48..68].try_into().unwrap();
+            let their_info_hash: [u8; 20] = data[28..48]
+                .try_into()
+                .map_err(|_| anyhow!("invalid info hash length"))?;
+            let their_peer_id: [u8; 20] = data[48..68]
+                .try_into()
+                .map_err(|_| anyhow!("invalid peer id length"))?;
 
             let entry = self
                 .infohash_registry
@@ -546,8 +572,12 @@ mod unix_impl {
                 return Err(anyhow!("invalid protocol string"));
             }
 
-            let their_info_hash: [u8; 20] = data[28..48].try_into().unwrap();
-            let their_peer_id: [u8; 20] = data[48..68].try_into().unwrap();
+            let their_info_hash: [u8; 20] = data[28..48]
+                .try_into()
+                .map_err(|_| anyhow!("invalid info hash length"))?;
+            let their_peer_id: [u8; 20] = data[48..68]
+                .try_into()
+                .map_err(|_| anyhow!("invalid peer id length"))?;
 
             let entry = registry
                 .get(&their_info_hash)

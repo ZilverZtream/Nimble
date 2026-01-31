@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use crate::session::Session;
 use crate::settings::EngineSettings;
@@ -20,12 +21,17 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
         let _ = evt_tx.send(Event::Started);
 
         let download_dir = PathBuf::from(&settings.download_dir);
-        let mut session = Session::new(download_dir);
+        let mut session = Session::new(download_dir, settings.listen_port);
         let mut stats = EngineStats::default();
 
+        let tick_interval = Duration::from_secs(1);
+
         loop {
-            match cmd_rx.recv() {
-                Ok(Command::Shutdown) | Err(_) => break,
+            match cmd_rx.recv_timeout(tick_interval) {
+                Ok(Command::Shutdown) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                }
 
                 Ok(Command::PauseAll) => {
                     session.pause_all();
@@ -54,6 +60,10 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
                     let msg = format!("Magnet not yet implemented: {}", uri);
                     let _ = evt_tx.send(Event::LogLine(msg));
                 }
+            }
+
+            for log_line in session.tick() {
+                let _ = evt_tx.send(Event::LogLine(log_line));
             }
 
             stats.active_torrents = session.active_count();

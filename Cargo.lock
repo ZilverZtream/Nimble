@@ -175,6 +175,7 @@ name = "nimble-net"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nimble-bencode",
  "nimble-util",
  "thiserror",
  "windows-sys",

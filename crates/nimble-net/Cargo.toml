@@ -21,3 +21,4 @@ utp = []
   "Win32_System_Threading",
 ] }
 nimble-util = { path = "../nimble-util" }
+nimble-bencode = { path = "../nimble-bencode" }

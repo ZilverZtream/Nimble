@@ -10,11 +10,16 @@ use windows_sys::Win32::{
     System::LibraryLoader::*,
 };
 
+#[cfg(windows)]
+const WM_APP: u32 = 0x8000;
+
 // NOTE:
 // This is a minimal placeholder tray loop. It establishes a hidden window
 // and registers a tray icon. Menu actions are wired but most commands are stubs.
 
+#[cfg(windows)]
 const WM_TRAYICON: u32 = WM_APP + 1;
+#[cfg(windows)]
 const TRAY_UID: u32 = 1;
 
 pub fn run_tray_loop(_engine: EngineHandle, _events: EventReceiver) -> Result<()> {

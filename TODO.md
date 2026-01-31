@@ -101,33 +101,33 @@ Leaving completed TODOs unchecked is considered a bug.
 # D. Bencode & Torrent Parsing
 
 ## D1. Bencode decoder
-- [ ] D1.1 Integer parsing
-- [ ] D1.2 Byte string parsing
-- [ ] D1.3 List parsing
-- [ ] D1.4 Dictionary parsing
-- [ ] D1.5 Zero-copy decoding where possible
-- [ ] D1.6 Nesting depth cap
-- [ ] D1.7 Input size cap
-- [ ] D1.8 Fuzz tests
+- [x] D1.1 Integer parsing
+- [x] D1.2 Byte string parsing
+- [x] D1.3 List parsing
+- [x] D1.4 Dictionary parsing
+- [x] D1.5 Zero-copy decoding where possible
+- [x] D1.6 Nesting depth cap
+- [x] D1.7 Input size cap
+- [x] D1.8 Fuzz tests
 
 ## D2. Torrent parsing
-- [ ] D2.1 Parse announce URL
-- [ ] D2.2 Parse announce-list tiers
-- [ ] D2.3 Parse piece length
-- [ ] D2.4 Parse pieces SHA-1 list
-- [ ] D2.5 Parse single-file torrents
-- [ ] D2.6 Parse multi-file torrents
+- [x] D2.1 Parse announce URL
+- [x] D2.2 Parse announce-list tiers
+- [x] D2.3 Parse piece length
+- [x] D2.4 Parse pieces SHA-1 list
+- [x] D2.5 Parse single-file torrents
+- [x] D2.6 Parse multi-file torrents
 
 ## D3. Path safety
-- [ ] D3.1 Reject absolute paths
-- [ ] D3.2 Reject `..` traversal
-- [ ] D3.3 Normalize separators
-- [ ] D3.4 Safe UTF-8 handling
+- [x] D3.1 Reject absolute paths
+- [x] D3.2 Reject `..` traversal
+- [x] D3.3 Normalize separators
+- [x] D3.4 Safe UTF-8 handling
 
 ## D4. Infohash
-- [ ] D4.1 Canonical bencode of info dict
-- [ ] D4.2 SHA-1 infohash computation
-- [ ] D4.3 Verification tests with known torrents
+- [x] D4.1 Canonical bencode of info dict
+- [x] D4.2 SHA-1 infohash computation
+- [x] D4.3 Verification tests with known torrents
 
 -------------------------------------------------------------------------------
 

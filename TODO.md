@@ -279,7 +279,7 @@ Leaving completed TODOs unchecked is considered a bug.
 - [x] J1.1 Node ID generation
 - [x] J1.2 Routing table (k-buckets)
 - [x] J1.3 RPC encoding/decoding
-- [ ] J1.4 ping
+- [x] J1.4 ping
 - [ ] J1.5 find_node
 - [ ] J1.6 get_peers
 - [ ] J1.7 announce_peer

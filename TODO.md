@@ -393,7 +393,7 @@ Leaving completed TODOs unchecked is considered a bug.
 - [ ] P1.4 Bandwidth limiter tests
 
 ## P2. Integration tests
-- [ ] P2.1 Engine startup/shutdown
+- [x] P2.1 Engine startup/shutdown
 - [ ] P2.2 Add torrent workflow
 - [ ] P2.3 Magnet workflow
 - [ ] P2.4 Resume after crash

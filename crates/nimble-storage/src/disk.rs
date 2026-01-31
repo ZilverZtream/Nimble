@@ -8,6 +8,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use crate::layout::FileLayout;
+use crate::resume::ResumeData;
 
 const BLOCK_SIZE: u32 = 16384;
 
@@ -18,6 +19,8 @@ pub struct DiskStorage {
     bitfield: Bitfield,
     file_handles: HashMap<usize, File>,
     pending_pieces: HashMap<u64, PendingPiece>,
+    info_hash: [u8; 20],
+    download_dir: PathBuf,
 }
 
 struct PendingPiece {
@@ -28,16 +31,35 @@ struct PendingPiece {
 
 impl DiskStorage {
     pub fn new(info: &TorrentInfo, download_dir: PathBuf) -> Result<Self> {
-        let layout = FileLayout::new(info, download_dir);
+        let layout = FileLayout::new(info, download_dir.clone());
         let piece_count = info.pieces.len();
+        let info_hash = *info.infohash.as_bytes();
+
+        let resume_path = ResumeData::resume_file_path(&download_dir, info_hash);
+        let bitfield = if resume_path.exists() {
+            match ResumeData::load(&resume_path, piece_count) {
+                Ok(resume_data) => {
+                    if resume_data.info_hash == info_hash {
+                        resume_data.bitfield
+                    } else {
+                        Bitfield::new(piece_count)
+                    }
+                }
+                Err(_) => Bitfield::new(piece_count),
+            }
+        } else {
+            Bitfield::new(piece_count)
+        };
 
         Ok(DiskStorage {
             layout,
             piece_length: info.piece_length,
             pieces: info.pieces.clone(),
-            bitfield: Bitfield::new(piece_count),
+            bitfield,
             file_handles: HashMap::new(),
             pending_pieces: HashMap::new(),
+            info_hash,
+            download_dir,
         })
     }
 
@@ -116,6 +138,8 @@ impl DiskStorage {
         self.write_piece_to_disk(piece_index, &pending.data)?;
         self.bitfield.set(piece_index as usize, true);
 
+        self.save_resume_data()?;
+
         Ok(())
     }
 
@@ -174,10 +198,21 @@ impl DiskStorage {
     }
 
     pub fn close(&mut self) -> Result<()> {
+        self.save_resume_data()?;
+
         for (_, mut file) in self.file_handles.drain() {
             file.flush().context("failed to flush file")?;
         }
         Ok(())
+    }
+
+    fn save_resume_data(&self) -> Result<()> {
+        let resume_data = ResumeData {
+            info_hash: self.info_hash,
+            bitfield: self.bitfield.clone(),
+        };
+        let resume_path = ResumeData::resume_file_path(&self.download_dir, self.info_hash);
+        resume_data.save(&resume_path)
     }
 }
 

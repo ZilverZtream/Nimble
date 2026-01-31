@@ -272,6 +272,22 @@ impl Session {
         if let Some(dht) = self.dht.as_mut() {
             log_lines.extend(dht.tick());
 
+            for (infohash_hex, torrent) in self.torrents.iter() {
+                let info_hash = match torrent {
+                    TorrentEntry::Active(t) => *t.info.infohash.as_bytes(),
+                    TorrentEntry::Magnet(t) => t.info_hash,
+                };
+
+                let needs_peers = match torrent {
+                    TorrentEntry::Active(t) => !t.paused && t.stats.connected_peers < 10,
+                    TorrentEntry::Magnet(t) => !t.paused && t.stats.connected_peers < 10,
+                };
+
+                if needs_peers {
+                    dht.announce_peer(info_hash);
+                }
+            }
+
             if let Some(socket) = self.dht_socket.as_ref() {
                 for (addr, payload) in dht.take_pending_packets() {
                     let _ = socket.send_to(&payload, addr);
@@ -524,6 +540,17 @@ impl Session {
         }
     }
 
+    pub fn shutdown(&mut self) -> Result<()> {
+        for (infohash, torrent) in self.torrents.iter_mut() {
+            if let TorrentEntry::Active(state) = torrent {
+                if let Err(e) = state.storage.close() {
+                    eprintln!("Failed to close storage for {}: {}", infohash, e);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn process_dht_incoming(&mut self) -> Vec<String> {
         let mut log_lines = Vec::new();
         let Some(socket) = self.dht_socket.as_ref() else {
@@ -536,6 +563,7 @@ impl Session {
         let mut buf = [0u8; 4096];
         let mut packets_processed = 0;
         const MAX_PACKETS_PER_TICK: usize = 100;
+        let mut all_discovered_peers: HashMap<[u8; 20], Vec<SocketAddrV4>> = HashMap::new();
 
         loop {
             if packets_processed >= MAX_PACKETS_PER_TICK {
@@ -552,6 +580,13 @@ impl Session {
                                 let response_payload = encode_message(&response_msg);
                                 let _ = socket.send_to(&response_payload, v4_addr);
                             }
+
+                            for (peer_addr, info_hash) in outcome.discovered_peers {
+                                all_discovered_peers
+                                    .entry(info_hash)
+                                    .or_insert_with(Vec::new)
+                                    .push(peer_addr);
+                            }
                         }
                     }
                 }
@@ -559,6 +594,31 @@ impl Session {
                 Err(_) => break,
             }
         }
+
+        for (info_hash, peers) in all_discovered_peers {
+            let infohash_hex = nimble_bencode::torrent::InfoHash(info_hash).to_hex();
+            if let Some(torrent) = self.torrents.get_mut(&infohash_hex) {
+                match torrent {
+                    TorrentEntry::Active(torrent) => {
+                        torrent.peer_manager.add_peers(&peers);
+                        log_lines.push(format!(
+                            "DHT peers for {}: {} peers",
+                            &infohash_hex[..8],
+                            peers.len()
+                        ));
+                    }
+                    TorrentEntry::Magnet(torrent) => {
+                        torrent.peer_manager.add_peers(&peers);
+                        log_lines.push(format!(
+                            "DHT peers for {}: {} peers",
+                            &infohash_hex[..8],
+                            peers.len()
+                        ));
+                    }
+                }
+            }
+        }
+
         log_lines
     }
 }

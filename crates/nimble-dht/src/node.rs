@@ -43,6 +43,7 @@ pub struct DhtNode {
 pub struct PacketOutcome {
     pub message: Message,
     pub response: Option<Message>,
+    pub discovered_peers: Vec<(SocketAddrV4, [u8; 20])>,
 }
 
 type TransactionId = [u8; 2];
@@ -57,6 +58,7 @@ struct PendingQuery {
 enum QueryType {
     BootstrapPing,
     RefreshPing,
+    GetPeers([u8; 20]),
 }
 
 impl DhtNode {
@@ -156,6 +158,8 @@ impl DhtNode {
         payload: &[u8],
     ) -> Result<PacketOutcome, RpcError> {
         let message = decode_message(payload)?;
+        let mut discovered_peers = Vec::new();
+
         if let Message::Query(query) = &message {
             if !self.rate_limiter.allow(*source.ip()) {
                 let transaction_id = query.transaction_id.clone();
@@ -166,6 +170,7 @@ impl DhtNode {
                         code: 202,
                         message: b"rate limited".to_vec(),
                     })),
+                    discovered_peers,
                 });
             }
         }
@@ -174,7 +179,25 @@ impl DhtNode {
             if response.transaction_id.len() == 2 {
                 let mut tid = [0u8; 2];
                 tid.copy_from_slice(&response.transaction_id);
-                if self.pending_queries.remove(&tid).is_some() {
+                if let Some(pending) = self.pending_queries.remove(&tid) {
+                    match &response.kind {
+                        ResponseKind::FindNode { nodes, .. } => {
+                            for node in nodes {
+                                self.observe_node(node.id, node.addr);
+                            }
+                        }
+                        ResponseKind::GetPeers { nodes, values, .. } => {
+                            for node in nodes {
+                                self.observe_node(node.id, node.addr);
+                            }
+                            if let QueryType::GetPeers(info_hash) = pending.query_type {
+                                for peer_addr in values {
+                                    discovered_peers.push((*peer_addr, info_hash));
+                                }
+                            }
+                        }
+                        ResponseKind::Ping { .. } => {}
+                    }
                 }
             }
         }
@@ -186,7 +209,11 @@ impl DhtNode {
             Message::Query(query) => self.handle_query(source, query),
             _ => None,
         };
-        Ok(PacketOutcome { message, response })
+        Ok(PacketOutcome {
+            message,
+            response,
+            discovered_peers,
+        })
     }
 
     pub fn observe_node(&mut self, id: [u8; 20], addr: SocketAddrV4) -> bool {
@@ -195,6 +222,24 @@ impl DhtNode {
 
     pub fn take_pending_packets(&mut self) -> Vec<(SocketAddrV4, Vec<u8>)> {
         std::mem::take(&mut self.pending_outbound)
+    }
+
+    pub fn announce_peer(&mut self, info_hash: [u8; 20]) {
+        let now_ms = Instant::now()
+            .checked_duration_since(self.clock_start)
+            .unwrap_or(Duration::from_millis(0))
+            .as_millis() as u64;
+
+        let targets = self.routing.find_closest(info_hash, 8);
+        if targets.is_empty() {
+            for bootstrap_addr in default_bootstrap_nodes() {
+                self.queue_get_peers(*bootstrap_addr, info_hash, now_ms);
+            }
+        } else {
+            for node in targets {
+                self.queue_get_peers(node.addr, info_hash, now_ms);
+            }
+        }
     }
 
     fn generate_tid(&mut self) -> TransactionId {
@@ -219,6 +264,33 @@ impl DhtNode {
             tid,
             PendingQuery {
                 query_type,
+                sent_at_ms: now_ms,
+                addr,
+            },
+        );
+
+        self.pending_outbound.push((addr, payload));
+    }
+
+    fn queue_get_peers(&mut self, addr: SocketAddrV4, info_hash: [u8; 20], now_ms: u64) {
+        if self.pending_queries.len() >= MAX_PENDING_QUERIES {
+            return;
+        }
+
+        let tid = self.generate_tid();
+        let message = Message::Query(Query {
+            transaction_id: tid.to_vec(),
+            kind: QueryKind::GetPeers {
+                id: self.node_id,
+                info_hash,
+            },
+        });
+        let payload = encode_message(&message);
+
+        self.pending_queries.insert(
+            tid,
+            PendingQuery {
+                query_type: QueryType::GetPeers(info_hash),
                 sent_at_ms: now_ms,
                 addr,
             },
@@ -430,6 +502,7 @@ mod tests {
         let outcome = node.handle_packet(addr, &payload).unwrap();
         assert_eq!(outcome.message, message);
         assert_eq!(node.known_nodes(), 1);
+        assert!(outcome.discovered_peers.is_empty());
     }
 
     #[test]

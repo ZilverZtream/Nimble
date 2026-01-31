@@ -8,7 +8,9 @@ use crate::extension::{
     ExtensionHandshake, ExtensionState, EXTENSION_UT_METADATA,
 };
 use crate::sockets::TcpSocket;
-use crate::ut_metadata::{UtMetadataMessage, UtMetadataMessageType, UtMetadataState};
+use crate::ut_metadata::{
+    verify_metadata_infohash, UtMetadataMessage, UtMetadataMessageType, UtMetadataState,
+};
 
 const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
 const HANDSHAKE_LENGTH: usize = 68;
@@ -501,7 +503,12 @@ impl PeerConnection {
 
                 if let Some(state) = self.metadata_state.as_mut() {
                     if let Ok(Some(metadata)) = state.insert_piece(msg.piece, &msg.data) {
-                        self.metadata = Some(metadata);
+                        if verify_metadata_infohash(&metadata, self.info_hash) {
+                            self.metadata = Some(metadata);
+                        } else {
+                            self.metadata_state = None;
+                            self.metadata = None;
+                        }
                     }
                 }
             }

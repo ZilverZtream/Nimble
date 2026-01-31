@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use crate::bootstrap::default_bootstrap_nodes;
 use crate::rpc::{
-    decode_message, ErrorMessage, Message, NodeEntry, Query, QueryKind, Response, ResponseKind,
-    RpcError,
+    decode_message, encode_message, ErrorMessage, Message, NodeEntry, Query, QueryKind, Response,
+    ResponseKind, RpcError,
 };
 use crate::routing::RoutingTable;
 use crate::tokens::TokenIssuer;
@@ -21,6 +21,8 @@ const RATE_LIMIT_STALE_MS: u64 = 60_000;
 const BOOTSTRAP_RETRY_MS: u64 = 60_000;
 const REFRESH_INTERVAL_MS: u64 = 300_000;
 const REFRESH_BATCH_SIZE: usize = 8;
+const QUERY_TIMEOUT_MS: u64 = 5_000;
+const MAX_PENDING_QUERIES: usize = 256;
 
 pub struct DhtNode {
     node_id: [u8; 20],
@@ -29,7 +31,9 @@ pub struct DhtNode {
     tokens: TokenIssuer,
     peers: HashMap<[u8; 20], Vec<SocketAddrV4>>,
     rate_limiter: RateLimiter,
-    pending_queries: Vec<DhtQuery>,
+    pending_outbound: Vec<(SocketAddrV4, Vec<u8>)>,
+    pending_queries: HashMap<TransactionId, PendingQuery>,
+    tid_counter: u16,
     bootstrap_done: bool,
     last_bootstrap_ms: Option<u64>,
     next_refresh_ms: u64,
@@ -41,10 +45,18 @@ pub struct PacketOutcome {
     pub response: Option<Message>,
 }
 
+type TransactionId = [u8; 2];
+
+struct PendingQuery {
+    query_type: QueryType,
+    sent_at_ms: u64,
+    addr: SocketAddrV4,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DhtQuery {
-    BootstrapPing(SocketAddrV4),
-    RefreshPing(SocketAddrV4),
+enum QueryType {
+    BootstrapPing,
+    RefreshPing,
 }
 
 impl DhtNode {
@@ -59,7 +71,9 @@ impl DhtNode {
             tokens: TokenIssuer::new(),
             peers: HashMap::new(),
             rate_limiter: RateLimiter::new(RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_QUERIES),
-            pending_queries: Vec::new(),
+            pending_outbound: Vec::new(),
+            pending_queries: HashMap::new(),
+            tid_counter: 0,
             bootstrap_done: false,
             last_bootstrap_ms: None,
             next_refresh_ms: REFRESH_INTERVAL_MS,
@@ -93,6 +107,8 @@ impl DhtNode {
             .unwrap_or(Duration::from_millis(0))
             .as_millis() as u64;
 
+        self.cleanup_stale_queries(now_ms);
+
         if !self.bootstrap_done {
             if self.routing.is_empty() {
                 if self
@@ -101,7 +117,7 @@ impl DhtNode {
                     .unwrap_or(true)
                 {
                     for node in default_bootstrap_nodes() {
-                        self.pending_queries.push(DhtQuery::BootstrapPing(*node));
+                        self.queue_ping(*node, QueryType::BootstrapPing, now_ms);
                     }
                     self.last_bootstrap_ms = Some(now_ms);
                     log_lines.push(format!(
@@ -120,7 +136,7 @@ impl DhtNode {
                 refresh_targets = default_bootstrap_nodes().to_vec();
             }
             for addr in refresh_targets.iter().copied() {
-                self.pending_queries.push(DhtQuery::RefreshPing(addr));
+                self.queue_ping(addr, QueryType::RefreshPing, now_ms);
             }
             if !refresh_targets.is_empty() {
                 log_lines.push(format!(
@@ -153,6 +169,16 @@ impl DhtNode {
                 });
             }
         }
+
+        if let Message::Response(response) = &message {
+            if response.transaction_id.len() == 2 {
+                let mut tid = [0u8; 2];
+                tid.copy_from_slice(&response.transaction_id);
+                if self.pending_queries.remove(&tid).is_some() {
+                }
+            }
+        }
+
         if let Some(id) = message.sender_id() {
             self.observe_node(id, source);
         }
@@ -167,8 +193,43 @@ impl DhtNode {
         self.routing.insert(id, addr)
     }
 
-    pub fn take_pending_queries(&mut self) -> Vec<DhtQuery> {
-        std::mem::take(&mut self.pending_queries)
+    pub fn take_pending_packets(&mut self) -> Vec<(SocketAddrV4, Vec<u8>)> {
+        std::mem::take(&mut self.pending_outbound)
+    }
+
+    fn generate_tid(&mut self) -> TransactionId {
+        let tid = self.tid_counter.to_be_bytes();
+        self.tid_counter = self.tid_counter.wrapping_add(1);
+        tid
+    }
+
+    fn queue_ping(&mut self, addr: SocketAddrV4, query_type: QueryType, now_ms: u64) {
+        if self.pending_queries.len() >= MAX_PENDING_QUERIES {
+            return;
+        }
+
+        let tid = self.generate_tid();
+        let message = Message::Query(Query {
+            transaction_id: tid.to_vec(),
+            kind: QueryKind::Ping { id: self.node_id },
+        });
+        let payload = encode_message(&message);
+
+        self.pending_queries.insert(
+            tid,
+            PendingQuery {
+                query_type,
+                sent_at_ms: now_ms,
+                addr,
+            },
+        );
+
+        self.pending_outbound.push((addr, payload));
+    }
+
+    fn cleanup_stale_queries(&mut self, now_ms: u64) {
+        self.pending_queries
+            .retain(|_, query| now_ms.saturating_sub(query.sent_at_ms) < QUERY_TIMEOUT_MS);
     }
 
     fn handle_query(&mut self, source: SocketAddrV4, query: &Query) -> Option<Message> {
@@ -334,6 +395,7 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bootstrap::default_bootstrap_nodes;
     use crate::rpc::{encode_message, Message, Query, QueryKind};
     use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -534,9 +596,9 @@ mod tests {
         let now = node.clock_start;
         let logs = node.tick_at(now);
         assert!(logs.iter().any(|line| line.contains("DHT bootstrap queued")));
-        let queued = node.take_pending_queries();
-        assert!(!queued.is_empty());
-        assert!(queued.iter().all(|query| matches!(query, DhtQuery::BootstrapPing(_))));
+        let packets = node.take_pending_packets();
+        assert!(!packets.is_empty());
+        assert_eq!(packets.len(), default_bootstrap_nodes().len());
     }
 
     #[test]
@@ -553,8 +615,7 @@ mod tests {
             .unwrap();
         let logs = node.tick_at(now);
         assert!(logs.iter().any(|line| line.contains("DHT refresh queued")));
-        let queued = node.take_pending_queries();
-        assert!(!queued.is_empty());
-        assert!(queued.iter().all(|query| matches!(query, DhtQuery::RefreshPing(_))));
+        let packets = node.take_pending_packets();
+        assert!(!packets.is_empty());
     }
 }

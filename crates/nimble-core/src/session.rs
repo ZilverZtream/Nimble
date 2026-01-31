@@ -1,7 +1,6 @@
 use anyhow::Result;
 use nimble_bencode::torrent::{parse_info_dict, parse_torrent, InfoHash, TorrentInfo};
-use nimble_dht::node::{DhtNode, DhtQuery};
-use nimble_dht::rpc::{encode_message, Message, Query, QueryKind};
+use nimble_dht::node::DhtNode;
 use nimble_net::tracker_http::TrackerEvent;
 use nimble_storage::disk::DiskStorage;
 use nimble_util::ids::peer_id_20;
@@ -274,22 +273,8 @@ impl Session {
             log_lines.extend(dht.tick());
 
             if let Some(socket) = self.dht_socket.as_ref() {
-                for query in dht.take_pending_queries() {
-                    let (addr, description) = match query {
-                        DhtQuery::BootstrapPing(addr) => (addr, "bootstrap"),
-                        DhtQuery::RefreshPing(addr) => (addr, "refresh"),
-                    };
-
-                    let transaction_id = generate_transaction_id();
-                    let message = Message::Query(Query {
-                        transaction_id,
-                        kind: QueryKind::Ping { id: *dht.node_id() },
-                    });
-                    let payload = encode_message(&message);
-
-                    if socket.send_to(&payload, addr).is_ok() {
-                        log_lines.push(format!("DHT {} ping sent: {}", description, addr));
-                    }
+                for (addr, payload) in dht.take_pending_packets() {
+                    let _ = socket.send_to(&payload, addr);
                 }
             }
         }
@@ -549,18 +534,24 @@ impl Session {
         };
 
         let mut buf = [0u8; 4096];
+        let mut packets_processed = 0;
+        const MAX_PACKETS_PER_TICK: usize = 100;
+
         loop {
+            if packets_processed >= MAX_PACKETS_PER_TICK {
+                break;
+            }
+
             match socket.recv_from(&mut buf) {
                 Ok((len, addr)) => {
+                    packets_processed += 1;
                     if let std::net::SocketAddr::V4(v4_addr) = addr {
-                        match dht.handle_packet(v4_addr, &buf[..len]) {
-                            Ok(outcome) => {
-                                if let Some(response_msg) = outcome.response {
-                                    let response_payload = encode_message(&response_msg);
-                                    let _ = socket.send_to(&response_payload, v4_addr);
-                                }
+                        if let Ok(outcome) = dht.handle_packet(v4_addr, &buf[..len]) {
+                            if let Some(response_msg) = outcome.response {
+                                use nimble_dht::rpc::encode_message;
+                                let response_payload = encode_message(&response_msg);
+                                let _ = socket.send_to(&response_payload, v4_addr);
                             }
-                            Err(_) => {}
                         }
                     }
                 }
@@ -570,11 +561,4 @@ impl Session {
         }
         log_lines
     }
-}
-
-fn generate_transaction_id() -> Vec<u8> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let value = COUNTER.fetch_add(1, Ordering::Relaxed);
-    value.to_be_bytes().to_vec()
 }

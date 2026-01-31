@@ -263,7 +263,7 @@ Leaving completed TODOs unchecked is considered a bug.
 - [x] I2.2 Piece assembly
 - [x] I2.3 Size cap enforcement
 - [x] I2.4 Infohash verification
-- [ ] I2.5 Transition to full torrent
+- [x] I2.5 Transition to full torrent
 
 ## I3. PEX (ut_pex)
 - [x] I3.1 Parse added peers

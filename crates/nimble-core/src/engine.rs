@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::session::Session;
 use crate::settings::EngineSettings;
-use crate::types::{Command, CommandSender, Event, EventReceiver, EngineStats};
+use crate::types::{Command, CommandSender, EngineStats, Event, EventReceiver};
 
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -30,8 +30,7 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
             match cmd_rx.recv_timeout(tick_interval) {
                 Ok(Command::Shutdown) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
 
                 Ok(Command::PauseAll) => {
                     session.pause_all();
@@ -43,23 +42,27 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
                     let _ = evt_tx.send(Event::LogLine("Resumed all torrents".to_string()));
                 }
 
-                Ok(Command::AddTorrentFile { path }) => {
-                    match session.add_torrent_file(&path) {
-                        Ok(infohash) => {
-                            let msg = format!("Added torrent: {} ({})", path, infohash);
-                            let _ = evt_tx.send(Event::LogLine(msg));
-                        }
-                        Err(e) => {
-                            let msg = format!("Failed to add torrent {}: {}", path, e);
-                            let _ = evt_tx.send(Event::LogLine(msg));
-                        }
+                Ok(Command::AddTorrentFile { path }) => match session.add_torrent_file(&path) {
+                    Ok(infohash) => {
+                        let msg = format!("Added torrent: {} ({})", path, infohash);
+                        let _ = evt_tx.send(Event::LogLine(msg));
                     }
-                }
+                    Err(e) => {
+                        let msg = format!("Failed to add torrent {}: {}", path, e);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                },
 
-                Ok(Command::AddMagnet { uri }) => {
-                    let msg = format!("Magnet not yet implemented: {}", uri);
-                    let _ = evt_tx.send(Event::LogLine(msg));
-                }
+                Ok(Command::AddMagnet { uri }) => match session.add_magnet(&uri) {
+                    Ok(infohash) => {
+                        let msg = format!("Added magnet: {} ({})", uri, infohash);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to add magnet {}: {}", uri, e);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                },
             }
 
             for log_line in session.tick() {

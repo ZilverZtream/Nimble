@@ -12,6 +12,7 @@ const MAX_CONNECT_PER_TICK: usize = 5;
 const BLOCK_SIZE: u32 = 16384;
 const MAX_PENDING_PER_PEER: usize = 5;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(60);
+const MAX_CANDIDATE_PEERS: usize = 2000;
 
 pub struct PeerManager {
     info_hash: [u8; 20],
@@ -80,6 +81,10 @@ impl PeerManager {
 
     pub fn add_peers(&mut self, addrs: &[SocketAddrV4]) {
         for &addr in addrs {
+            if self.candidate_peers.len() >= MAX_CANDIDATE_PEERS {
+                break;
+            }
+
             if !self.peers.contains_key(&addr) && !self.candidate_peers.contains(&addr) {
                 let should_add = self
                     .failed_peers
@@ -156,8 +161,8 @@ impl PeerManager {
                                 );
                             }
 
-                            stats.downloaded += peer.connection.downloaded();
-                            stats.uploaded += peer.connection.uploaded();
+                            stats.downloaded = stats.downloaded.saturating_add(peer.connection.downloaded());
+                            stats.uploaded = stats.uploaded.saturating_add(peer.connection.uploaded());
                         }
                         Err(_) => {
                             peers_to_remove.push(addr);
@@ -252,6 +257,15 @@ impl PeerManager {
         self.candidate_peers.retain(|addr| !dropped.contains(addr));
     }
 
+    fn is_fatal_error(e: &anyhow::Error) -> bool {
+        let error_msg = e.to_string();
+        error_msg.contains("connection closed")
+            || error_msg.contains("not connected")
+            || error_msg.contains("info hash mismatch")
+            || error_msg.contains("invalid protocol")
+            || error_msg.contains("message too large")
+    }
+
     fn handle_peer_messages(
         peer: &mut ManagedPeer,
         picker: &mut PiecePicker,
@@ -296,7 +310,10 @@ impl PeerManager {
                     {
                         break;
                     }
-                    return Err(e);
+                    if Self::is_fatal_error(&e) {
+                        return Err(e);
+                    }
+                    break;
                 }
             }
         }

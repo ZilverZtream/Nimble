@@ -5,6 +5,7 @@ use std::time::Instant;
 const NODE_ID_LEN: usize = 20;
 const K_BUCKET_SIZE: usize = 8;
 const BUCKET_COUNT: usize = NODE_ID_LEN * 8;
+const REPLACEMENT_CACHE_SIZE: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeInfo {
@@ -30,12 +31,14 @@ impl NodeInfo {
 
 struct Bucket {
     nodes: VecDeque<NodeInfo>,
+    replacement_cache: VecDeque<NodeInfo>,
 }
 
 impl Bucket {
     fn new() -> Self {
         Self {
             nodes: VecDeque::new(),
+            replacement_cache: VecDeque::new(),
         }
     }
 }
@@ -73,20 +76,34 @@ impl RoutingTable {
         };
 
         let bucket = &mut self.buckets[bucket_index];
+
         if let Some(pos) = bucket.nodes.iter().position(|node| node.id == id) {
             if let Some(mut node) = bucket.nodes.remove(pos) {
                 node.touch(addr);
                 bucket.nodes.push_back(node);
             }
+            bucket.replacement_cache.retain(|node| node.id != id);
             return false;
         }
 
-        if bucket.nodes.len() >= K_BUCKET_SIZE {
-            bucket.nodes.pop_front();
+        if let Some(pos) = bucket.replacement_cache.iter().position(|node| node.id == id) {
+            if let Some(mut node) = bucket.replacement_cache.remove(pos) {
+                node.touch(addr);
+                bucket.replacement_cache.push_back(node);
+            }
         }
 
-        bucket.nodes.push_back(NodeInfo::new(id, addr));
-        true
+        if bucket.nodes.len() < K_BUCKET_SIZE {
+            bucket.nodes.push_back(NodeInfo::new(id, addr));
+            return true;
+        }
+
+        if bucket.replacement_cache.len() >= REPLACEMENT_CACHE_SIZE {
+            bucket.replacement_cache.pop_front();
+        }
+        bucket.replacement_cache.push_back(NodeInfo::new(id, addr));
+
+        false
     }
 
     pub fn find_closest(&self, target: [u8; NODE_ID_LEN], limit: usize) -> Vec<NodeInfo> {
@@ -126,6 +143,25 @@ impl RoutingTable {
             out.push(node.addr);
         }
         out
+    }
+
+    pub fn remove_node(&mut self, id: &[u8; NODE_ID_LEN]) -> bool {
+        let bucket_index = match bucket_index(&self.self_id, id) {
+            Some(index) => index,
+            None => return false,
+        };
+
+        let bucket = &mut self.buckets[bucket_index];
+        if let Some(pos) = bucket.nodes.iter().position(|node| &node.id == id) {
+            bucket.nodes.remove(pos);
+
+            if let Some(replacement) = bucket.replacement_cache.pop_front() {
+                bucket.nodes.push_back(replacement);
+            }
+            return true;
+        }
+
+        false
     }
 }
 
@@ -188,14 +224,14 @@ mod tests {
     }
 
     #[test]
-    fn insert_eviction_keeps_bucket_size() {
+    fn insert_replacement_cache_fills_on_overflow() {
         let self_id = [0u8; NODE_ID_LEN];
         let mut table = RoutingTable::new(self_id);
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6881);
         let base = 0x80u8;
         let mut ids = Vec::new();
 
-        for i in 0..=K_BUCKET_SIZE {
+        for i in 0..=(K_BUCKET_SIZE + 2) {
             let id = id_with_last_byte(base + i as u8);
             ids.push(id);
             table.insert(id, addr);
@@ -204,7 +240,8 @@ mod tests {
         let bucket_idx = bucket_index(&self_id, &ids[0]).unwrap();
         let bucket = &table.buckets[bucket_idx];
         assert_eq!(bucket.nodes.len(), K_BUCKET_SIZE);
-        assert!(bucket.nodes.iter().all(|node| node.id != ids[0]));
+        assert!(bucket.nodes.iter().any(|node| node.id == ids[0]));
+        assert_eq!(bucket.replacement_cache.len(), 3);
     }
 
     #[test]

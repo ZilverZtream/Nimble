@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
@@ -11,14 +12,15 @@ pub struct EngineHandle {
     pub tx: CommandSender,
 }
 
-pub fn start(_settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> {
+pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
     let (evt_tx, evt_rx) = mpsc::channel::<Event>();
 
     thread::spawn(move || {
         let _ = evt_tx.send(Event::Started);
 
-        let mut session = Session::new();
+        let download_dir = PathBuf::from(&settings.download_dir);
+        let mut session = Session::new(download_dir);
         let mut stats = EngineStats::default();
 
         loop {

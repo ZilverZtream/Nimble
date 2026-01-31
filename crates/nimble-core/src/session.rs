@@ -1,21 +1,26 @@
 use anyhow::Result;
 use nimble_bencode::torrent::{parse_torrent, TorrentInfo};
+use nimble_storage::disk::DiskStorage;
 use std::collections::HashMap;
 use std::fs;
+use std::path::PathBuf;
 
 pub struct Session {
     torrents: HashMap<String, TorrentState>,
+    download_dir: PathBuf,
 }
 
 pub struct TorrentState {
     pub info: TorrentInfo,
+    pub storage: DiskStorage,
     pub paused: bool,
 }
 
 impl Session {
-    pub fn new() -> Self {
+    pub fn new(download_dir: PathBuf) -> Self {
         Session {
             torrents: HashMap::new(),
+            download_dir,
         }
     }
 
@@ -24,8 +29,11 @@ impl Session {
         let info = parse_torrent(&data)?;
         let infohash = info.infohash.to_hex();
 
+        let storage = DiskStorage::new(&info, self.download_dir.clone())?;
+
         let state = TorrentState {
             info,
+            storage,
             paused: false,
         };
 

@@ -165,7 +165,7 @@ Leaving completed TODOs unchecked is considered a bug.
 
 ## F1. Connection handling
 - [x] F1.1 Outbound peer connections
-- [ ] F1.2 Inbound peer listener
+- [x] F1.2 Inbound peer listener
 - [x] F1.3 Connection caps (global/per-torrent)
 - [x] F1.4 Backoff on failures
 
@@ -235,15 +235,15 @@ Leaving completed TODOs unchecked is considered a bug.
 - [x] H1.6 Failure reason handling
 
 ## H2. HTTPS trackers (WinHTTP + SChannel)
-- [ ] H2.1 TLS via SChannel
-- [ ] H2.2 HTTPS announce success path
-- [ ] H2.3 Error handling
+- [x] H2.1 TLS via SChannel
+- [x] H2.2 HTTPS announce success path
+- [x] H2.3 Error handling
 
 ## H3. UDP trackers (BEP-15)
-- [ ] H3.1 Connect request
-- [ ] H3.2 Announce request
-- [ ] H3.3 Transaction ID validation
-- [ ] H3.4 Retry & timeout logic
+- [x] H3.1 Connect request
+- [x] H3.2 Announce request
+- [x] H3.3 Transaction ID validation
+- [x] H3.4 Retry & timeout logic
 
 ## H4. Tracker management
 - [ ] H4.1 Tier rotation
@@ -255,8 +255,8 @@ Leaving completed TODOs unchecked is considered a bug.
 # I. Extension Protocol & Magnets
 
 ## I1. BEP-10 base
-- [ ] I1.1 Extended handshake
-- [ ] I1.2 Extension ID negotiation
+- [x] I1.1 Extended handshake
+- [x] I1.2 Extension ID negotiation
 
 ## I2. ut_metadata
 - [ ] I2.1 Metadata request

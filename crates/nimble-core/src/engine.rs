@@ -74,6 +74,10 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
             let _ = evt_tx.send(Event::Stats(stats.clone()));
         }
 
+        if let Err(e) = session.shutdown() {
+            let _ = evt_tx.send(Event::LogLine(format!("Shutdown error: {}", e)));
+        }
+
         let _ = evt_tx.send(Event::Stopped);
     });
 

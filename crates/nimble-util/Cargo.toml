@@ -15,5 +15,6 @@ sha1_crate = ["dep:sha1"]
         windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_System_SystemInformation",
+  "Win32_Security_Cryptography",
 ] }
 sha1 = { workspace = true, optional = true }

@@ -43,4 +43,23 @@ impl Bitfield {
     pub fn is_empty(&self) -> bool {
         self.bits == 0
     }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8], bits: usize) -> Self {
+        let expected_bytes = (bits + 7) / 8;
+        let mut bf = Self {
+            bytes: vec![0; expected_bytes],
+            bits,
+        };
+        let copy_len = bytes.len().min(expected_bytes);
+        bf.bytes[..copy_len].copy_from_slice(&bytes[..copy_len]);
+        bf
+    }
+
+    pub fn is_all_set(&self) -> bool {
+        self.count_ones() == self.bits
+    }
 }

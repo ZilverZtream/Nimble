@@ -67,6 +67,7 @@ pub struct TorrentInfo {
     pub mode: TorrentMode,
     pub infohash: InfoHash,
     pub total_length: u64,
+    pub private: bool,
 }
 
 const MAX_PATH_COMPONENT_LENGTH: usize = 255;
@@ -309,6 +310,12 @@ fn parse_info_dict_fields(
 
     let name = sanitize_path_component(&name)?;
 
+    let private = info_dict
+        .get(b"private".as_ref())
+        .and_then(|v| v.as_integer())
+        .map(|i| i == 1)
+        .unwrap_or(false);
+
     let (mode, total_length) = if let Some(length_val) = info_dict.get(b"length".as_ref()) {
         let length = length_val
             .as_integer()
@@ -402,6 +409,7 @@ fn parse_info_dict_fields(
         mode,
         infohash,
         total_length,
+        private,
     })
 }
 

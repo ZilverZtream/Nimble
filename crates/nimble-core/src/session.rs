@@ -68,6 +68,7 @@ pub struct TrackerState {
     pub consecutive_failures: u32,
     pub current_tier: usize,
     pub current_tracker_in_tier: usize,
+    pub retry_interval: Duration,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -225,6 +226,7 @@ impl Session {
             consecutive_failures: 0,
             current_tier: 0,
             current_tracker_in_tier: 0,
+            retry_interval: Duration::from_secs(60),
         };
 
         let mut peer_manager = PeerManager::new(
@@ -245,6 +247,7 @@ impl Session {
 
         let piece_count = info.pieces.len();
         let info_hash_bytes = *info.infohash.as_bytes();
+        let is_private = info.private;
 
         let state = ActiveTorrent {
             info,
@@ -263,8 +266,10 @@ impl Session {
             listener.register_infohash(info_hash_bytes, self.peer_id, piece_count);
         }
 
-        if let Some(lsd) = self.lsd.as_mut() {
-            lsd.add_torrent(info_hash_bytes);
+        if !is_private {
+            if let Some(lsd) = self.lsd.as_mut() {
+                lsd.add_torrent(info_hash_bytes);
+            }
         }
 
         Ok(())
@@ -292,6 +297,7 @@ impl Session {
             consecutive_failures: 0,
             current_tier: 0,
             current_tracker_in_tier: 0,
+            retry_interval: Duration::from_secs(60),
         };
 
         let mut peer_manager = PeerManager::new(
@@ -311,6 +317,7 @@ impl Session {
 
         let piece_count = info.pieces.len();
         let info_hash_bytes = *info.infohash.as_bytes();
+        let is_private = info.private;
 
         let state = ActiveTorrent {
             info,
@@ -329,8 +336,10 @@ impl Session {
             listener.register_infohash(info_hash_bytes, self.peer_id, piece_count);
         }
 
-        if let Some(lsd) = self.lsd.as_mut() {
-            lsd.add_torrent(info_hash_bytes);
+        if !is_private {
+            if let Some(lsd) = self.lsd.as_mut() {
+                lsd.add_torrent(info_hash_bytes);
+            }
         }
 
         Ok(infohash)
@@ -355,6 +364,7 @@ impl Session {
             consecutive_failures: 0,
             current_tier: 0,
             current_tracker_in_tier: 0,
+            retry_interval: Duration::from_secs(60),
         };
 
         let peer_manager = PeerManager::new_metadata_only(magnet.info_hash, self.peer_id);
@@ -433,6 +443,7 @@ impl Session {
                             torrent.tracker.consecutive_failures = 0;
                             torrent.tracker.current_tier = 0;
                             torrent.tracker.current_tracker_in_tier = 0;
+                            torrent.tracker.retry_interval = Duration::from_secs(60);
                             if let Some(interval) = result.interval {
                                 torrent.tracker.interval = Duration::from_secs(interval as u64);
                             }
@@ -448,12 +459,18 @@ impl Session {
                         } else {
                             torrent.tracker.consecutive_failures = torrent.tracker.consecutive_failures.saturating_add(1);
                             Self::advance_tracker_tier(&mut torrent.tracker, &torrent.info.announce_list);
-                            torrent.tracker.next_announce = Some(now + Duration::from_secs(60));
+
+                            let max_retry = Duration::from_secs(1800);
+                            let next_retry = torrent.tracker.retry_interval.min(max_retry);
+                            torrent.tracker.next_announce = Some(now + next_retry);
+                            torrent.tracker.retry_interval = (torrent.tracker.retry_interval * 2).min(max_retry);
+
                             if let Some(error) = &result.error {
                                 log_lines.push(format!(
-                                    "Tracker announce failed for {} (failures: {}): {}",
+                                    "Tracker announce failed for {} (failures: {}, next retry in {}s): {}",
                                     &result.infohash_hex[..8],
                                     torrent.tracker.consecutive_failures,
+                                    next_retry.as_secs(),
                                     error
                                 ));
                             }
@@ -464,6 +481,7 @@ impl Session {
                             torrent.tracker.last_announce = Some(now);
                             torrent.tracker.consecutive_failures = 0;
                             torrent.tracker.current_tracker_in_tier = 0;
+                            torrent.tracker.retry_interval = Duration::from_secs(60);
                             if let Some(interval) = result.interval {
                                 torrent.tracker.interval = Duration::from_secs(interval as u64);
                             }
@@ -481,12 +499,18 @@ impl Session {
                             if !torrent.trackers.is_empty() {
                                 torrent.tracker.current_tracker_in_tier = (torrent.tracker.current_tracker_in_tier + 1) % torrent.trackers.len();
                             }
-                            torrent.tracker.next_announce = Some(now + Duration::from_secs(60));
+
+                            let max_retry = Duration::from_secs(1800);
+                            let next_retry = torrent.tracker.retry_interval.min(max_retry);
+                            torrent.tracker.next_announce = Some(now + next_retry);
+                            torrent.tracker.retry_interval = (torrent.tracker.retry_interval * 2).min(max_retry);
+
                             if let Some(error) = &result.error {
                                 log_lines.push(format!(
-                                    "Magnet announce failed for {} (failures: {}): {}",
+                                    "Magnet announce failed for {} (failures: {}, next retry in {}s): {}",
                                     &result.infohash_hex[..8],
                                     torrent.tracker.consecutive_failures,
+                                    next_retry.as_secs(),
                                     error
                                 ));
                             }
@@ -504,6 +528,10 @@ impl Session {
                 match torrent {
                     TorrentEntry::Active(t) => {
                         if t.paused {
+                            continue;
+                        }
+
+                        if t.info.private {
                             continue;
                         }
 
@@ -713,13 +741,16 @@ impl Session {
         for (infohash, state) in upgrades {
             let info_hash_bytes = *state.info.infohash.as_bytes();
             let piece_count = state.info.pieces.len();
+            let is_private = state.info.private;
 
             if let Some(listener) = self.peer_listener.as_mut() {
                 listener.register_infohash(info_hash_bytes, self.peer_id, piece_count);
             }
 
-            if let Some(lsd) = self.lsd.as_mut() {
-                lsd.add_torrent(info_hash_bytes);
+            if !is_private {
+                if let Some(lsd) = self.lsd.as_mut() {
+                    lsd.add_torrent(info_hash_bytes);
+                }
             }
 
             self.torrents.insert(infohash, TorrentEntry::Active(state));
@@ -776,6 +807,7 @@ impl Session {
             consecutive_failures: 0,
             current_tier: 0,
             current_tracker_in_tier: 0,
+            retry_interval: Duration::from_secs(60),
         };
 
         Ok(ActiveTorrent {
@@ -888,10 +920,14 @@ impl Session {
         }
 
         for (infohash_hex, torrent) in self.torrents.iter_mut() {
-            let info_hash = match torrent {
-                TorrentEntry::Active(t) => *t.info.infohash.as_bytes(),
-                TorrentEntry::Magnet(t) => t.info_hash,
+            let (info_hash, is_private) = match torrent {
+                TorrentEntry::Active(t) => (*t.info.infohash.as_bytes(), t.info.private),
+                TorrentEntry::Magnet(t) => (t.info_hash, false),
             };
+
+            if is_private {
+                continue;
+            }
 
             let discovered = lsd.get_discovered_peers(&info_hash);
             if !discovered.is_empty() {

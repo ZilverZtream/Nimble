@@ -1,3 +1,4 @@
+pub mod encryption;
 pub mod extension;
 pub mod listener;
 pub mod peer;

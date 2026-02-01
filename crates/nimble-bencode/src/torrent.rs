@@ -21,6 +21,14 @@ pub enum TorrentError {
     PieceLengthTooLarge(u64, u64),
     #[error("total length overflow")]
     TotalLengthOverflow,
+    #[error("too many files: {0} (max {1})")]
+    TooManyFiles(usize, usize),
+    #[error("path depth too deep: {0} components (max {1})")]
+    PathTooDeep(usize, usize),
+    #[error("total path length too long: {0} bytes (max {1})")]
+    TotalPathTooLong(usize, usize),
+    #[error("too many trackers: {0} (max {1})")]
+    TooManyTrackers(usize, usize),
 }
 
 pub type Result<T> = std::result::Result<T, TorrentError>;
@@ -61,9 +69,29 @@ pub struct TorrentInfo {
     pub total_length: u64,
 }
 
+const MAX_PATH_COMPONENT_LENGTH: usize = 255;
+const MAX_FILES_IN_TORRENT: usize = 50_000;
+const MAX_PATH_DEPTH: usize = 32;
+const MAX_TOTAL_PATH_LENGTH: usize = 4096;
+const MAX_TRACKERS: usize = 200;
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+const WINDOWS_FORBIDDEN_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
+
 fn sanitize_path_component(component: &str) -> Result<String> {
     if component.is_empty() {
         return Err(TorrentError::UnsafePath("empty path component".to_string()));
+    }
+
+    if component.len() > MAX_PATH_COMPONENT_LENGTH {
+        return Err(TorrentError::UnsafePath(format!(
+            "path component too long: {} bytes (max {})",
+            component.len(),
+            MAX_PATH_COMPONENT_LENGTH
+        )));
     }
 
     if component == "." || component == ".." {
@@ -97,6 +125,38 @@ fn sanitize_path_component(component: &str) -> Result<String> {
         }
     }
 
+    for &forbidden_char in WINDOWS_FORBIDDEN_CHARS {
+        if component.contains(forbidden_char) {
+            return Err(TorrentError::UnsafePath(format!(
+                "forbidden character '{}' in path component: {}",
+                forbidden_char, component
+            )));
+        }
+    }
+
+    let trimmed = component.trim_end_matches(&['.', ' '][..]);
+    if trimmed.is_empty() {
+        return Err(TorrentError::UnsafePath(format!(
+            "path component is only dots/spaces: {}",
+            component
+        )));
+    }
+    if trimmed != component {
+        return Err(TorrentError::UnsafePath(format!(
+            "path component has trailing dots/spaces: {}",
+            component
+        )));
+    }
+
+    let upper = component.to_uppercase();
+    let base_name = upper.split('.').next().unwrap_or("");
+    if WINDOWS_RESERVED_NAMES.contains(&base_name) {
+        return Err(TorrentError::UnsafePath(format!(
+            "Windows reserved device name: {}",
+            component
+        )));
+    }
+
     Ok(component.to_string())
 }
 
@@ -109,7 +169,12 @@ fn extract_file_path(path_value: &Value) -> Result<Vec<String>> {
         return Err(TorrentError::UnsafePath("empty file path".to_string()));
     }
 
+    if path_list.len() > MAX_PATH_DEPTH {
+        return Err(TorrentError::PathTooDeep(path_list.len(), MAX_PATH_DEPTH));
+    }
+
     let mut sanitized = Vec::new();
+    let mut total_path_len = 0;
     for component_val in path_list {
         let component_str = component_val
             .as_str()
@@ -118,6 +183,13 @@ fn extract_file_path(path_value: &Value) -> Result<Vec<String>> {
             ))?;
 
         let sanitized_component = sanitize_path_component(component_str)?;
+        total_path_len += sanitized_component.len() + 1;
+        if total_path_len > MAX_TOTAL_PATH_LENGTH {
+            return Err(TorrentError::TotalPathTooLong(
+                total_path_len,
+                MAX_TOTAL_PATH_LENGTH,
+            ));
+        }
         sanitized.push(sanitized_component);
     }
 
@@ -145,6 +217,7 @@ pub fn parse_torrent(data: &[u8]) -> Result<TorrentInfo> {
         .map(|s| s.to_string());
 
     let mut announce_list = Vec::new();
+    let mut total_tracker_count = if announce.is_some() { 1 } else { 0 };
     if let Some(announce_list_val) = root_dict.get(b"announce-list".as_ref()) {
         if let Some(tiers) = announce_list_val.as_list() {
             for tier_val in tiers {
@@ -152,6 +225,13 @@ pub fn parse_torrent(data: &[u8]) -> Result<TorrentInfo> {
                     let mut tier_urls = Vec::new();
                     for url_val in tier {
                         if let Some(url) = url_val.as_str() {
+                            total_tracker_count += 1;
+                            if total_tracker_count > MAX_TRACKERS {
+                                return Err(TorrentError::TooManyTrackers(
+                                    total_tracker_count,
+                                    MAX_TRACKERS,
+                                ));
+                            }
                             tier_urls.push(url.to_string());
                         }
                     }
@@ -251,6 +331,13 @@ fn parse_info_dict_fields(
         let files_list = files_val
             .as_list()
             .ok_or(TorrentError::InvalidFieldType("files must be list"))?;
+
+        if files_list.len() > MAX_FILES_IN_TORRENT {
+            return Err(TorrentError::TooManyFiles(
+                files_list.len(),
+                MAX_FILES_IN_TORRENT,
+            ));
+        }
 
         let mut files = Vec::new();
         let mut total = 0u64;

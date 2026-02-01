@@ -14,6 +14,10 @@ pub enum MagnetError {
     InvalidPercentEncoding,
     #[error("invalid utf-8 in magnet parameter")]
     InvalidUtf8,
+    #[error("too many trackers: {0} (max {1})")]
+    TooManyTrackers(usize, usize),
+    #[error("unsupported tracker scheme: {0}")]
+    UnsupportedTrackerScheme(String),
 }
 
 pub type Result<T> = std::result::Result<T, MagnetError>;
@@ -22,6 +26,12 @@ pub type Result<T> = std::result::Result<T, MagnetError>;
 pub struct MagnetLink {
     pub info_hash: [u8; 20],
     pub trackers: Vec<String>,
+}
+
+const MAX_TRACKERS: usize = 200;
+
+fn is_supported_tracker_scheme(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://") || url.starts_with("udp://")
 }
 
 pub fn parse_magnet(uri: &str) -> Result<MagnetLink> {
@@ -50,6 +60,15 @@ pub fn parse_magnet(uri: &str) -> Result<MagnetLink> {
         } else if key == "tr" {
             let decoded = percent_decode(value)?;
             if !decoded.is_empty() {
+                if !is_supported_tracker_scheme(&decoded) {
+                    return Err(MagnetError::UnsupportedTrackerScheme(decoded));
+                }
+                if trackers.len() >= MAX_TRACKERS {
+                    return Err(MagnetError::TooManyTrackers(
+                        trackers.len() + 1,
+                        MAX_TRACKERS,
+                    ));
+                }
                 trackers.push(decoded);
             }
         }

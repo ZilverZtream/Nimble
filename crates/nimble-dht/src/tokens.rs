@@ -16,7 +16,7 @@ pub struct TokenIssuer {
 
 impl TokenIssuer {
     pub fn new() -> Self {
-        let secret = generate_random_bytes::<SECRET_LEN>();
+        let secret = generate_random_bytes::<SECRET_LEN>().expect("Failed to generate token secret");
         Self {
             secret,
             previous_secret: secret,
@@ -52,7 +52,7 @@ impl TokenIssuer {
             return;
         }
         self.previous_secret = self.secret;
-        self.secret = generate_random_bytes::<SECRET_LEN>();
+        self.secret = generate_random_bytes::<SECRET_LEN>().expect("Failed to rotate token secret");
         self.last_rotate = Instant::now();
     }
 }

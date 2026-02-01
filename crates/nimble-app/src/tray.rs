@@ -118,7 +118,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 1004 => { handle_status_window(hwnd); }
                 1005 => { handle_pause_all(hwnd); }
                 1006 => { handle_resume_all(hwnd); }
-                1007 => { /* Settings... */ }
+                1007 => { handle_settings(hwnd); }
                 1099 => { handle_quit(hwnd); }
                 _ => {}
             }
@@ -230,15 +230,100 @@ unsafe fn handle_add_torrent_file(hwnd: HWND) {
 }
 
 #[cfg(windows)]
-unsafe fn handle_add_magnet(_hwnd: HWND) {
-    // TODO: Implement magnet input dialog
-    log::info("Add Magnet not yet implemented");
+unsafe fn handle_add_magnet(hwnd: HWND) {
+    use nimble_core::types::Command;
+    use windows_sys::Win32::System::DataExchange::{OpenClipboard, GetClipboardData, CloseClipboard};
+    use windows_sys::Win32::System::Memory::GlobalLock;
+
+    const CF_UNICODETEXT: u32 = 13;
+    const MB_OKCANCEL: u32 = 1;
+    const MB_ICONINFORMATION: u32 = 64;
+    const IDOK: i32 = 1;
+
+    let message = widestr("Please copy the magnet link to your clipboard, then click OK.");
+    let title = widestr("Add Magnet Link");
+
+    let result = MessageBoxW(hwnd, message.as_ptr(), title.as_ptr(), MB_OKCANCEL | MB_ICONINFORMATION);
+
+    if result == IDOK {
+        if OpenClipboard(hwnd) != 0 {
+            let h_data = GetClipboardData(CF_UNICODETEXT);
+            if h_data != 0 {
+                let p_data = GlobalLock(h_data) as *const u16;
+                if !p_data.is_null() {
+                    let mut len = 0;
+                    while *p_data.add(len) != 0 && len < 8192 {
+                        len += 1;
+                    }
+
+                    let uri_slice = std::slice::from_raw_parts(p_data, len);
+                    let uri = String::from_utf16_lossy(uri_slice);
+
+                    if uri.starts_with("magnet:") {
+                        if let Some(engine) = get_engine(hwnd) {
+                            let _ = engine.tx.send(Command::AddMagnet { uri });
+                            log::info("Added magnet link from clipboard");
+                        }
+                    } else {
+                        log::info("Clipboard does not contain a valid magnet link");
+                    }
+
+                    windows_sys::Win32::System::Memory::GlobalUnlock(h_data);
+                }
+            }
+            CloseClipboard();
+        } else {
+            log::info("Failed to open clipboard");
+        }
+    }
 }
 
 #[cfg(windows)]
 unsafe fn handle_open_downloads(_hwnd: HWND) {
-    // TODO: Open downloads folder
-    log::info("Open Downloads not yet implemented");
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let settings = match nimble_core::settings::EngineSettings::load_default() {
+        Ok(s) => s,
+        Err(e) => {
+            log::info(&format!("Failed to load settings: {}", e));
+            return;
+        }
+    };
+
+    let download_dir = std::path::PathBuf::from(&settings.download_dir);
+    let absolute_path = if download_dir.is_absolute() {
+        download_dir
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(download_dir),
+            Err(_) => {
+                log::info("Failed to get current directory");
+                return;
+            }
+        }
+    };
+
+    if !absolute_path.exists() {
+        if let Err(e) = std::fs::create_dir_all(&absolute_path) {
+            log::info(&format!("Failed to create downloads directory: {}", e));
+            return;
+        }
+    }
+
+    let path_wide = widestr(&absolute_path.to_string_lossy());
+    let result = ShellExecuteW(
+        0,
+        widestr("open").as_ptr(),
+        path_wide.as_ptr(),
+        std::ptr::null(),
+        std::ptr::null(),
+        SW_SHOWNORMAL,
+    );
+
+    if result <= 32 {
+        log::info(&format!("Failed to open downloads folder, error code: {}", result));
+    }
 }
 
 #[cfg(windows)]
@@ -264,6 +349,65 @@ unsafe fn handle_resume_all(hwnd: HWND) {
     if let Some(engine) = get_engine(hwnd) {
         let _ = engine.tx.send(Command::ResumeAll);
     }
+}
+
+#[cfg(windows)]
+unsafe fn handle_settings(hwnd: HWND) {
+    let settings = match nimble_core::settings::EngineSettings::load_default() {
+        Ok(s) => s,
+        Err(e) => {
+            log::info(&format!("Failed to load settings: {}", e));
+            return;
+        }
+    };
+
+    let settings_text = format!(
+        "Current Settings:\n\n\
+        Download Directory: {}\n\
+        Listen Port: {}\n\n\
+        DHT: {}\n\
+        PEX: {}\n\
+        LSD: {}\n\
+        UPnP: {}\n\
+        NAT-PMP: {}\n\
+        IPv6: {}\n\
+        µTP: {}\n\n\
+        Max Connections (Global): {}\n\
+        Max Connections (Per Torrent): {}\n\
+        Max Active Torrents: {}\n\n\
+        Download Limit: {} KiB/s\n\
+        Upload Limit: {} KiB/s\n\n\
+        Cache Size: {} MB\n\
+        Write Behind: {}\n\
+        Preallocate: {}",
+        settings.download_dir,
+        settings.listen_port,
+        if settings.enable_dht { "Enabled" } else { "Disabled" },
+        if settings.enable_pex { "Enabled" } else { "Disabled" },
+        if settings.enable_lsd { "Enabled" } else { "Disabled" },
+        if settings.enable_upnp { "Enabled" } else { "Disabled" },
+        if settings.enable_nat_pmp { "Enabled" } else { "Disabled" },
+        if settings.enable_ipv6 { "Enabled" } else { "Disabled" },
+        if settings.enable_utp { "Enabled" } else { "Disabled" },
+        settings.max_connections_global,
+        settings.max_connections_per_torrent,
+        settings.max_active_torrents,
+        if settings.dl_limit_kib == 0 { "Unlimited".to_string() } else { settings.dl_limit_kib.to_string() },
+        if settings.ul_limit_kib == 0 { "Unlimited".to_string() } else { settings.ul_limit_kib.to_string() },
+        settings.cache_mb,
+        if settings.write_behind { "Enabled" } else { "Disabled" },
+        if settings.preallocate { "Enabled" } else { "Disabled" },
+    );
+
+    const MB_OK: u32 = 0;
+    const MB_ICONINFORMATION: u32 = 64;
+
+    MessageBoxW(
+        hwnd,
+        widestr(&settings_text).as_ptr(),
+        widestr("Nimble Settings").as_ptr(),
+        MB_OK | MB_ICONINFORMATION,
+    );
 }
 
 #[cfg(windows)]

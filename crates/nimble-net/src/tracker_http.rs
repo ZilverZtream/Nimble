@@ -7,6 +7,11 @@ use windows_sys::Win32::Networking::WinHttp::*;
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1MB cap for tracker responses
 const MAX_PEERS_FROM_TRACKER: usize = 200; // Cap peers to prevent excessive memory/CPU usage
 
+const TIMEOUT_RESOLVE_MS: i32 = 30_000;
+const TIMEOUT_CONNECT_MS: i32 = 30_000;
+const TIMEOUT_SEND_MS: i32 = 30_000;
+const TIMEOUT_RECEIVE_MS: i32 = 60_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackerEvent {
     Started,
@@ -145,6 +150,20 @@ unsafe fn http_get_inner(h_session: *mut std::ffi::c_void, url: &str) -> Result<
     if h_request.is_null() {
         WinHttpCloseHandle(h_connect);
         return Err(anyhow!("WinHttpOpenRequest failed"));
+    }
+
+    let timeout_result = WinHttpSetTimeouts(
+        h_request,
+        TIMEOUT_RESOLVE_MS,
+        TIMEOUT_CONNECT_MS,
+        TIMEOUT_SEND_MS,
+        TIMEOUT_RECEIVE_MS,
+    );
+
+    if timeout_result == 0 {
+        WinHttpCloseHandle(h_request);
+        WinHttpCloseHandle(h_connect);
+        return Err(anyhow!("WinHttpSetTimeouts failed"));
     }
 
     let send_result = WinHttpSendRequest(

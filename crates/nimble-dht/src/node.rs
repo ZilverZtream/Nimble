@@ -76,7 +76,7 @@ enum QueryType {
 
 impl DhtNode {
     pub fn new() -> Self {
-        let node_id = dht_node_id_20();
+        let node_id = dht_node_id_20().expect("Failed to generate DHT node ID");
         let routing = RoutingTable::new(node_id);
         #[cfg(feature = "ipv6")]
         let routing6 = RoutingTable6::new(node_id);

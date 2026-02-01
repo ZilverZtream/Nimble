@@ -255,7 +255,8 @@ fn get_or_open_file<'a>(
         cache.insert(file_index, file);
     }
 
-    Ok(cache.get_mut(&file_index).unwrap())
+    cache.get_mut(&file_index)
+        .ok_or_else(|| anyhow::anyhow!("File handle missing after insertion for index {}", file_index))
 }
 
 fn read_block_sync(

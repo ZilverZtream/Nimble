@@ -166,7 +166,7 @@ impl Session {
         let mut session = Session {
             torrents: HashMap::new(),
             download_dir,
-            peer_id: peer_id_20(),
+            peer_id: peer_id_20().expect("Failed to generate peer ID"),
             listen_port,
             dht,
             dht_socket,

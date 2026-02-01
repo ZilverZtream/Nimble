@@ -185,7 +185,8 @@ impl CacheWorker {
             self.file_handles.insert(file_index, file);
         }
 
-        Ok(self.file_handles.get_mut(&file_index).unwrap())
+        self.file_handles.get_mut(&file_index)
+            .ok_or_else(|| anyhow::anyhow!("File handle missing after insertion for index {}", file_index))
     }
 
     fn close_all_files(&mut self) {

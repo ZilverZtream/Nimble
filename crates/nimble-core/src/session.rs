@@ -1,6 +1,8 @@
 use anyhow::Result;
 use nimble_bencode::torrent::{parse_info_dict, parse_torrent, InfoHash, TorrentInfo};
 use nimble_dht::node::DhtNode;
+use nimble_net::listener::PeerListener;
+use nimble_net::peer::PeerConnection;
 use nimble_net::tracker_http::TrackerEvent;
 use nimble_storage::disk::DiskStorage;
 use nimble_util::ids::peer_id_20;
@@ -23,6 +25,7 @@ pub struct Session {
     dht_socket: Option<UdpSocket>,
     announce_worker: AnnounceWorker,
     pending_announces: HashSet<String>,
+    peer_listener: Option<PeerListener>,
 }
 
 pub enum TorrentEntry {
@@ -56,6 +59,8 @@ pub struct TrackerState {
     pub interval: Duration,
     pub peers: Vec<SocketAddrV4>,
     pub consecutive_failures: u32,
+    pub current_tier: usize,
+    pub current_tracker_in_tier: usize,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -89,6 +94,11 @@ impl Session {
             (None, None)
         };
 
+        let peer_listener = PeerListener::new(listen_port).ok();
+        if peer_listener.is_none() {
+            eprintln!("Failed to create peer listener on port {}", listen_port);
+        }
+
         let mut session = Session {
             torrents: HashMap::new(),
             download_dir,
@@ -98,6 +108,7 @@ impl Session {
             dht_socket,
             announce_worker: AnnounceWorker::new(),
             pending_announces: HashSet::new(),
+            peer_listener,
         };
 
         if let Err(e) = session.load_saved_torrents() {
@@ -144,6 +155,8 @@ impl Session {
             interval: Duration::from_secs(1800),
             peers: Vec::new(),
             consecutive_failures: 0,
+            current_tier: 0,
+            current_tracker_in_tier: 0,
         };
 
         let mut peer_manager = PeerManager::new(
@@ -162,6 +175,9 @@ impl Session {
             ..Default::default()
         };
 
+        let piece_count = info.pieces.len();
+        let info_hash_bytes = *info.infohash.as_bytes();
+
         let state = ActiveTorrent {
             info,
             storage,
@@ -173,7 +189,12 @@ impl Session {
         };
 
         self.torrents
-            .insert(infohash, TorrentEntry::Active(state));
+            .insert(infohash.clone(), TorrentEntry::Active(state));
+
+        if let Some(listener) = self.peer_listener.as_mut() {
+            listener.register_infohash(info_hash_bytes, self.peer_id, piece_count);
+        }
+
         Ok(())
     }
 
@@ -197,6 +218,8 @@ impl Session {
             interval: Duration::from_secs(1800),
             peers: Vec::new(),
             consecutive_failures: 0,
+            current_tier: 0,
+            current_tracker_in_tier: 0,
         };
 
         let mut peer_manager = PeerManager::new(
@@ -214,6 +237,9 @@ impl Session {
             ..Default::default()
         };
 
+        let piece_count = info.pieces.len();
+        let info_hash_bytes = *info.infohash.as_bytes();
+
         let state = ActiveTorrent {
             info,
             storage,
@@ -226,6 +252,11 @@ impl Session {
 
         self.torrents
             .insert(infohash.clone(), TorrentEntry::Active(state));
+
+        if let Some(listener) = self.peer_listener.as_mut() {
+            listener.register_infohash(info_hash_bytes, self.peer_id, piece_count);
+        }
+
         Ok(infohash)
     }
 
@@ -246,6 +277,8 @@ impl Session {
             interval: Duration::from_secs(1800),
             peers: Vec::new(),
             consecutive_failures: 0,
+            current_tier: 0,
+            current_tracker_in_tier: 0,
         };
 
         let peer_manager = PeerManager::new_metadata_only(magnet.info_hash, self.peer_id);
@@ -264,6 +297,11 @@ impl Session {
 
         self.torrents
             .insert(infohash.clone(), TorrentEntry::Magnet(state));
+
+        if let Some(listener) = self.peer_listener.as_mut() {
+            listener.register_infohash(magnet.info_hash, self.peer_id, 0);
+        }
+
         Ok(infohash)
     }
 
@@ -296,6 +334,7 @@ impl Session {
         let listen_port = self.listen_port;
         let mut upgrades = Vec::new();
 
+        log_lines.extend(self.process_incoming_peers());
         log_lines.extend(self.process_dht_incoming());
 
         while let Some(result) = self.announce_worker.try_recv_result() {
@@ -307,6 +346,8 @@ impl Session {
                         if result.success {
                             torrent.tracker.last_announce = Some(now);
                             torrent.tracker.consecutive_failures = 0;
+                            torrent.tracker.current_tier = 0;
+                            torrent.tracker.current_tracker_in_tier = 0;
                             if let Some(interval) = result.interval {
                                 torrent.tracker.interval = Duration::from_secs(interval as u64);
                             }
@@ -321,6 +362,7 @@ impl Session {
                             ));
                         } else {
                             torrent.tracker.consecutive_failures = torrent.tracker.consecutive_failures.saturating_add(1);
+                            Self::advance_tracker_tier(&mut torrent.tracker, &torrent.info.announce_list);
                             torrent.tracker.next_announce = Some(now + Duration::from_secs(60));
                             if let Some(error) = &result.error {
                                 log_lines.push(format!(
@@ -336,6 +378,7 @@ impl Session {
                         if result.success {
                             torrent.tracker.last_announce = Some(now);
                             torrent.tracker.consecutive_failures = 0;
+                            torrent.tracker.current_tracker_in_tier = 0;
                             if let Some(interval) = result.interval {
                                 torrent.tracker.interval = Duration::from_secs(interval as u64);
                             }
@@ -350,6 +393,9 @@ impl Session {
                             ));
                         } else {
                             torrent.tracker.consecutive_failures = torrent.tracker.consecutive_failures.saturating_add(1);
+                            if !torrent.trackers.is_empty() {
+                                torrent.tracker.current_tracker_in_tier = (torrent.tracker.current_tracker_in_tier + 1) % torrent.trackers.len();
+                            }
                             torrent.tracker.next_announce = Some(now + Duration::from_secs(60));
                             if let Some(error) = &result.error {
                                 log_lines.push(format!(
@@ -452,7 +498,7 @@ impl Session {
                         .unwrap_or(false);
 
                     if should_announce && !self.pending_announces.contains(infohash) {
-                        if let Some(announce_url) = torrent.info.announce.clone() {
+                        if let Some(announce_url) = Self::get_tracker_url(&torrent.info, &torrent.tracker) {
                             self.pending_announces.insert(infohash.clone());
                             let task = AnnounceTask {
                                 infohash_hex: infohash.clone(),
@@ -510,7 +556,7 @@ impl Session {
                         .unwrap_or(false);
 
                     if should_announce && !self.pending_announces.contains(infohash) {
-                        if let Some(announce_url) = torrent.trackers.first().cloned() {
+                        if let Some(announce_url) = torrent.trackers.get(torrent.tracker.current_tracker_in_tier).cloned() {
                             self.pending_announces.insert(infohash.clone());
                             let task = AnnounceTask {
                                 infohash_hex: infohash.clone(),
@@ -580,6 +626,11 @@ impl Session {
         }
 
         for (infohash, state) in upgrades {
+            if let Some(listener) = self.peer_listener.as_mut() {
+                let info_hash_bytes = *state.info.infohash.as_bytes();
+                let piece_count = state.info.pieces.len();
+                listener.register_infohash(info_hash_bytes, self.peer_id, piece_count);
+            }
             self.torrents.insert(infohash, TorrentEntry::Active(state));
         }
 
@@ -632,6 +683,8 @@ impl Session {
             interval: Duration::from_secs(1800),
             peers: Vec::new(),
             consecutive_failures: 0,
+            current_tier: 0,
+            current_tracker_in_tier: 0,
         };
 
         Ok(ActiveTorrent {
@@ -652,6 +705,35 @@ impl Session {
             announce_list.push(vec![tracker.clone()]);
         }
         (announce, announce_list)
+    }
+
+    fn get_tracker_url(info: &TorrentInfo, tracker_state: &TrackerState) -> Option<String> {
+        if !info.announce_list.is_empty() {
+            if let Some(tier) = info.announce_list.get(tracker_state.current_tier) {
+                if let Some(url) = tier.get(tracker_state.current_tracker_in_tier) {
+                    return Some(url.clone());
+                }
+            }
+        }
+        info.announce.clone()
+    }
+
+    fn advance_tracker_tier(tracker_state: &mut TrackerState, announce_list: &[Vec<String>]) {
+        if announce_list.is_empty() {
+            return;
+        }
+
+        let current_tier = &announce_list[tracker_state.current_tier];
+        tracker_state.current_tracker_in_tier += 1;
+
+        if tracker_state.current_tracker_in_tier >= current_tier.len() {
+            tracker_state.current_tracker_in_tier = 0;
+            tracker_state.current_tier += 1;
+
+            if tracker_state.current_tier >= announce_list.len() {
+                tracker_state.current_tier = 0;
+            }
+        }
     }
 
     pub fn get_session_stats(&self) -> SessionStats {
@@ -686,6 +768,10 @@ impl Session {
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
+        if let Some(listener) = self.peer_listener.as_mut() {
+            listener.close();
+        }
+
         for (infohash, torrent) in self.torrents.iter_mut() {
             if let TorrentEntry::Active(state) = torrent {
                 if let Err(e) = state.storage.close() {
@@ -694,6 +780,79 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    fn process_incoming_peers(&mut self) -> Vec<String> {
+        let mut log_lines = Vec::new();
+        let Some(listener) = self.peer_listener.as_mut() else {
+            return log_lines;
+        };
+
+        let accepted = match listener.poll() {
+            Ok(peers) => peers,
+            Err(_) => return log_lines,
+        };
+
+        for accepted_peer in accepted {
+            let infohash_hex = InfoHash(accepted_peer.info_hash).to_hex();
+
+            let torrent = match self.torrents.get_mut(&infohash_hex) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            let piece_count = match torrent {
+                TorrentEntry::Active(t) => t.info.pieces.len(),
+                TorrentEntry::Magnet(_) => 0,
+            };
+
+            #[cfg(target_os = "windows")]
+            let connection = match PeerConnection::from_accepted(
+                accepted_peer.socket,
+                accepted_peer.addr,
+                accepted_peer.info_hash,
+                self.peer_id,
+                accepted_peer.their_peer_id,
+                piece_count,
+                self.listen_port,
+            ) {
+                Ok(conn) => conn,
+                Err(_) => continue,
+            };
+
+            #[cfg(not(target_os = "windows"))]
+            let connection = match PeerConnection::from_accepted(
+                accepted_peer.stream,
+                accepted_peer.addr,
+                accepted_peer.info_hash,
+                self.peer_id,
+                accepted_peer.their_peer_id,
+                piece_count,
+                self.listen_port,
+            ) {
+                Ok(conn) => conn,
+                Err(_) => continue,
+            };
+
+            let result = match torrent {
+                TorrentEntry::Active(t) => {
+                    t.peer_manager.accept_incoming(connection, accepted_peer.addr)
+                }
+                TorrentEntry::Magnet(t) => {
+                    t.peer_manager.accept_incoming(connection, accepted_peer.addr)
+                }
+            };
+
+            if result.is_ok() {
+                log_lines.push(format!(
+                    "Accepted incoming peer for {} from {}",
+                    &infohash_hex[..8],
+                    accepted_peer.addr
+                ));
+            }
+        }
+
+        log_lines
     }
 
     fn process_dht_incoming(&mut self) -> Vec<String> {

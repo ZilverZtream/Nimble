@@ -3,7 +3,7 @@ use nimble_bencode::torrent::TorrentInfo;
 use nimble_util::bitfield::Bitfield;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use crate::hasher::{HashVerifier, VerifyRequest};
@@ -148,6 +148,68 @@ impl DiskStorage {
         } else {
             Ok(false)
         }
+    }
+
+    pub fn read_block(&mut self, piece_index: u64, block_offset: u32, length: u32) -> Result<Vec<u8>> {
+        if piece_index >= self.pieces.len() as u64 {
+            anyhow::bail!("invalid piece index: {}", piece_index);
+        }
+
+        if !self.has_piece(piece_index) {
+            anyhow::bail!("piece {} not available", piece_index);
+        }
+
+        let piece_len = self.get_piece_length(piece_index);
+
+        if block_offset as u64 >= piece_len {
+            anyhow::bail!(
+                "block offset {} exceeds piece length {}",
+                block_offset,
+                piece_len
+            );
+        }
+
+        let max_length = (piece_len - block_offset as u64) as u32;
+        if length > max_length {
+            anyhow::bail!(
+                "requested length {} exceeds available {} bytes",
+                length,
+                max_length
+            );
+        }
+
+        if length > BLOCK_SIZE {
+            anyhow::bail!("requested length {} exceeds max block size", length);
+        }
+
+        let global_start = piece_index * self.piece_length + block_offset as u64;
+        let global_end = global_start + length as u64;
+
+        let segments = self.layout.map_range(global_start, global_end);
+        let mut data = vec![0u8; length as usize];
+        let mut data_offset = 0;
+
+        for segment in segments {
+            let file_handle = self.get_or_create_file(segment.file_index)?;
+            file_handle.seek(SeekFrom::Start(segment.file_offset))
+                .context("seek failed")?;
+
+            let read_length = segment.length as usize;
+            file_handle.read_exact(&mut data[data_offset..data_offset + read_length])
+                .context("read failed")?;
+
+            data_offset += read_length;
+        }
+
+        if data_offset != length as usize {
+            anyhow::bail!(
+                "incomplete read: expected {} bytes, got {}",
+                length,
+                data_offset
+            );
+        }
+
+        Ok(data)
     }
 
     fn submit_piece_for_verification(&mut self, piece_index: u64) {

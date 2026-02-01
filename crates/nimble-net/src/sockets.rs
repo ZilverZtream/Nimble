@@ -83,6 +83,24 @@ mod windows_impl {
             }
         }
 
+        pub fn from_raw_socket(socket: SOCKET, peer_addr: SocketAddr) -> Result<Self> {
+            if socket == INVALID_SOCKET {
+                anyhow::bail!("invalid socket");
+            }
+
+            let sock = TcpSocket {
+                socket,
+                connected: true,
+                peer_addr: Some(peer_addr),
+            };
+
+            sock.set_nonblocking(true)?;
+            sock.set_timeouts(RECV_TIMEOUT_MS, SEND_TIMEOUT_MS)?;
+            sock.set_keepalive(true)?;
+
+            Ok(sock)
+        }
+
         fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
             let mut mode: u32 = if nonblocking { 1 } else { 0 };
             let result = unsafe {
@@ -438,6 +456,17 @@ mod unix_impl {
 
         pub fn new_for_addr(_addr: &SocketAddr) -> Result<Self> {
             Self::new()
+        }
+
+        pub fn from_raw_socket(stream: TcpStream, peer_addr: SocketAddr) -> Result<Self> {
+            stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+            stream.set_nodelay(true)?;
+
+            Ok(TcpSocket {
+                stream: Some(stream),
+                peer_addr: Some(peer_addr),
+            })
         }
 
         pub fn connect(&mut self, addr: SocketAddr) -> Result<()> {

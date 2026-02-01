@@ -8,6 +8,12 @@ const LATENCY_WINDOW: usize = 10;
 const GOOD_LATENCY_MS: f64 = 100.0;
 const FAST_THROUGHPUT_BPS: f64 = 100_000.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportType {
+    Tcp,
+    Utp,
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerScore {
     download_bytes: u64,
@@ -21,10 +27,16 @@ pub struct PeerScore {
     choke_count: u32,
     last_score_update: Instant,
     cached_score: f64,
+    transport_type: TransportType,
+    utp_rtt_us: Option<u32>,
 }
 
 impl PeerScore {
     pub fn new() -> Self {
+        Self::with_transport(TransportType::Tcp)
+    }
+
+    pub fn with_transport(transport: TransportType) -> Self {
         let now = Instant::now();
         PeerScore {
             download_bytes: 0,
@@ -38,7 +50,17 @@ impl PeerScore {
             choke_count: 0,
             last_score_update: now,
             cached_score: 0.5,
+            transport_type: transport,
+            utp_rtt_us: None,
         }
+    }
+
+    pub fn transport_type(&self) -> TransportType {
+        self.transport_type
+    }
+
+    pub fn update_utp_rtt(&mut self, rtt_us: u32) {
+        self.utp_rtt_us = Some(rtt_us);
     }
 
     pub fn record_download(&mut self, bytes: u64) {
@@ -82,6 +104,13 @@ impl PeerScore {
     }
 
     fn calculate_latency_score(&self) -> f64 {
+        if self.transport_type == TransportType::Utp {
+            if let Some(rtt_us) = self.utp_rtt_us {
+                let rtt_ms = rtt_us as f64 / 1000.0;
+                return (GOOD_LATENCY_MS / rtt_ms.max(1.0)).min(1.0);
+            }
+        }
+
         if self.recent_latencies.is_empty() {
             return 0.5;
         }
@@ -234,5 +263,27 @@ mod tests {
         let first = score.calculate_score();
         let second = score.get_cached_score();
         assert!((first - second).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_utp_transport_type() {
+        let score = PeerScore::with_transport(TransportType::Utp);
+        assert_eq!(score.transport_type(), TransportType::Utp);
+    }
+
+    #[test]
+    fn test_utp_rtt_latency() {
+        let mut score = PeerScore::with_transport(TransportType::Utp);
+        score.update_utp_rtt(50_000);
+        let latency = score.calculate_latency_score();
+        assert!(latency > 0.9);
+    }
+
+    #[test]
+    fn test_utp_high_rtt() {
+        let mut score = PeerScore::with_transport(TransportType::Utp);
+        score.update_utp_rtt(500_000);
+        let latency = score.calculate_latency_score();
+        assert!(latency < 0.3);
     }
 }

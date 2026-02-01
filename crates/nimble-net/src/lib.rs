@@ -5,5 +5,6 @@ pub mod sockets;
 pub mod tracker_http;
 pub mod tracker_udp;
 pub mod utp;
+pub mod utp_peer;
 pub mod ut_metadata;
 pub mod ut_pex;

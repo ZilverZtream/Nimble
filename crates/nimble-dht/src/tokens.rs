@@ -1,9 +1,10 @@
+use nimble_util::hash::sha1;
 use nimble_util::ids::generate_random_bytes;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
-const SECRET_LEN: usize = 8;
-const TOKEN_LEN: usize = SECRET_LEN + 4;
+const SECRET_LEN: usize = 16;
+const TOKEN_LEN: usize = 20;
 const DEFAULT_ROTATE_INTERVAL: Duration = Duration::from_secs(300);
 
 pub struct TokenIssuer {
@@ -24,12 +25,16 @@ impl TokenIssuer {
         }
     }
 
+    fn compute_token(secret: &[u8; SECRET_LEN], ip: Ipv4Addr) -> [u8; TOKEN_LEN] {
+        let mut data = [0u8; SECRET_LEN + 4];
+        data[..SECRET_LEN].copy_from_slice(secret);
+        data[SECRET_LEN..].copy_from_slice(&ip.octets());
+        sha1(&data)
+    }
+
     pub fn token_for(&mut self, ip: Ipv4Addr) -> Vec<u8> {
         self.maybe_rotate();
-        let mut token = Vec::with_capacity(TOKEN_LEN);
-        token.extend_from_slice(&self.secret);
-        token.extend_from_slice(&ip.octets());
-        token
+        Self::compute_token(&self.secret, ip).to_vec()
     }
 
     pub fn validate(&mut self, ip: Ipv4Addr, token: &[u8]) -> bool {
@@ -37,9 +42,9 @@ impl TokenIssuer {
             return false;
         }
         self.maybe_rotate();
-        let (secret, addr_bytes) = token.split_at(SECRET_LEN);
-        addr_bytes == ip.octets()
-            && (secret == self.secret || secret == self.previous_secret)
+        let current_token = Self::compute_token(&self.secret, ip);
+        let previous_token = Self::compute_token(&self.previous_secret, ip);
+        token == current_token || token == previous_token
     }
 
     fn maybe_rotate(&mut self) {

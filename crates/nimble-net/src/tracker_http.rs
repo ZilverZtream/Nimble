@@ -5,6 +5,7 @@ use windows_sys::core::w;
 use windows_sys::Win32::Networking::WinHttp::*;
 
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1MB cap for tracker responses
+const MAX_PEERS_FROM_TRACKER: usize = 200; // Cap peers to prevent excessive memory/CPU usage
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackerEvent {
@@ -348,9 +349,11 @@ fn parse_compact_peers(data: &[u8]) -> Result<Vec<SocketAddrV4>> {
         return Err(anyhow!("compact peers length must be multiple of 6"));
     }
 
-    let mut peers = Vec::new();
+    let peer_count = data.len() / 6;
+    let capped_count = peer_count.min(MAX_PEERS_FROM_TRACKER);
+    let mut peers = Vec::with_capacity(capped_count);
 
-    for chunk in data.chunks_exact(6) {
+    for chunk in data.chunks_exact(6).take(MAX_PEERS_FROM_TRACKER) {
         let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
         peers.push(SocketAddrV4::new(ip, port));

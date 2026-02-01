@@ -15,6 +15,12 @@ pub enum TorrentError {
     InvalidPiecesLength,
     #[error("invalid announce URL")]
     InvalidAnnounce,
+    #[error("piece count mismatch: expected {expected}, got {actual}")]
+    PieceCountMismatch { expected: usize, actual: usize },
+    #[error("piece length too large: {0} bytes (max {1})")]
+    PieceLengthTooLarge(u64, u64),
+    #[error("total length overflow")]
+    TotalLengthOverflow,
 }
 
 pub type Result<T> = std::result::Result<T, TorrentError>;
@@ -172,6 +178,8 @@ pub fn parse_torrent(data: &[u8]) -> Result<TorrentInfo> {
     parse_info_dict_fields(info_dict, info_bencoded, announce, announce_list)
 }
 
+const MAX_PIECE_LENGTH: u64 = 64 * 1024 * 1024;
+
 fn parse_info_dict_fields(
     info_dict: &std::collections::BTreeMap<&[u8], Value>,
     info_bencoded: &[u8],
@@ -186,6 +194,14 @@ fn parse_info_dict_fields(
     if piece_length <= 0 {
         return Err(TorrentError::InvalidFieldType(
             "piece length must be positive",
+        ));
+    }
+
+    let piece_length = piece_length as u64;
+    if piece_length > MAX_PIECE_LENGTH {
+        return Err(TorrentError::PieceLengthTooLarge(
+            piece_length,
+            MAX_PIECE_LENGTH,
         ));
     }
 
@@ -261,7 +277,9 @@ fn parse_info_dict_fields(
 
             let path = extract_file_path(path_val)?;
 
-            total = total.saturating_add(length as u64);
+            total = total
+                .checked_add(length as u64)
+                .ok_or(TorrentError::TotalLengthOverflow)?;
 
             files.push(FileInfo {
                 path,
@@ -274,12 +292,25 @@ fn parse_info_dict_fields(
         return Err(TorrentError::MissingField("length or files"));
     };
 
+    let expected_pieces = if total_length == 0 {
+        0
+    } else {
+        ((total_length + piece_length - 1) / piece_length) as usize
+    };
+
+    if pieces.len() != expected_pieces {
+        return Err(TorrentError::PieceCountMismatch {
+            expected: expected_pieces,
+            actual: pieces.len(),
+        });
+    }
+
     let infohash = compute_infohash(info_bencoded);
 
     Ok(TorrentInfo {
         announce,
         announce_list,
-        piece_length: piece_length as u64,
+        piece_length,
         pieces,
         mode,
         infohash,
@@ -294,20 +325,82 @@ fn compute_infohash(info_bencoded: &[u8]) -> InfoHash {
 }
 
 fn find_info_dict_range(data: &[u8]) -> Option<(usize, usize)> {
-    let needle = b"4:info";
-    let mut pos = 0;
+    if data.is_empty() || data[0] != b'd' {
+        return None;
+    }
 
-    while pos + needle.len() <= data.len() {
-        if &data[pos..pos + needle.len()] == needle {
-            let value_start = pos + needle.len();
-            if let Some(value_end) = find_bencode_value_end(data, value_start) {
-                return Some((value_start, value_end));
-            }
+    let mut pos = 1;
+
+    while pos < data.len() && data[pos] != b'e' {
+        let key_start = pos;
+        let key_end = skip_bencode_string(data, key_start)?;
+        let key_bytes = extract_bencode_string(data, key_start)?;
+
+        let value_start = key_end;
+        let value_end = find_bencode_value_end(data, value_start)?;
+
+        if key_bytes == b"info" {
+            return Some((value_start, value_end));
         }
-        pos += 1;
+
+        pos = value_end;
     }
 
     None
+}
+
+fn skip_bencode_string(data: &[u8], start: usize) -> Option<usize> {
+    if start >= data.len() || !data[start].is_ascii_digit() {
+        return None;
+    }
+
+    let mut pos = start;
+    while pos < data.len() && data[pos].is_ascii_digit() {
+        pos += 1;
+    }
+
+    if pos >= data.len() || data[pos] != b':' {
+        return None;
+    }
+
+    let len_bytes = &data[start..pos];
+    let len_str = std::str::from_utf8(len_bytes).ok()?;
+    let len: usize = len_str.parse().ok()?;
+
+    pos += 1;
+    let end = pos.checked_add(len)?;
+    if end > data.len() {
+        return None;
+    }
+
+    Some(end)
+}
+
+fn extract_bencode_string(data: &[u8], start: usize) -> Option<&[u8]> {
+    if start >= data.len() || !data[start].is_ascii_digit() {
+        return None;
+    }
+
+    let mut pos = start;
+    while pos < data.len() && data[pos].is_ascii_digit() {
+        pos += 1;
+    }
+
+    if pos >= data.len() || data[pos] != b':' {
+        return None;
+    }
+
+    let len_bytes = &data[start..pos];
+    let len_str = std::str::from_utf8(len_bytes).ok()?;
+    let len: usize = len_str.parse().ok()?;
+
+    pos += 1;
+    let end = pos.checked_add(len)?;
+    if end > data.len() {
+        return None;
+    }
+
+    Some(&data[pos..end])
 }
 
 fn find_bencode_value_end(data: &[u8], start: usize) -> Option<usize> {

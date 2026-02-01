@@ -1,5 +1,5 @@
 use nimble_util::ids::dht_node_id_20;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
 #[cfg(feature = "ipv6")]
 use std::net::SocketAddrV6;
@@ -29,6 +29,7 @@ const REFRESH_INTERVAL_MS: u64 = 300_000;
 const REFRESH_BATCH_SIZE: usize = 8;
 const QUERY_TIMEOUT_MS: u64 = 5_000;
 const MAX_PENDING_QUERIES: usize = 256;
+const MAX_NODE_IDS_PER_IP: usize = 3;
 
 pub struct DhtNode {
     node_id: [u8; 20],
@@ -48,6 +49,7 @@ pub struct DhtNode {
     last_bootstrap_ms: Option<u64>,
     next_refresh_ms: u64,
     clock_start: Instant,
+    node_ids_per_ip: HashMap<Ipv4Addr, HashSet<[u8; 20]>>,
 }
 
 pub struct PacketOutcome {
@@ -97,6 +99,7 @@ impl DhtNode {
             last_bootstrap_ms: None,
             next_refresh_ms: REFRESH_INTERVAL_MS,
             clock_start,
+            node_ids_per_ip: HashMap::new(),
         }
     }
 
@@ -271,6 +274,16 @@ impl DhtNode {
 
     pub fn observe_node(&mut self, id: [u8; 20], addr: SocketAddrV4) -> bool {
         use crate::routing::InsertResult;
+
+        let ip = *addr.ip();
+        let node_ids = self.node_ids_per_ip.entry(ip).or_insert_with(HashSet::new);
+
+        if !node_ids.contains(&id) && node_ids.len() >= MAX_NODE_IDS_PER_IP {
+            return false;
+        }
+
+        node_ids.insert(id);
+
         let result = self.routing.insert(id, addr);
 
         if let InsertResult::PingOldest { addr: ping_addr, id: ping_id } = result {

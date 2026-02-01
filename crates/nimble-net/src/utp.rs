@@ -26,6 +26,8 @@ const MAX_WINDOW_SIZE: u32 = 1024 * 1024;
 const SACK_EXTENSION: u8 = 1;
 const MAX_SACK_SIZE: usize = 32;
 const MAX_INFLIGHT_PACKETS: usize = 1024;
+const MAX_REORDER_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_SEQUENCE_GAP: u16 = 16384;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,6 +315,7 @@ pub struct UtpSocket {
     fin_seq_nr: Option<u16>,
     outgoing_packets: Vec<(Vec<u8>, SocketAddr)>,
     reorder_buffer: HashMap<u16, Vec<u8>>,
+    reorder_buffer_bytes: usize,
     sack_ranges: Vec<(u16, u16)>,
 }
 
@@ -346,6 +349,7 @@ impl UtpSocket {
             fin_seq_nr: None,
             outgoing_packets: Vec::new(),
             reorder_buffer: HashMap::new(),
+            reorder_buffer_bytes: 0,
             sack_ranges: Vec::new(),
         }
     }
@@ -379,6 +383,7 @@ impl UtpSocket {
             fin_seq_nr: None,
             outgoing_packets: Vec::new(),
             reorder_buffer: HashMap::new(),
+            reorder_buffer_bytes: 0,
             sack_ranges: Vec::new(),
         }
     }
@@ -628,7 +633,14 @@ impl UtpSocket {
                 self.deliver_reordered();
             }
         } else if wrapping_cmp(header.seq_nr, expected_seq) == std::cmp::Ordering::Greater {
-            if self.reorder_buffer.len() < MAX_INFLIGHT_PACKETS {
+            let seq_gap = header.seq_nr.wrapping_sub(expected_seq);
+            if seq_gap > MAX_SEQUENCE_GAP {
+                return;
+            }
+
+            if self.reorder_buffer.len() < MAX_INFLIGHT_PACKETS
+                && self.reorder_buffer_bytes + payload.len() <= MAX_REORDER_BUFFER_BYTES {
+                self.reorder_buffer_bytes += payload.len();
                 self.reorder_buffer.insert(header.seq_nr, payload.to_vec());
             }
         }
@@ -641,6 +653,7 @@ impl UtpSocket {
             let next_seq = self.ack_nr.wrapping_add(1);
             if let Some(data) = self.reorder_buffer.remove(&next_seq) {
                 if self.recv_buffer.len() + data.len() <= MAX_RECV_BUFFER {
+                    self.reorder_buffer_bytes = self.reorder_buffer_bytes.saturating_sub(data.len());
                     self.recv_buffer.extend(&data);
                     self.ack_nr = next_seq;
                 } else {

@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
 
+use crate::endgame::{BlockId, EndgameMode};
+
 const MAX_PEERS_PER_TORRENT: usize = 50;
 const MAX_CONNECT_ATTEMPTS: usize = 5;
 const MAX_CONNECT_PER_TICK: usize = 5;
@@ -13,6 +15,8 @@ const BLOCK_SIZE: u32 = 16384;
 const MAX_PENDING_PER_PEER: usize = 5;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MAX_CANDIDATE_PEERS: usize = 2000;
+const BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const FAILED_PEER_TTL: Duration = Duration::from_secs(300);
 
 pub struct PeerManager {
     info_hash: [u8; 20],
@@ -26,6 +30,7 @@ pub struct PeerManager {
     candidate_peers: VecDeque<SocketAddrV4>,
     failed_peers: HashMap<SocketAddrV4, (Instant, usize)>,
     piece_picker: PiecePicker,
+    endgame: EndgameMode,
 }
 
 struct ManagedPeer {
@@ -38,6 +43,7 @@ struct BlockRequest {
     piece: u32,
     offset: u32,
     length: u32,
+    sent_at: Instant,
 }
 
 impl PeerManager {
@@ -60,6 +66,7 @@ impl PeerManager {
             candidate_peers: VecDeque::new(),
             failed_peers: HashMap::new(),
             piece_picker: PiecePicker::new(piece_count),
+            endgame: EndgameMode::new(),
         }
     }
 
@@ -76,6 +83,7 @@ impl PeerManager {
             candidate_peers: VecDeque::new(),
             failed_peers: HashMap::new(),
             piece_picker: PiecePicker::new(0),
+            endgame: EndgameMode::new(),
         }
     }
 
@@ -125,6 +133,7 @@ impl PeerManager {
         let mut stats = PeerManagerStats::default();
 
         self.connect_to_candidates();
+        self.check_block_timeouts();
 
         let mut pieces_received = Vec::new();
         let mut peers_to_remove = Vec::new();
@@ -134,7 +143,7 @@ impl PeerManager {
         for (&addr, peer) in self.peers.iter_mut() {
             match peer.connection.state() {
                 PeerState::Connected => {
-                    match Self::handle_peer_messages(peer, &mut self.piece_picker) {
+                    match Self::handle_peer_messages(peer, &mut self.piece_picker, &mut self.endgame, addr) {
                         Ok(blocks) => {
                             if let Some(update) = peer.connection.take_pex_updates() {
                                 for addr in update.added {
@@ -168,6 +177,8 @@ impl PeerManager {
                                 Self::request_blocks(
                                     peer,
                                     &mut self.piece_picker,
+                                    &mut self.endgame,
+                                    addr,
                                     self.piece_length,
                                     self.total_length,
                                     self.piece_count,
@@ -209,6 +220,10 @@ impl PeerManager {
             for piece_index in storage.take_failed_pieces() {
                 self.piece_picker.cancel_piece(piece_index as usize);
             }
+
+            let pieces_remaining = self.piece_count - self.piece_picker.completed_count();
+            let blocks_remaining = self.piece_picker.pending_blocks.len();
+            self.endgame.update_state(pieces_remaining, blocks_remaining);
         }
 
         for piece_index in &pieces_received {
@@ -233,6 +248,8 @@ impl PeerManager {
                         }
                     }
                 }
+
+                self.endgame.remove_peer(&addr);
 
                 let entry = self.failed_peers.entry(addr).or_insert((Instant::now(), 0));
                 entry.0 = Instant::now();
@@ -300,6 +317,27 @@ impl PeerManager {
         self.candidate_peers.retain(|addr| !dropped.contains(addr));
     }
 
+    fn check_block_timeouts(&mut self) {
+        let now = Instant::now();
+        for peer in self.peers.values_mut() {
+            let timed_out: Vec<BlockRequest> = peer
+                .pending_blocks
+                .iter()
+                .filter(|req| now.duration_since(req.sent_at) > BLOCK_REQUEST_TIMEOUT)
+                .copied()
+                .collect();
+
+            for req in timed_out {
+                peer.pending_blocks.retain(|r| !(r.piece == req.piece && r.offset == req.offset));
+                self.piece_picker.cancel_block(req.piece as usize, req.offset);
+            }
+        }
+
+        self.failed_peers.retain(|_, (timestamp, _)| {
+            now.duration_since(*timestamp) < FAILED_PEER_TTL
+        });
+    }
+
     fn is_timeout_error(e: &anyhow::Error) -> bool {
         use std::io::ErrorKind;
 
@@ -338,6 +376,8 @@ impl PeerManager {
     fn handle_peer_messages(
         peer: &mut ManagedPeer,
         picker: &mut PiecePicker,
+        endgame: &mut EndgameMode,
+        peer_addr: SocketAddrV4,
     ) -> Result<Vec<(u32, u32, Vec<u8>)>> {
         let mut received_blocks = Vec::new();
 
@@ -353,6 +393,9 @@ impl PeerManager {
                             .retain(|r| !(r.piece == index && r.offset == begin));
                         peer.connection.complete_request(index, begin);
                         received_blocks.push((index, begin, block));
+
+                        let block_id = BlockId::new(index, begin);
+                        endgame.record_completion(block_id);
                     }
                     PeerMessage::Unchoke => {}
                     PeerMessage::Choke => {
@@ -392,6 +435,8 @@ impl PeerManager {
     fn request_blocks(
         peer: &mut ManagedPeer,
         picker: &mut PiecePicker,
+        endgame: &mut EndgameMode,
+        peer_addr: SocketAddrV4,
         piece_length: u64,
         total_length: u64,
         piece_count: usize,
@@ -428,7 +473,13 @@ impl PeerManager {
                     BLOCK_SIZE
                 };
 
-                if picker.is_block_pending(piece_index, offset) {
+                let block_id = BlockId::new(piece_index as u32, offset);
+
+                if !endgame.is_active() && picker.is_block_pending(piece_index, offset) {
+                    continue;
+                }
+
+                if !endgame.can_request_block(block_id) {
                     continue;
                 }
 
@@ -436,6 +487,7 @@ impl PeerManager {
                     piece: piece_index as u32,
                     offset,
                     length,
+                    sent_at: Instant::now(),
                 };
 
                 if peer
@@ -445,6 +497,7 @@ impl PeerManager {
                 {
                     peer.pending_blocks.push(req);
                     picker.mark_block_pending(piece_index, offset);
+                    endgame.record_request(block_id, peer_addr);
                 }
             }
 

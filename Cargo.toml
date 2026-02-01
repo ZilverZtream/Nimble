@@ -31,6 +31,18 @@ windows-sys = { version = "0.52", default-features = false }
 # Fast hashing; production may switch to Windows CNG if needed.
 sha1 = { version = "0.10", default-features = false }
 
+# Small, fast RNG for optimistic unchoke and other randomization.
+fastrand = { version = "2", default-features = false }
+
+# Lightweight synchronous HTTP client for UPnP SOAP requests.
+ureq = { version = "2", default-features = false }
+
+# Hex encoding/decoding for LSD infohash exchange.
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+# Test-only dependencies.
+tempfile = { version = "3", default-features = false }
+
 [profile.release]
 opt-level = "z"
 lto = "fat"

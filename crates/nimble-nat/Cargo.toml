@@ -13,4 +13,5 @@ nat_pmp = []
         [dependencies]
         anyhow = { workspace = true }
         thiserror = { workspace = true }
+        ureq = { workspace = true }
         nimble-util = { path = "../nimble-util" }

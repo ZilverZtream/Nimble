@@ -145,11 +145,11 @@ Leaving completed TODOs unchecked is considered a bug.
 - [x] E2.4 Piece invalidation on mismatch
 
 ## E3. Disk cache
-- [ ] E3.1 Cache data structures
-- [ ] E3.2 Write-behind queue
-- [ ] E3.3 Periodic flush
-- [ ] E3.4 Flush on shutdown
-- [ ] E3.5 Configurable cache size
+- [x] E3.1 Cache data structures
+- [x] E3.2 Write-behind queue
+- [x] E3.3 Periodic flush
+- [x] E3.4 Flush on shutdown
+- [x] E3.5 Configurable cache size
 
 ## E4. Resume system
 - [ ] E4.1 Resume file format v1
@@ -194,14 +194,14 @@ Leaving completed TODOs unchecked is considered a bug.
 # G. Scheduler, Limits & Scoring
 
 ## G1. Bandwidth limiting
-- [ ] G1.1 Global download limiter
-- [ ] G1.2 Global upload limiter
-- [ ] G1.3 Per-torrent limits
-- [ ] G1.4 Token bucket implementation
+- [x] G1.1 Global download limiter
+- [x] G1.2 Global upload limiter
+- [x] G1.3 Per-torrent limits
+- [x] G1.4 Token bucket implementation
 
 ## G2. Choking algorithm
-- [ ] G2.1 Regular rechoke interval
-- [ ] G2.2 Optimistic unchoke
+- [x] G2.1 Regular rechoke interval
+- [x] G2.2 Optimistic unchoke
 - [ ] G2.3 Seed vs leecher behavior
 
 ## G3. Piece picker
@@ -211,16 +211,16 @@ Leaving completed TODOs unchecked is considered a bug.
 - [ ] G3.4 File priority integration
 
 ## G4. Endgame mode
-- [ ] G4.1 Endgame detection
-- [ ] G4.2 Duplicate requests
-- [ ] G4.3 Cancel redundant blocks
+- [x] G4.1 Endgame detection
+- [x] G4.2 Duplicate requests
+- [x] G4.3 Cancel redundant blocks
 
 ## G5. Peer scoring
-- [ ] G5.1 Throughput scoring
-- [ ] G5.2 Latency scoring
-- [ ] G5.3 Reliability scoring
-- [ ] G5.4 Penalize bad peers
-- [ ] G5.5 Integrate scoring into scheduler
+- [x] G5.1 Throughput scoring
+- [x] G5.2 Latency scoring
+- [x] G5.3 Reliability scoring
+- [x] G5.4 Penalize bad peers
+- [x] G5.5 Integrate scoring into scheduler
 
 -------------------------------------------------------------------------------
 
@@ -308,29 +308,29 @@ Leaving completed TODOs unchecked is considered a bug.
 
 # K. Local Service Discovery (BEP-14)
 
-- [ ] K1. Multicast announce sender
-- [ ] K2. Multicast listener
-- [ ] K3. Parse LSD messages
-- [ ] K4. Add discovered peers
-- [ ] K5. Rate limiting
+- [x] K1. Multicast announce sender
+- [x] K2. Multicast listener
+- [x] K3. Parse LSD messages
+- [x] K4. Add discovered peers
+- [x] K5. Rate limiting
 
 -------------------------------------------------------------------------------
 
 # L. NAT Traversal
 
 ## L1. UPnP IGD
-- [ ] L1.1 SSDP discovery
-- [ ] L1.2 Device description fetch
-- [ ] L1.3 Control URL detection
-- [ ] L1.4 AddPortMapping
-- [ ] L1.5 Renew mapping
-- [ ] L1.6 Delete mapping on shutdown
+- [x] L1.1 SSDP discovery
+- [x] L1.2 Device description fetch
+- [x] L1.3 Control URL detection
+- [x] L1.4 AddPortMapping
+- [x] L1.5 Renew mapping
+- [x] L1.6 Delete mapping on shutdown
 
 ## L2. NAT-PMP
-- [ ] L2.1 Gateway discovery
-- [ ] L2.2 Add mapping
-- [ ] L2.3 Renew mapping
-- [ ] L2.4 Error handling
+- [x] L2.1 Gateway discovery
+- [x] L2.2 Add mapping
+- [x] L2.3 Renew mapping
+- [x] L2.4 Error handling
 
 -------------------------------------------------------------------------------
 

@@ -1,12 +1,20 @@
+pub mod bandwidth;
+pub mod choking;
+pub mod endgame;
 pub mod engine;
 mod magnet;
 pub mod peer_manager;
+pub mod peer_scoring;
 pub mod session;
 pub mod settings;
 mod tracker_worker;
 pub mod types;
 
+pub use bandwidth::{BandwidthLimit, BandwidthManager};
+pub use choking::ChokingManager;
+pub use endgame::{BlockId, EndgameMode};
 pub use engine::EngineHandle;
 pub use peer_manager::{PeerManager, PeerManagerStats, PiecePicker};
+pub use peer_scoring::PeerScore;
 pub use settings::EngineSettings;
 pub use types::EventReceiver;

@@ -3,6 +3,7 @@ use nimble_util::bitfield::Bitfield;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::{Duration, Instant};
 
+use crate::encryption::{MseHandshake, MseStage};
 use crate::extension::{
     create_nimble_handshake, has_extension_bit, set_extension_bit, ExtendedMessage,
     ExtensionHandshake, ExtensionState, EXTENSION_UT_METADATA, EXTENSION_UT_PEX,
@@ -322,6 +323,8 @@ pub struct PeerConnection {
     pex_dropped: Vec<SocketAddrV4>,
     pex_dropped_v6: Vec<SocketAddrV6>,
     last_pex_received: Option<Instant>,
+    mse_handshake: Option<MseHandshake>,
+    encryption_enabled: bool,
 }
 
 impl PeerConnection {
@@ -353,6 +356,7 @@ impl PeerConnection {
     ) -> Self {
         let now = Instant::now();
         let socket = TcpSocket::new_for_addr(&addr).expect("failed to create socket");
+        let mse_handshake = Some(MseHandshake::new_initiator(&info_hash));
         PeerConnection {
             socket,
             addr,
@@ -387,6 +391,8 @@ impl PeerConnection {
             pex_dropped: Vec::new(),
             pex_dropped_v6: Vec::new(),
             last_pex_received: None,
+            mse_handshake,
+            encryption_enabled: false,
         }
     }
 
@@ -438,6 +444,8 @@ impl PeerConnection {
             pex_dropped: Vec::new(),
             pex_dropped_v6: Vec::new(),
             last_pex_received: None,
+            mse_handshake: None,
+            encryption_enabled: false,
         };
 
         conn.init_extension_state();
@@ -494,6 +502,8 @@ impl PeerConnection {
             pex_dropped: Vec::new(),
             pex_dropped_v6: Vec::new(),
             last_pex_received: None,
+            mse_handshake: None,
+            encryption_enabled: false,
         };
 
         conn.init_extension_state();
@@ -509,6 +519,11 @@ impl PeerConnection {
     }
 
     fn do_handshake(&mut self) -> Result<()> {
+        if self.mse_handshake.is_some() {
+            self.do_mse_handshake()?;
+            self.encryption_enabled = true;
+        }
+
         let mut reserved = [0u8; 8];
         set_extension_bit(&mut reserved);
 
@@ -519,10 +534,22 @@ impl PeerConnection {
         handshake.extend_from_slice(&self.info_hash);
         handshake.extend_from_slice(&self.our_peer_id);
 
+        if self.encryption_enabled {
+            if let Some(ref mut mse) = self.mse_handshake {
+                mse.encrypt(&mut handshake);
+            }
+        }
+
         self.socket.send_all(&handshake)?;
 
         let mut response = [0u8; HANDSHAKE_LENGTH];
         self.socket.recv_exact(&mut response)?;
+
+        if self.encryption_enabled {
+            if let Some(ref mut mse) = self.mse_handshake {
+                mse.decrypt(&mut response);
+            }
+        }
 
         if response[0] != 19 {
             anyhow::bail!("invalid protocol string length: {}", response[0]);
@@ -553,6 +580,41 @@ impl PeerConnection {
         Ok(())
     }
 
+    fn do_mse_handshake(&mut self) -> Result<()> {
+        let mse = self.mse_handshake.as_mut()
+            .ok_or_else(|| anyhow::anyhow!("MSE handshake not initialized"))?;
+
+        let our_pubkey = mse.get_public_key().to_vec();
+
+        self.socket.send_all(&our_pubkey)?;
+
+        let mut their_pubkey = vec![0u8; 96];
+        self.socket.recv_exact(&mut their_pubkey)?;
+
+        let mse = self.mse_handshake.as_mut().unwrap();
+        let info_hash = self.info_hash;
+        mse.compute_shared_secret(&their_pubkey, &info_hash);
+
+        let mut vc = [0u8; 8];
+        mse.encrypt(&mut vc);
+
+        self.socket.send_all(&vc)?;
+
+        let mut their_vc = [0u8; 8];
+        self.socket.recv_exact(&mut their_vc)?;
+
+        let mse = self.mse_handshake.as_mut().unwrap();
+        mse.decrypt(&mut their_vc);
+
+        if their_vc != [0u8; 8] {
+            anyhow::bail!("invalid MSE verification constant");
+        }
+
+        mse.set_stage(MseStage::Established);
+
+        Ok(())
+    }
+
     fn init_extension_state(&mut self) {
         let our_hs = create_nimble_handshake(self.listen_port, self.metadata_size);
         self.extension_state = Some(ExtensionState::new(our_hs));
@@ -578,7 +640,14 @@ impl PeerConnection {
             anyhow::bail!("not connected");
         }
 
-        let data = msg.serialize();
+        let mut data = msg.serialize();
+
+        if self.encryption_enabled {
+            if let Some(ref mut mse) = self.mse_handshake {
+                mse.encrypt(&mut data);
+            }
+        }
+
         self.socket.send_all(&data)?;
         self.last_message_sent = Instant::now();
 
@@ -608,7 +677,13 @@ impl PeerConnection {
                                 anyhow::bail!("connection closed");
                             }
                             Ok(n) => {
-                                self.recv_buffer.extend_from_slice(&self.temp_recv_buf[..n]);
+                                let mut chunk = self.temp_recv_buf[..n].to_vec();
+                                if self.encryption_enabled {
+                                    if let Some(ref mut mse) = self.mse_handshake {
+                                        mse.decrypt(&mut chunk);
+                                    }
+                                }
+                                self.recv_buffer.extend_from_slice(&chunk);
                             }
                             Err(e) => {
                                 if is_timeout_error(&e) {
@@ -654,7 +729,13 @@ impl PeerConnection {
                                 anyhow::bail!("connection closed");
                             }
                             Ok(n) => {
-                                self.recv_buffer.extend_from_slice(&self.temp_recv_buf[..n]);
+                                let mut chunk = self.temp_recv_buf[..n].to_vec();
+                                if self.encryption_enabled {
+                                    if let Some(ref mut mse) = self.mse_handshake {
+                                        mse.decrypt(&mut chunk);
+                                    }
+                                }
+                                self.recv_buffer.extend_from_slice(&chunk);
                             }
                             Err(e) => {
                                 if is_timeout_error(&e) {

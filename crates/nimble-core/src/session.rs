@@ -37,6 +37,7 @@ pub struct ActiveTorrent {
     pub tracker: TrackerState,
     pub peer_manager: PeerManager,
     pub stats: TorrentStats,
+    pub last_dht_query: Option<Instant>,
 }
 
 pub struct MagnetState {
@@ -54,6 +55,7 @@ pub struct TrackerState {
     pub next_announce: Option<Instant>,
     pub interval: Duration,
     pub peers: Vec<SocketAddrV4>,
+    pub consecutive_failures: u32,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -141,6 +143,7 @@ impl Session {
             next_announce: Some(Instant::now()),
             interval: Duration::from_secs(1800),
             peers: Vec::new(),
+            consecutive_failures: 0,
         };
 
         let mut peer_manager = PeerManager::new(
@@ -166,6 +169,7 @@ impl Session {
             tracker,
             peer_manager,
             stats,
+            last_dht_query: None,
         };
 
         self.torrents
@@ -192,6 +196,7 @@ impl Session {
             next_announce: Some(Instant::now()),
             interval: Duration::from_secs(1800),
             peers: Vec::new(),
+            consecutive_failures: 0,
         };
 
         let mut peer_manager = PeerManager::new(
@@ -216,6 +221,7 @@ impl Session {
             tracker,
             peer_manager,
             stats,
+            last_dht_query: None,
         };
 
         self.torrents
@@ -239,6 +245,7 @@ impl Session {
             },
             interval: Duration::from_secs(1800),
             peers: Vec::new(),
+            consecutive_failures: 0,
         };
 
         let peer_manager = PeerManager::new_metadata_only(magnet.info_hash, self.peer_id);
@@ -299,6 +306,7 @@ impl Session {
                     TorrentEntry::Active(torrent) => {
                         if result.success {
                             torrent.tracker.last_announce = Some(now);
+                            torrent.tracker.consecutive_failures = 0;
                             if let Some(interval) = result.interval {
                                 torrent.tracker.interval = Duration::from_secs(interval as u64);
                             }
@@ -312,11 +320,13 @@ impl Session {
                                 result.peers.len()
                             ));
                         } else {
+                            torrent.tracker.consecutive_failures = torrent.tracker.consecutive_failures.saturating_add(1);
                             torrent.tracker.next_announce = Some(now + Duration::from_secs(60));
                             if let Some(error) = &result.error {
                                 log_lines.push(format!(
-                                    "Tracker announce failed for {}: {}",
+                                    "Tracker announce failed for {} (failures: {}): {}",
                                     &result.infohash_hex[..8],
+                                    torrent.tracker.consecutive_failures,
                                     error
                                 ));
                             }
@@ -325,6 +335,7 @@ impl Session {
                     TorrentEntry::Magnet(torrent) => {
                         if result.success {
                             torrent.tracker.last_announce = Some(now);
+                            torrent.tracker.consecutive_failures = 0;
                             if let Some(interval) = result.interval {
                                 torrent.tracker.interval = Duration::from_secs(interval as u64);
                             }
@@ -338,11 +349,13 @@ impl Session {
                                 result.peers.len()
                             ));
                         } else {
+                            torrent.tracker.consecutive_failures = torrent.tracker.consecutive_failures.saturating_add(1);
                             torrent.tracker.next_announce = Some(now + Duration::from_secs(60));
                             if let Some(error) = &result.error {
                                 log_lines.push(format!(
-                                    "Magnet announce failed for {}: {}",
+                                    "Magnet announce failed for {} (failures: {}): {}",
                                     &result.infohash_hex[..8],
+                                    torrent.tracker.consecutive_failures,
                                     error
                                 ));
                             }
@@ -356,23 +369,62 @@ impl Session {
             log_lines.extend(dht.tick());
 
             let dht_nodes = dht.known_nodes();
-            for (_infohash_hex, torrent) in self.torrents.iter_mut() {
+            for (infohash_hex, torrent) in self.torrents.iter_mut() {
                 match torrent {
                     TorrentEntry::Active(t) => {
-                        if !t.paused && t.stats.connected_peers < 10 {
-                            dht.announce_peer(*t.info.infohash.as_bytes());
+                        if t.paused {
+                            continue;
                         }
-                    }
-                    TorrentEntry::Magnet(t) => {
-                        if !t.paused && dht_nodes > 0 {
+
+                        let tracker_failing = t.tracker.consecutive_failures >= 2;
+                        let needs_peers = t.stats.connected_peers < 10;
+                        let use_dht = needs_peers || tracker_failing;
+
+                        if use_dht && dht_nodes > 0 {
                             let should_query = match t.last_dht_query {
                                 None => true,
                                 Some(last) => now.duration_since(last) >= Duration::from_secs(5),
                             };
 
                             if should_query {
+                                dht.announce_peer(*t.info.infohash.as_bytes());
+                                t.last_dht_query = Some(now);
+                                if tracker_failing {
+                                    log_lines.push(format!(
+                                        "DHT fallback for {}: tracker failed {} times",
+                                        &infohash_hex[..8],
+                                        t.tracker.consecutive_failures
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    TorrentEntry::Magnet(t) => {
+                        if !t.paused && dht_nodes > 0 {
+                            let tracker_failing = t.tracker.consecutive_failures >= 2;
+                            let has_no_trackers = t.trackers.is_empty();
+                            let interval_secs = if tracker_failing || has_no_trackers { 5 } else { 10 };
+
+                            let should_query = match t.last_dht_query {
+                                None => true,
+                                Some(last) => now.duration_since(last) >= Duration::from_secs(interval_secs),
+                            };
+
+                            if should_query {
                                 dht.announce_peer(t.info_hash);
                                 t.last_dht_query = Some(now);
+                                if tracker_failing {
+                                    log_lines.push(format!(
+                                        "DHT fallback for {}: tracker failed {} times",
+                                        &infohash_hex[..8],
+                                        t.tracker.consecutive_failures
+                                    ));
+                                } else if has_no_trackers {
+                                    log_lines.push(format!(
+                                        "DHT primary for {}: no trackers available",
+                                        &infohash_hex[..8]
+                                    ));
+                                }
                             }
                         }
                     }
@@ -579,6 +631,7 @@ impl Session {
             },
             interval: Duration::from_secs(1800),
             peers: Vec::new(),
+            consecutive_failures: 0,
         };
 
         Ok(ActiveTorrent {
@@ -588,6 +641,7 @@ impl Session {
             tracker,
             peer_manager,
             stats,
+            last_dht_query: torrent.last_dht_query,
         })
     }
 

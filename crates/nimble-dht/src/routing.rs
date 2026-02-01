@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 use std::net::SocketAddrV4;
+#[cfg(feature = "ipv6")]
+use std::net::SocketAddrV6;
 use std::time::{Duration, Instant};
 
 const NODE_ID_LEN: usize = 20;
@@ -373,5 +375,174 @@ mod tests {
         let nodes = table.oldest_nodes(1);
         assert_eq!(nodes.len(), 1);
         assert!(nodes[0] == addr1 || nodes[0] == addr2);
+    }
+}
+
+#[cfg(feature = "ipv6")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeInfo6 {
+    pub id: [u8; NODE_ID_LEN],
+    pub addr: SocketAddrV6,
+    last_seen: Instant,
+    pending_ping: bool,
+}
+
+#[cfg(feature = "ipv6")]
+impl NodeInfo6 {
+    fn new(id: [u8; NODE_ID_LEN], addr: SocketAddrV6) -> Self {
+        Self {
+            id,
+            addr,
+            last_seen: Instant::now(),
+            pending_ping: false,
+        }
+    }
+
+    fn touch(&mut self, addr: SocketAddrV6) {
+        self.addr = addr;
+        self.last_seen = Instant::now();
+        self.pending_ping = false;
+    }
+
+    fn is_questionable(&self) -> bool {
+        self.last_seen.elapsed() > NODE_STALE_TIMEOUT
+    }
+}
+
+#[cfg(feature = "ipv6")]
+struct Bucket6 {
+    nodes: VecDeque<NodeInfo6>,
+    replacement_cache: VecDeque<NodeInfo6>,
+}
+
+#[cfg(feature = "ipv6")]
+impl Bucket6 {
+    fn new() -> Self {
+        Self {
+            nodes: VecDeque::new(),
+            replacement_cache: VecDeque::new(),
+        }
+    }
+}
+
+#[cfg(feature = "ipv6")]
+pub struct RoutingTable6 {
+    self_id: [u8; NODE_ID_LEN],
+    buckets: Vec<Bucket6>,
+}
+
+#[cfg(feature = "ipv6")]
+impl RoutingTable6 {
+    pub fn new(self_id: [u8; NODE_ID_LEN]) -> Self {
+        let mut buckets = Vec::with_capacity(BUCKET_COUNT);
+        for _ in 0..BUCKET_COUNT {
+            buckets.push(Bucket6::new());
+        }
+        Self { self_id, buckets }
+    }
+
+    pub fn len(&self) -> usize {
+        self.buckets.iter().map(|bucket| bucket.nodes.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn insert(&mut self, id: [u8; NODE_ID_LEN], addr: SocketAddrV6) -> InsertResult {
+        if id == self.self_id {
+            return InsertResult::Rejected;
+        }
+
+        let bucket_index = match bucket_index(&self.self_id, &id) {
+            Some(index) => index,
+            None => return InsertResult::Rejected,
+        };
+
+        let bucket = &mut self.buckets[bucket_index];
+
+        if let Some(pos) = bucket.nodes.iter().position(|node| node.id == id) {
+            if let Some(mut node) = bucket.nodes.remove(pos) {
+                node.touch(addr);
+                bucket.nodes.push_back(node);
+            }
+            bucket.replacement_cache.retain(|node| node.id != id);
+            return InsertResult::Updated;
+        }
+
+        if let Some(pos) = bucket.replacement_cache.iter().position(|node| node.id == id) {
+            if let Some(mut node) = bucket.replacement_cache.remove(pos) {
+                node.touch(addr);
+                bucket.replacement_cache.push_back(node);
+            }
+            return InsertResult::Updated;
+        }
+
+        if bucket.nodes.len() < K_BUCKET_SIZE {
+            bucket.nodes.push_back(NodeInfo6::new(id, addr));
+            return InsertResult::Inserted;
+        }
+
+        if bucket.replacement_cache.len() >= REPLACEMENT_CACHE_SIZE {
+            bucket.replacement_cache.pop_front();
+        }
+        bucket.replacement_cache.push_back(NodeInfo6::new(id, addr));
+
+        InsertResult::Cached
+    }
+
+    pub fn mark_node_good(&mut self, id: &[u8; NODE_ID_LEN]) {
+        let bucket_index = match bucket_index(&self.self_id, id) {
+            Some(index) => index,
+            None => return,
+        };
+
+        let bucket = &mut self.buckets[bucket_index];
+        if let Some(pos) = bucket.nodes.iter().position(|node| &node.id == id) {
+            if let Some(mut node) = bucket.nodes.remove(pos) {
+                node.last_seen = Instant::now();
+                node.pending_ping = false;
+                bucket.nodes.push_back(node);
+            }
+        }
+    }
+
+    pub fn find_closest(&self, target: [u8; NODE_ID_LEN], limit: usize) -> Vec<NodeInfo6> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut nodes = Vec::new();
+        for bucket in &self.buckets {
+            for node in &bucket.nodes {
+                nodes.push(node.clone());
+            }
+        }
+
+        nodes.sort_by(|a, b| xor_distance_cmp(&a.id, &b.id, &target));
+        if nodes.len() > limit {
+            nodes.truncate(limit);
+        }
+        nodes
+    }
+
+    pub fn oldest_nodes(&self, limit: usize) -> Vec<SocketAddrV6> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut nodes = Vec::new();
+        for bucket in &self.buckets {
+            for node in &bucket.nodes {
+                nodes.push(node);
+            }
+        }
+
+        nodes.sort_by_key(|node| node.last_seen);
+        let mut out = Vec::with_capacity(limit.min(nodes.len()));
+        for node in nodes.into_iter().take(limit) {
+            out.push(node.addr);
+        }
+        out
     }
 }

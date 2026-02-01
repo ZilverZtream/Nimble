@@ -1,14 +1,14 @@
 use anyhow::Result;
-use std::net::SocketAddrV4;
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::*;
     use windows_sys::Win32::Networking::WinSock::{
-        self, INVALID_SOCKET, SOCKET, SOCKET_ERROR, WSADATA, AF_INET, SOCK_STREAM,
-        IPPROTO_TCP, FIONBIO, SOCKADDR_IN, SD_BOTH, WSAEWOULDBLOCK, WSAEINPROGRESS,
+        self, INVALID_SOCKET, SOCKET, SOCKET_ERROR, WSADATA, AF_INET, AF_INET6, SOCK_STREAM,
+        IPPROTO_TCP, FIONBIO, SOCKADDR_IN, SOCKADDR_IN6, SD_BOTH, WSAEWOULDBLOCK, WSAEINPROGRESS,
         WSAECONNRESET, FD_SET, TIMEVAL,
-        SOL_SOCKET, SO_ERROR, SO_RCVTIMEO, SO_SNDTIMEO, SO_KEEPALIVE,
+        SOL_SOCKET, SO_ERROR, SO_RCVTIMEO, SO_SNDTIMEO, SO_KEEPALIVE, IPV6_V6ONLY,
     };
 
     const MAX_RECV_BUFFER: usize = 65536;
@@ -19,11 +19,15 @@ mod windows_impl {
     pub struct TcpSocket {
         socket: SOCKET,
         connected: bool,
-        peer_addr: Option<SocketAddrV4>,
+        peer_addr: Option<SocketAddr>,
     }
 
     impl TcpSocket {
         pub fn new() -> Result<Self> {
+            Self::new_v4()
+        }
+
+        pub fn new_v4() -> Result<Self> {
             init_winsock()?;
 
             let socket = unsafe {
@@ -40,6 +44,43 @@ mod windows_impl {
                 connected: false,
                 peer_addr: None,
             })
+        }
+
+        pub fn new_v6() -> Result<Self> {
+            init_winsock()?;
+
+            let socket = unsafe {
+                WinSock::socket(AF_INET6 as i32, SOCK_STREAM, IPPROTO_TCP)
+            };
+
+            if socket == INVALID_SOCKET {
+                let err = get_last_error();
+                anyhow::bail!("socket() failed: error {}", err);
+            }
+
+            let v6only: i32 = 1;
+            unsafe {
+                WinSock::setsockopt(
+                    socket,
+                    windows_sys::Win32::Networking::WinSock::IPPROTO_IPV6 as i32,
+                    IPV6_V6ONLY as i32,
+                    &v6only as *const i32 as *const u8,
+                    std::mem::size_of::<i32>() as i32,
+                );
+            }
+
+            Ok(TcpSocket {
+                socket,
+                connected: false,
+                peer_addr: None,
+            })
+        }
+
+        pub fn new_for_addr(addr: &SocketAddr) -> Result<Self> {
+            match addr {
+                SocketAddr::V4(_) => Self::new_v4(),
+                SocketAddr::V6(_) => Self::new_v6(),
+            }
         }
 
         fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
@@ -101,16 +142,30 @@ mod windows_impl {
             Ok(())
         }
 
-        pub fn connect(&mut self, addr: SocketAddrV4) -> Result<()> {
+        pub fn connect(&mut self, addr: SocketAddr) -> Result<()> {
             self.set_nonblocking(true)?;
 
-            let sockaddr = sockaddr_from_v4(addr);
-            let result = unsafe {
-                WinSock::connect(
-                    self.socket,
-                    &sockaddr as *const SOCKADDR_IN as *const WinSock::SOCKADDR,
-                    std::mem::size_of::<SOCKADDR_IN>() as i32,
-                )
+            let result = match addr {
+                SocketAddr::V4(v4_addr) => {
+                    let sockaddr = sockaddr_from_v4(v4_addr);
+                    unsafe {
+                        WinSock::connect(
+                            self.socket,
+                            &sockaddr as *const SOCKADDR_IN as *const WinSock::SOCKADDR,
+                            std::mem::size_of::<SOCKADDR_IN>() as i32,
+                        )
+                    }
+                }
+                SocketAddr::V6(v6_addr) => {
+                    let sockaddr = sockaddr_from_v6(v6_addr);
+                    unsafe {
+                        WinSock::connect(
+                            self.socket,
+                            &sockaddr as *const SOCKADDR_IN6 as *const WinSock::SOCKADDR,
+                            std::mem::size_of::<SOCKADDR_IN6>() as i32,
+                        )
+                    }
+                }
             };
 
             if result == SOCKET_ERROR {
@@ -131,6 +186,10 @@ mod windows_impl {
             self.connected = true;
             self.peer_addr = Some(addr);
             Ok(())
+        }
+
+        pub fn connect_v4(&mut self, addr: SocketAddrV4) -> Result<()> {
+            self.connect(SocketAddr::V4(addr))
         }
 
         fn wait_for_connect(&self, timeout_ms: u32) -> Result<bool> {
@@ -262,8 +321,15 @@ mod windows_impl {
             self.connected
         }
 
-        pub fn peer_addr(&self) -> Option<SocketAddrV4> {
+        pub fn peer_addr(&self) -> Option<SocketAddr> {
             self.peer_addr
+        }
+
+        pub fn peer_addr_v4(&self) -> Option<SocketAddrV4> {
+            match self.peer_addr {
+                Some(SocketAddr::V4(addr)) => Some(addr),
+                _ => None,
+            }
         }
 
         pub fn close(&mut self) {
@@ -296,6 +362,21 @@ mod windows_impl {
                 },
             },
             sin_zero: [0; 8],
+        }
+    }
+
+    fn sockaddr_from_v6(addr: SocketAddrV6) -> SOCKADDR_IN6 {
+        let ip_bytes = addr.ip().octets();
+        SOCKADDR_IN6 {
+            sin6_family: AF_INET6,
+            sin6_port: addr.port().to_be(),
+            sin6_flowinfo: addr.flowinfo(),
+            sin6_addr: WinSock::IN6_ADDR {
+                u: WinSock::IN6_ADDR_0 {
+                    Byte: ip_bytes,
+                },
+            },
+            sin6_scope_id: addr.scope_id(),
         }
     }
 
@@ -336,7 +417,7 @@ mod unix_impl {
 
     pub struct TcpSocket {
         stream: Option<TcpStream>,
-        peer_addr: Option<SocketAddrV4>,
+        peer_addr: Option<SocketAddr>,
     }
 
     impl TcpSocket {
@@ -347,7 +428,19 @@ mod unix_impl {
             })
         }
 
-        pub fn connect(&mut self, addr: SocketAddrV4) -> Result<()> {
+        pub fn new_v4() -> Result<Self> {
+            Self::new()
+        }
+
+        pub fn new_v6() -> Result<Self> {
+            Self::new()
+        }
+
+        pub fn new_for_addr(_addr: &SocketAddr) -> Result<Self> {
+            Self::new()
+        }
+
+        pub fn connect(&mut self, addr: SocketAddr) -> Result<()> {
             let stream = TcpStream::connect(addr)?;
             stream.set_read_timeout(Some(Duration::from_secs(30)))?;
             stream.set_write_timeout(Some(Duration::from_secs(30)))?;
@@ -355,6 +448,10 @@ mod unix_impl {
             self.peer_addr = Some(addr);
             self.stream = Some(stream);
             Ok(())
+        }
+
+        pub fn connect_v4(&mut self, addr: SocketAddrV4) -> Result<()> {
+            self.connect(SocketAddr::V4(addr))
         }
 
         pub fn send(&mut self, data: &[u8]) -> Result<usize> {
@@ -387,8 +484,15 @@ mod unix_impl {
             self.stream.is_some()
         }
 
-        pub fn peer_addr(&self) -> Option<SocketAddrV4> {
+        pub fn peer_addr(&self) -> Option<SocketAddr> {
             self.peer_addr
+        }
+
+        pub fn peer_addr_v4(&self) -> Option<SocketAddrV4> {
+            match self.peer_addr {
+                Some(SocketAddr::V4(addr)) => Some(addr),
+                _ => None,
+            }
         }
 
         pub fn close(&mut self) {

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use nimble_util::bitfield::Bitfield;
-use std::net::SocketAddrV4;
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::{Duration, Instant};
 
 use crate::extension::{
@@ -273,12 +273,14 @@ pub struct PendingRequest {
 #[derive(Debug, Default)]
 pub struct PexUpdate {
     pub added: Vec<SocketAddrV4>,
+    pub added_v6: Vec<SocketAddrV6>,
     pub dropped: Vec<SocketAddrV4>,
+    pub dropped_v6: Vec<SocketAddrV6>,
 }
 
 pub struct PeerConnection {
     socket: TcpSocket,
-    addr: SocketAddrV4,
+    addr: SocketAddr,
     state: PeerState,
     info_hash: [u8; 20],
     our_peer_id: [u8; 20],
@@ -305,13 +307,15 @@ pub struct PeerConnection {
     metadata: Option<Vec<u8>>,
     metadata_requests_sent: bool,
     pex_added: Vec<SocketAddrV4>,
+    pex_added_v6: Vec<SocketAddrV6>,
     pex_dropped: Vec<SocketAddrV4>,
+    pex_dropped_v6: Vec<SocketAddrV6>,
     last_pex_received: Option<Instant>,
 }
 
 impl PeerConnection {
     pub fn new(
-        addr: SocketAddrV4,
+        addr: SocketAddr,
         info_hash: [u8; 20],
         our_peer_id: [u8; 20],
         piece_count: usize,
@@ -319,8 +323,17 @@ impl PeerConnection {
         Self::with_options(addr, info_hash, our_peer_id, piece_count, 6881, None)
     }
 
-    pub fn with_options(
+    pub fn new_v4(
         addr: SocketAddrV4,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        piece_count: usize,
+    ) -> Self {
+        Self::new(SocketAddr::V4(addr), info_hash, our_peer_id, piece_count)
+    }
+
+    pub fn with_options(
+        addr: SocketAddr,
         info_hash: [u8; 20],
         our_peer_id: [u8; 20],
         piece_count: usize,
@@ -328,8 +341,9 @@ impl PeerConnection {
         metadata_size: Option<u32>,
     ) -> Self {
         let now = Instant::now();
+        let socket = TcpSocket::new_for_addr(&addr).expect("failed to create socket");
         PeerConnection {
-            socket: TcpSocket::new().expect("failed to create socket"),
+            socket,
             addr,
             state: PeerState::Connecting,
             info_hash,
@@ -357,13 +371,15 @@ impl PeerConnection {
             metadata: None,
             metadata_requests_sent: false,
             pex_added: Vec::new(),
+            pex_added_v6: Vec::new(),
             pex_dropped: Vec::new(),
+            pex_dropped_v6: Vec::new(),
             last_pex_received: None,
         }
     }
 
     pub fn connect(&mut self) -> Result<()> {
-        self.socket.connect(self.addr)?;
+        self.socket.connect(self.addr.clone())?;
         self.state = PeerState::Handshaking;
         self.do_handshake()
     }
@@ -827,8 +843,15 @@ impl PeerConnection {
         self.state
     }
 
-    pub fn addr(&self) -> SocketAddrV4 {
-        self.addr
+    pub fn addr(&self) -> SocketAddr {
+        self.addr.clone()
+    }
+
+    pub fn addr_v4(&self) -> Option<SocketAddrV4> {
+        match self.addr {
+            SocketAddr::V4(addr) => Some(addr),
+            _ => None,
+        }
     }
 
     pub fn peer_id(&self) -> Option<&[u8; 20]> {
@@ -869,13 +892,16 @@ impl PeerConnection {
     }
 
     pub fn take_pex_updates(&mut self) -> Option<PexUpdate> {
-        if self.pex_added.is_empty() && self.pex_dropped.is_empty() {
+        if self.pex_added.is_empty() && self.pex_added_v6.is_empty()
+            && self.pex_dropped.is_empty() && self.pex_dropped_v6.is_empty() {
             return None;
         }
 
         Some(PexUpdate {
             added: std::mem::take(&mut self.pex_added),
+            added_v6: std::mem::take(&mut self.pex_added_v6),
             dropped: std::mem::take(&mut self.pex_dropped),
+            dropped_v6: std::mem::take(&mut self.pex_dropped_v6),
         })
     }
 

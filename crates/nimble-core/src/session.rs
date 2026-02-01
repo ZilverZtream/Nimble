@@ -1,6 +1,9 @@
 use anyhow::Result;
 use nimble_bencode::torrent::{parse_info_dict, parse_torrent, InfoHash, TorrentInfo};
 use nimble_dht::node::DhtNode;
+use nimble_lsd::bep14::LsdClient;
+use nimble_nat::nat_pmp::{NatPmpClient, Protocol as NatProtocol};
+use nimble_nat::upnp::UpnpClient;
 use nimble_net::listener::PeerListener;
 use nimble_net::peer::PeerConnection;
 use nimble_net::tracker_http::TrackerEvent;
@@ -26,6 +29,10 @@ pub struct Session {
     announce_worker: AnnounceWorker,
     pending_announces: HashSet<String>,
     peer_listener: Option<PeerListener>,
+    nat_pmp: Option<NatPmpClient>,
+    upnp: Option<UpnpClient>,
+    lsd: Option<LsdClient>,
+    mapped_port: Option<u16>,
 }
 
 pub enum TorrentEntry {
@@ -81,7 +88,14 @@ pub struct SessionStats {
 }
 
 impl Session {
-    pub fn new(download_dir: PathBuf, listen_port: u16, enable_dht: bool) -> Self {
+    pub fn new(
+        download_dir: PathBuf,
+        listen_port: u16,
+        enable_dht: bool,
+        enable_upnp: bool,
+        enable_nat_pmp: bool,
+        enable_lsd: bool,
+    ) -> Self {
         let (dht, dht_socket) = if enable_dht {
             let socket = UdpSocket::bind(("0.0.0.0", listen_port))
                 .ok()
@@ -99,6 +113,56 @@ impl Session {
             eprintln!("Failed to create peer listener on port {}", listen_port);
         }
 
+        let mut nat_pmp = if enable_nat_pmp {
+            let mut client = NatPmpClient::new();
+            match client.discover() {
+                Ok(_) => {
+                    if let Ok(port) = client.add_port_mapping(listen_port, listen_port, NatProtocol::Tcp, None) {
+                        eprintln!("NAT-PMP: Mapped TCP port {} -> {}", listen_port, port);
+                    }
+                    Some(client)
+                }
+                Err(e) => {
+                    eprintln!("NAT-PMP discovery failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut upnp = if enable_upnp && nat_pmp.is_none() {
+            let mut client = UpnpClient::new();
+            match client.discover() {
+                Ok(_) => {
+                    eprintln!("UPnP: Gateway discovered");
+                    Some(client)
+                }
+                Err(e) => {
+                    eprintln!("UPnP discovery failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut lsd = if enable_lsd {
+            let mut client = LsdClient::new(listen_port);
+            match client.start() {
+                Ok(_) => {
+                    eprintln!("LSD: Started on port {}", listen_port);
+                    Some(client)
+                }
+                Err(e) => {
+                    eprintln!("LSD start failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut session = Session {
             torrents: HashMap::new(),
             download_dir,
@@ -109,6 +173,10 @@ impl Session {
             announce_worker: AnnounceWorker::new(),
             pending_announces: HashSet::new(),
             peer_listener,
+            nat_pmp,
+            upnp,
+            lsd,
+            mapped_port: None,
         };
 
         if let Err(e) = session.load_saved_torrents() {
@@ -195,6 +263,10 @@ impl Session {
             listener.register_infohash(info_hash_bytes, self.peer_id, piece_count);
         }
 
+        if let Some(lsd) = self.lsd.as_mut() {
+            lsd.add_torrent(info_hash_bytes);
+        }
+
         Ok(())
     }
 
@@ -257,6 +329,10 @@ impl Session {
             listener.register_infohash(info_hash_bytes, self.peer_id, piece_count);
         }
 
+        if let Some(lsd) = self.lsd.as_mut() {
+            lsd.add_torrent(info_hash_bytes);
+        }
+
         Ok(infohash)
     }
 
@@ -302,6 +378,10 @@ impl Session {
             listener.register_infohash(magnet.info_hash, self.peer_id, 0);
         }
 
+        if let Some(lsd) = self.lsd.as_mut() {
+            lsd.add_torrent(magnet.info_hash);
+        }
+
         Ok(infohash)
     }
 
@@ -336,6 +416,11 @@ impl Session {
 
         log_lines.extend(self.process_incoming_peers());
         log_lines.extend(self.process_dht_incoming());
+        log_lines.extend(self.process_lsd());
+
+        if let Some(nat_pmp) = self.nat_pmp.as_mut() {
+            let _ = nat_pmp.renew_mappings();
+        }
 
         while let Some(result) = self.announce_worker.try_recv_result() {
             self.pending_announces.remove(&result.infohash_hex);
@@ -626,11 +711,17 @@ impl Session {
         }
 
         for (infohash, state) in upgrades {
+            let info_hash_bytes = *state.info.infohash.as_bytes();
+            let piece_count = state.info.pieces.len();
+
             if let Some(listener) = self.peer_listener.as_mut() {
-                let info_hash_bytes = *state.info.infohash.as_bytes();
-                let piece_count = state.info.pieces.len();
                 listener.register_infohash(info_hash_bytes, self.peer_id, piece_count);
             }
+
+            if let Some(lsd) = self.lsd.as_mut() {
+                lsd.add_torrent(info_hash_bytes);
+            }
+
             self.torrents.insert(infohash, TorrentEntry::Active(state));
         }
 
@@ -772,6 +863,10 @@ impl Session {
             listener.close();
         }
 
+        if let Some(nat_pmp) = self.nat_pmp.as_mut() {
+            let _ = nat_pmp.delete_all_mappings();
+        }
+
         for (infohash, torrent) in self.torrents.iter_mut() {
             if let TorrentEntry::Active(state) = torrent {
                 if let Err(e) = state.storage.close() {
@@ -780,6 +875,42 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    fn process_lsd(&mut self) -> Vec<String> {
+        let mut log_lines = Vec::new();
+        let Some(lsd) = self.lsd.as_mut() else {
+            return log_lines;
+        };
+
+        if let Err(e) = lsd.tick() {
+            eprintln!("LSD tick error: {}", e);
+        }
+
+        for (infohash_hex, torrent) in self.torrents.iter_mut() {
+            let info_hash = match torrent {
+                TorrentEntry::Active(t) => *t.info.infohash.as_bytes(),
+                TorrentEntry::Magnet(t) => t.info_hash,
+            };
+
+            let discovered = lsd.get_discovered_peers(&info_hash);
+            if !discovered.is_empty() {
+                match torrent {
+                    TorrentEntry::Active(t) => t.peer_manager.add_peers(&discovered),
+                    TorrentEntry::Magnet(t) => t.peer_manager.add_peers(&discovered),
+                }
+
+                log_lines.push(format!(
+                    "LSD discovered {} peers for {}",
+                    discovered.len(),
+                    &infohash_hex[..8]
+                ));
+
+                lsd.clear_discovered_peers(&info_hash);
+            }
+        }
+
+        log_lines
     }
 
     fn process_incoming_peers(&mut self) -> Vec<String> {

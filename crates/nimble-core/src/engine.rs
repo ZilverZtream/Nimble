@@ -24,7 +24,14 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
         let _ = evt_tx.send(Event::Started);
 
         let download_dir = PathBuf::from(&settings.download_dir);
-        let mut session = Session::new(download_dir, settings.listen_port, settings.enable_dht);
+        let mut session = Session::new(
+            download_dir,
+            settings.listen_port,
+            settings.enable_dht,
+            settings.enable_upnp,
+            settings.enable_nat_pmp,
+            settings.enable_lsd,
+        );
         let mut stats = EngineStats::default();
 
         let tick_interval = Duration::from_millis(TICK_INTERVAL_MS);

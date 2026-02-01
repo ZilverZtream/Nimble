@@ -1,6 +1,8 @@
 use nimble_util::ids::dht_node_id_20;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
+#[cfg(feature = "ipv6")]
+use std::net::SocketAddrV6;
 use std::time::{Duration, Instant};
 
 use crate::bootstrap::default_bootstrap_nodes;
@@ -8,7 +10,11 @@ use crate::rpc::{
     decode_message, encode_message, ErrorMessage, Message, NodeEntry, Query, QueryKind, Response,
     ResponseKind, RpcError,
 };
+#[cfg(feature = "ipv6")]
+use crate::rpc::NodeEntry6;
 use crate::routing::RoutingTable;
+#[cfg(feature = "ipv6")]
+use crate::routing::{NodeInfo6, RoutingTable6};
 use crate::tokens::TokenIssuer;
 
 const MAX_RESPONSE_NODES: usize = 16;
@@ -28,10 +34,14 @@ pub struct DhtNode {
     node_id: [u8; 20],
     logged_startup: bool,
     routing: RoutingTable,
+    #[cfg(feature = "ipv6")]
+    routing6: RoutingTable6,
     tokens: TokenIssuer,
     peers: HashMap<[u8; 20], Vec<SocketAddrV4>>,
     rate_limiter: RateLimiter,
     pending_outbound: Vec<(SocketAddrV4, Vec<u8>)>,
+    #[cfg(feature = "ipv6")]
+    pending_outbound6: Vec<(SocketAddrV6, Vec<u8>)>,
     pending_queries: HashMap<TransactionId, PendingQuery>,
     tid_counter: u16,
     bootstrap_done: bool,
@@ -66,15 +76,21 @@ impl DhtNode {
     pub fn new() -> Self {
         let node_id = dht_node_id_20();
         let routing = RoutingTable::new(node_id);
+        #[cfg(feature = "ipv6")]
+        let routing6 = RoutingTable6::new(node_id);
         let clock_start = Instant::now();
         Self {
             node_id,
             logged_startup: false,
             routing,
+            #[cfg(feature = "ipv6")]
+            routing6,
             tokens: TokenIssuer::new(),
             peers: HashMap::new(),
             rate_limiter: RateLimiter::new(RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_QUERIES),
             pending_outbound: Vec::new(),
+            #[cfg(feature = "ipv6")]
+            pending_outbound6: Vec::new(),
             pending_queries: HashMap::new(),
             tid_counter: 0,
             bootstrap_done: false,
@@ -89,7 +105,12 @@ impl DhtNode {
     }
 
     pub fn known_nodes(&self) -> u32 {
-        self.routing.len() as u32
+        let v4 = self.routing.len() as u32;
+        #[cfg(feature = "ipv6")]
+        let v6 = self.routing6.len() as u32;
+        #[cfg(not(feature = "ipv6"))]
+        let v6 = 0;
+        v4 + v6
     }
 
     pub fn tick(&mut self) -> Vec<String> {
@@ -182,18 +203,43 @@ impl DhtNode {
                 tid.copy_from_slice(&response.transaction_id);
                 if let Some(pending) = self.pending_queries.remove(&tid) {
                     match &response.kind {
-                        ResponseKind::FindNode { nodes, .. } => {
+                        ResponseKind::FindNode {
+                            nodes,
+                            #[cfg(feature = "ipv6")]
+                            nodes6,
+                            ..
+                        } => {
                             for node in nodes {
                                 self.observe_node(node.id, node.addr);
                             }
+                            #[cfg(feature = "ipv6")]
+                            for node in nodes6 {
+                                self.routing6.insert(node.id, node.addr);
+                            }
                         }
-                        ResponseKind::GetPeers { nodes, values, .. } => {
+                        ResponseKind::GetPeers {
+                            nodes,
+                            values,
+                            #[cfg(feature = "ipv6")]
+                            nodes6,
+                            #[cfg(feature = "ipv6")]
+                            values6,
+                            ..
+                        } => {
                             for node in nodes {
                                 self.observe_node(node.id, node.addr);
+                            }
+                            #[cfg(feature = "ipv6")]
+                            for node in nodes6 {
+                                self.routing6.insert(node.id, node.addr);
                             }
                             if let QueryType::GetPeers(info_hash) = pending.query_type {
                                 for peer_addr in values {
                                     discovered_peers.push((*peer_addr, info_hash));
+                                }
+                                #[cfg(feature = "ipv6")]
+                                for _peer_addr in values6 {
+
                                 }
                             }
                         }
@@ -240,6 +286,11 @@ impl DhtNode {
 
     pub fn take_pending_packets(&mut self) -> Vec<(SocketAddrV4, Vec<u8>)> {
         std::mem::take(&mut self.pending_outbound)
+    }
+
+    #[cfg(feature = "ipv6")]
+    pub fn take_pending_packets6(&mut self) -> Vec<(SocketAddrV6, Vec<u8>)> {
+        std::mem::take(&mut self.pending_outbound6)
     }
 
     pub fn announce_peer(&mut self, info_hash: [u8; 20]) {
@@ -352,6 +403,8 @@ impl DhtNode {
                     kind: ResponseKind::FindNode {
                         id: self.node_id,
                         nodes,
+                        #[cfg(feature = "ipv6")]
+                        nodes6: Vec::new(),
                     },
                 }))
             }
@@ -374,6 +427,10 @@ impl DhtNode {
                         token: Some(token),
                         nodes,
                         values: peers,
+                        #[cfg(feature = "ipv6")]
+                        nodes6: Vec::new(),
+                        #[cfg(feature = "ipv6")]
+                        values6: Vec::new(),
                     },
                 }))
             }

@@ -300,9 +300,9 @@ Leaving completed TODOs unchecked is considered a bug.
 - [x] J4.3 Fallback when no trackers
 
 ## J5. DHT IPv6
-- [ ] J5.1 IPv6 socket
-- [ ] J5.2 IPv6 routing table
-- [ ] J5.3 Dual-stack operation
+- [x] J5.1 IPv6 socket
+- [x] J5.2 IPv6 routing table
+- [x] J5.3 Dual-stack operation
 
 -------------------------------------------------------------------------------
 

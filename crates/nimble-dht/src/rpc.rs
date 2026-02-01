@@ -1,4 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
+#[cfg(feature = "ipv6")]
+use std::net::{Ipv6Addr, SocketAddrV6};
 
 use nimble_bencode::{decode, DecodeError, Value};
 use thiserror::Error;
@@ -28,6 +30,13 @@ pub enum RpcError {
 pub struct NodeEntry {
     pub id: [u8; NODE_ID_LEN],
     pub addr: SocketAddrV4,
+}
+
+#[cfg(feature = "ipv6")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeEntry6 {
+    pub id: [u8; NODE_ID_LEN],
+    pub addr: SocketAddrV6,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,12 +71,18 @@ pub enum ResponseKind {
     FindNode {
         id: [u8; NODE_ID_LEN],
         nodes: Vec<NodeEntry>,
+        #[cfg(feature = "ipv6")]
+        nodes6: Vec<NodeEntry6>,
     },
     GetPeers {
         id: [u8; NODE_ID_LEN],
         token: Option<Vec<u8>>,
         nodes: Vec<NodeEntry>,
         values: Vec<SocketAddrV4>,
+        #[cfg(feature = "ipv6")]
+        nodes6: Vec<NodeEntry6>,
+        #[cfg(feature = "ipv6")]
+        values6: Vec<SocketAddrV6>,
     },
 }
 
@@ -193,6 +208,10 @@ pub fn decode_message(input: &[u8]) -> Result<Message, RpcError> {
 
         let nodes = parse_nodes(response.get(b"nodes".as_ref()))?;
         let values = parse_peers(response.get(b"values".as_ref()))?;
+        #[cfg(feature = "ipv6")]
+        let nodes6 = parse_nodes6(response.get(b"nodes6".as_ref()))?;
+        #[cfg(feature = "ipv6")]
+        let values6 = parse_peers6(response.get(b"values6".as_ref()))?;
         let token = match response.get(b"token".as_ref()) {
             Some(value) => {
                 let token = read_bytes(Some(value))?.to_vec();
@@ -204,15 +223,34 @@ pub fn decode_message(input: &[u8]) -> Result<Message, RpcError> {
             None => None,
         };
 
-        let kind = if !values.is_empty() || token.is_some() {
+        #[cfg(feature = "ipv6")]
+        let has_values = !values.is_empty() || !values6.is_empty();
+        #[cfg(not(feature = "ipv6"))]
+        let has_values = !values.is_empty();
+
+        #[cfg(feature = "ipv6")]
+        let has_nodes = !nodes.is_empty() || !nodes6.is_empty();
+        #[cfg(not(feature = "ipv6"))]
+        let has_nodes = !nodes.is_empty();
+
+        let kind = if has_values || token.is_some() {
             ResponseKind::GetPeers {
                 id,
                 token,
                 nodes,
                 values,
+                #[cfg(feature = "ipv6")]
+                nodes6,
+                #[cfg(feature = "ipv6")]
+                values6,
             }
-        } else if !nodes.is_empty() {
-            ResponseKind::FindNode { id, nodes }
+        } else if has_nodes {
+            ResponseKind::FindNode {
+                id,
+                nodes,
+                #[cfg(feature = "ipv6")]
+                nodes6,
+            }
         } else {
             ResponseKind::Ping { id }
         };
@@ -342,6 +380,69 @@ fn parse_peers(value: Option<&Value<'_>>) -> Result<Vec<SocketAddrV4>, RpcError>
     Ok(peers)
 }
 
+#[cfg(feature = "ipv6")]
+fn parse_nodes6(value: Option<&Value<'_>>) -> Result<Vec<NodeEntry6>, RpcError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let bytes = value
+        .as_bytes()
+        .ok_or(RpcError::Invalid("nodes6 is not bytes"))?;
+    if bytes.len() % 38 != 0 {
+        return Err(RpcError::Invalid("nodes6 length invalid"));
+    }
+    let count = bytes.len() / 38;
+    if count > MAX_NODES {
+        return Err(RpcError::Invalid("too many nodes6"));
+    }
+
+    let mut nodes = Vec::with_capacity(count);
+    for chunk in bytes.chunks_exact(38) {
+        let mut id = [0u8; NODE_ID_LEN];
+        id.copy_from_slice(&chunk[..NODE_ID_LEN]);
+        let mut ip_bytes = [0u8; 16];
+        ip_bytes.copy_from_slice(&chunk[20..36]);
+        let ip = Ipv6Addr::from(ip_bytes);
+        let port = u16::from_be_bytes([chunk[36], chunk[37]]);
+        nodes.push(NodeEntry6 {
+            id,
+            addr: SocketAddrV6::new(ip, port, 0, 0),
+        });
+    }
+
+    Ok(nodes)
+}
+
+#[cfg(feature = "ipv6")]
+fn parse_peers6(value: Option<&Value<'_>>) -> Result<Vec<SocketAddrV6>, RpcError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let list = value
+        .as_list()
+        .ok_or(RpcError::Invalid("values6 is not list"))?;
+    if list.len() > MAX_PEERS {
+        return Err(RpcError::Invalid("too many peers6"));
+    }
+
+    let mut peers = Vec::with_capacity(list.len());
+    for entry in list {
+        let bytes = entry
+            .as_bytes()
+            .ok_or(RpcError::Invalid("peer6 value not bytes"))?;
+        if bytes.len() != 18 {
+            return Err(RpcError::Invalid("peer6 value length invalid"));
+        }
+        let mut ip_bytes = [0u8; 16];
+        ip_bytes.copy_from_slice(&bytes[0..16]);
+        let ip = Ipv6Addr::from(ip_bytes);
+        let port = u16::from_be_bytes([bytes[16], bytes[17]]);
+        peers.push(SocketAddrV6::new(ip, port, 0, 0));
+    }
+
+    Ok(peers)
+}
+
 struct Encoder {
     buf: Vec<u8>,
 }
@@ -443,23 +544,44 @@ impl Encoder {
                 self.write_bytes(b"id");
                 self.write_bytes(id);
             }
-            ResponseKind::FindNode { id, nodes } => {
-                self.write_bytes(b"id");
-                self.write_bytes(id);
-                self.write_bytes(b"nodes");
-                self.write_bytes(&encode_nodes(nodes));
-            }
-            ResponseKind::GetPeers {
+            ResponseKind::FindNode {
                 id,
-                token,
                 nodes,
-                values,
+                #[cfg(feature = "ipv6")]
+                nodes6,
             } => {
                 self.write_bytes(b"id");
                 self.write_bytes(id);
                 if !nodes.is_empty() {
                     self.write_bytes(b"nodes");
                     self.write_bytes(&encode_nodes(nodes));
+                }
+                #[cfg(feature = "ipv6")]
+                if !nodes6.is_empty() {
+                    self.write_bytes(b"nodes6");
+                    self.write_bytes(&encode_nodes6(nodes6));
+                }
+            }
+            ResponseKind::GetPeers {
+                id,
+                token,
+                nodes,
+                values,
+                #[cfg(feature = "ipv6")]
+                nodes6,
+                #[cfg(feature = "ipv6")]
+                values6,
+            } => {
+                self.write_bytes(b"id");
+                self.write_bytes(id);
+                if !nodes.is_empty() {
+                    self.write_bytes(b"nodes");
+                    self.write_bytes(&encode_nodes(nodes));
+                }
+                #[cfg(feature = "ipv6")]
+                if !nodes6.is_empty() {
+                    self.write_bytes(b"nodes6");
+                    self.write_bytes(&encode_nodes6(nodes6));
                 }
                 if let Some(token) = token {
                     self.write_bytes(b"token");
@@ -470,6 +592,15 @@ impl Encoder {
                     self.list_start();
                     for addr in values {
                         self.write_bytes(&encode_peer(addr));
+                    }
+                    self.list_end();
+                }
+                #[cfg(feature = "ipv6")]
+                if !values6.is_empty() {
+                    self.write_bytes(b"values6");
+                    self.list_start();
+                    for addr in values6 {
+                        self.write_bytes(&encode_peer6(addr));
                     }
                     self.list_end();
                 }
@@ -532,6 +663,25 @@ fn encode_peer(addr: &SocketAddrV4) -> [u8; 6] {
     let octets = addr.ip().octets();
     out[0..4].copy_from_slice(&octets);
     out[4..6].copy_from_slice(&addr.port().to_be_bytes());
+    out
+}
+
+#[cfg(feature = "ipv6")]
+fn encode_nodes6(nodes: &[NodeEntry6]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nodes.len() * 38);
+    for node in nodes {
+        out.extend_from_slice(&node.id);
+        out.extend_from_slice(&node.addr.ip().octets());
+        out.extend_from_slice(&node.addr.port().to_be_bytes());
+    }
+    out
+}
+
+#[cfg(feature = "ipv6")]
+fn encode_peer6(addr: &SocketAddrV6) -> [u8; 18] {
+    let mut out = [0u8; 18];
+    out[0..16].copy_from_slice(&addr.ip().octets());
+    out[16..18].copy_from_slice(&addr.port().to_be_bytes());
     out
 }
 

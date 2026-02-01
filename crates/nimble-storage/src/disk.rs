@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use crate::hasher::{HashVerifier, VerifyRequest};
 use crate::layout::FileLayout;
 use crate::resume::ResumeData;
+use crate::checkpoint::CheckpointManager;
 
 const BLOCK_SIZE: u32 = 16384;
 const RESUME_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -31,6 +32,7 @@ pub struct DiskStorage {
     hasher: HashVerifier,
     last_resume_save: std::time::Instant,
     resume_dirty: bool,
+    checkpoint_manager: CheckpointManager,
 }
 
 struct PendingPiece {
@@ -61,6 +63,39 @@ impl DiskStorage {
             Bitfield::new(piece_count)
         };
 
+        let mut checkpoint_manager = CheckpointManager::new(
+            &download_dir,
+            info_hash,
+            info.piece_length,
+            BLOCK_SIZE,
+        )?;
+
+        let mut pending_pieces = HashMap::new();
+
+        if let Ok(Some(checkpoint)) = checkpoint_manager.load_checkpoint() {
+            let piece_len = if checkpoint.piece_index == piece_count as u64 - 1 {
+                let remainder = info.total_length % info.piece_length;
+                if remainder > 0 {
+                    remainder
+                } else {
+                    info.piece_length
+                }
+            } else {
+                info.piece_length
+            };
+
+            if let Ok(data) = checkpoint_manager.read_checkpoint_data(
+                checkpoint.data_offset,
+                piece_len as usize,
+            ) {
+                pending_pieces.insert(checkpoint.piece_index, PendingPiece {
+                    data,
+                    received_blocks: checkpoint.received_blocks,
+                    last_updated: std::time::Instant::now(),
+                });
+            }
+        }
+
         Ok(DiskStorage {
             layout,
             piece_length: info.piece_length,
@@ -69,7 +104,7 @@ impl DiskStorage {
             bitfield,
             file_handles: HashMap::new(),
             file_lru: VecDeque::new(),
-            pending_pieces: HashMap::new(),
+            pending_pieces,
             verifying_pieces: HashMap::new(),
             failed_pieces: Vec::new(),
             info_hash,
@@ -77,6 +112,7 @@ impl DiskStorage {
             hasher: HashVerifier::new(),
             last_resume_save: std::time::Instant::now(),
             resume_dirty: false,
+            checkpoint_manager,
         })
     }
 
@@ -156,8 +192,14 @@ impl DiskStorage {
 
         if pending.received_blocks.count_ones() == block_count as usize {
             self.submit_piece_for_verification(piece_index);
+            let _ = self.checkpoint_manager.clear();
             Ok(false)
         } else {
+            let _ = self.checkpoint_manager.write_partial_piece(
+                piece_index,
+                &pending.received_blocks,
+                &pending.data,
+            );
             Ok(false)
         }
     }

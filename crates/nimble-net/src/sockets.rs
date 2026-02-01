@@ -83,6 +83,27 @@ mod windows_impl {
             }
         }
 
+        /// # Safety and Ownership
+        ///
+        /// This function takes FULL OWNERSHIP of the provided SOCKET handle.
+        /// The socket will be closed when this TcpSocket is dropped.
+        ///
+        /// **CRITICAL**: The caller MUST NOT retain any references to the socket
+        /// or attempt to close it. After calling this function, the socket handle
+        /// is INVALID from the caller's perspective.
+        ///
+        /// **Windows-specific hazard**: If the caller retains the SOCKET handle
+        /// and it gets reused by the OS for a different connection before this
+        /// TcpSocket is dropped, calling closesocket on the reused handle will
+        /// close the wrong connection.
+        ///
+        /// **Correct usage**:
+        /// ```no_run
+        /// use windows_sys::Win32::Networking::WinSock::SOCKET;
+        /// let raw_socket: SOCKET = /* accept() or similar */;
+        /// let tcp_socket = TcpSocket::from_raw_socket(raw_socket, addr)?;
+        /// // raw_socket is now INVALID - do not use it again
+        /// ```
         pub fn from_raw_socket(socket: SOCKET, peer_addr: SocketAddr) -> Result<Self> {
             if socket == INVALID_SOCKET {
                 anyhow::bail!("invalid socket");
@@ -99,6 +120,22 @@ mod windows_impl {
             sock.set_keepalive(true)?;
 
             Ok(sock)
+        }
+
+        /// Consumes the TcpSocket and returns the raw SOCKET handle WITHOUT closing it.
+        ///
+        /// # Safety
+        ///
+        /// After calling this function, the caller is responsible for closing
+        /// the socket. Failure to do so will leak the socket handle.
+        ///
+        /// This is useful for transferring ownership to another abstraction
+        /// without going through a close/reopen cycle.
+        pub fn into_raw_socket(mut self) -> SOCKET {
+            let socket = self.socket;
+            self.socket = INVALID_SOCKET;
+            std::mem::forget(self);
+            socket
         }
 
         fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
@@ -458,6 +495,10 @@ mod unix_impl {
             Self::new()
         }
 
+        /// Takes ownership of the provided TcpStream.
+        ///
+        /// The stream will be closed when this TcpSocket is dropped.
+        /// The caller must not retain any references to the stream.
         pub fn from_raw_socket(stream: TcpStream, peer_addr: SocketAddr) -> Result<Self> {
             stream.set_read_timeout(Some(Duration::from_secs(30)))?;
             stream.set_write_timeout(Some(Duration::from_secs(30)))?;
@@ -467,6 +508,14 @@ mod unix_impl {
                 stream: Some(stream),
                 peer_addr: Some(peer_addr),
             })
+        }
+
+        /// Consumes the TcpSocket and returns the raw TcpStream WITHOUT closing it.
+        ///
+        /// After calling this function, the caller is responsible for closing
+        /// the stream.
+        pub fn into_raw_socket(mut self) -> Option<TcpStream> {
+            self.stream.take()
         }
 
         pub fn connect(&mut self, addr: SocketAddr) -> Result<()> {

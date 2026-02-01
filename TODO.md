@@ -295,9 +295,9 @@ Leaving completed TODOs unchecked is considered a bug.
 - [x] J3.3 Node refresh logic
 
 ## J4. DHT for magnets
-- [ ] J4.1 get_peers for infohash
-- [ ] J4.2 Peer extraction
-- [ ] J4.3 Fallback when no trackers
+- [x] J4.1 get_peers for infohash
+- [x] J4.2 Peer extraction
+- [x] J4.3 Fallback when no trackers
 
 ## J5. DHT IPv6
 - [ ] J5.1 IPv6 socket

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use nimble_bencode::torrent::TorrentInfo;
 use nimble_util::bitfield::Bitfield;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -11,6 +11,9 @@ use crate::layout::FileLayout;
 use crate::resume::ResumeData;
 
 const BLOCK_SIZE: u32 = 16384;
+const RESUME_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const STALE_PIECE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const MAX_OPEN_FILE_HANDLES: usize = 128;
 
 pub struct DiskStorage {
     layout: FileLayout,
@@ -19,17 +22,21 @@ pub struct DiskStorage {
     pieces: Vec<[u8; 20]>,
     bitfield: Bitfield,
     file_handles: HashMap<usize, File>,
+    file_lru: VecDeque<usize>,
     pending_pieces: HashMap<u64, PendingPiece>,
     verifying_pieces: HashMap<u64, ()>,
     failed_pieces: Vec<u64>,
     info_hash: [u8; 20],
     download_dir: PathBuf,
     hasher: HashVerifier,
+    last_resume_save: std::time::Instant,
+    resume_dirty: bool,
 }
 
 struct PendingPiece {
     data: Vec<u8>,
     received_blocks: Bitfield,
+    last_updated: std::time::Instant,
 }
 
 impl DiskStorage {
@@ -61,12 +68,15 @@ impl DiskStorage {
             pieces: info.pieces.clone(),
             bitfield,
             file_handles: HashMap::new(),
+            file_lru: VecDeque::new(),
             pending_pieces: HashMap::new(),
             verifying_pieces: HashMap::new(),
             failed_pieces: Vec::new(),
             info_hash,
             download_dir,
             hasher: HashVerifier::new(),
+            last_resume_save: std::time::Instant::now(),
+            resume_dirty: false,
         })
     }
 
@@ -130,6 +140,7 @@ impl DiskStorage {
             PendingPiece {
                 data: vec![0u8; piece_len as usize],
                 received_blocks: Bitfield::new(block_count as usize),
+                last_updated: std::time::Instant::now(),
             }
         });
 
@@ -141,6 +152,7 @@ impl DiskStorage {
         let end = start + data.len();
         pending.data[start..end].copy_from_slice(data);
         pending.received_blocks.set(block_index as usize, true);
+        pending.last_updated = std::time::Instant::now();
 
         if pending.received_blocks.count_ones() == block_count as usize {
             self.submit_piece_for_verification(piece_index);
@@ -254,7 +266,22 @@ impl DiskStorage {
     fn finalize_verified_piece(&mut self, piece_index: u64, data: &[u8]) -> Result<()> {
         self.write_piece_to_disk(piece_index, data)?;
         self.bitfield.set(piece_index as usize, true);
-        self.save_resume_data()?;
+        self.resume_dirty = true;
+        Ok(())
+    }
+
+    pub fn tick(&mut self) -> Result<()> {
+        if self.resume_dirty && self.last_resume_save.elapsed() >= RESUME_SAVE_INTERVAL {
+            self.save_resume_data()?;
+            self.last_resume_save = std::time::Instant::now();
+            self.resume_dirty = false;
+        }
+
+        let now = std::time::Instant::now();
+        self.pending_pieces.retain(|_, piece| {
+            now.duration_since(piece.last_updated) < STALE_PIECE_TIMEOUT
+        });
+
         Ok(())
     }
 
@@ -279,7 +306,18 @@ impl DiskStorage {
     }
 
     fn get_or_create_file(&mut self, file_index: usize) -> Result<&mut File> {
-        if !self.file_handles.contains_key(&file_index) {
+        if self.file_handles.contains_key(&file_index) {
+            self.file_lru.retain(|&idx| idx != file_index);
+            self.file_lru.push_back(file_index);
+        } else {
+            if self.file_handles.len() >= MAX_OPEN_FILE_HANDLES {
+                if let Some(lru_index) = self.file_lru.pop_front() {
+                    if let Some(mut file) = self.file_handles.remove(&lru_index) {
+                        let _ = file.flush();
+                    }
+                }
+            }
+
             let path = self.layout.file_path(file_index)
                 .context("invalid file index")?;
 
@@ -296,6 +334,7 @@ impl DiskStorage {
                 .context("failed to open file")?;
 
             self.file_handles.insert(file_index, file);
+            self.file_lru.push_back(file_index);
         }
 
         Ok(self.file_handles.get_mut(&file_index).unwrap())
@@ -319,7 +358,10 @@ impl DiskStorage {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        self.save_resume_data()?;
+        if self.resume_dirty {
+            self.save_resume_data()?;
+            self.resume_dirty = false;
+        }
 
         for (_, mut file) in self.file_handles.drain() {
             file.flush().context("failed to flush file")?;

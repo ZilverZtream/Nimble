@@ -4,6 +4,7 @@ use thiserror::Error;
 const MAX_INPUT_SIZE: usize = 16 * 1024 * 1024;
 const MAX_NESTING_DEPTH: usize = 32;
 const MAX_STRING_LENGTH: usize = 8 * 1024 * 1024;
+const MAX_DICT_KEY_LENGTH: usize = 256;
 const MAX_INTEGER_DIGITS: usize = 20;
 
 #[derive(Error, Debug)]
@@ -202,6 +203,53 @@ impl<'a> Decoder<'a> {
         Ok(Value::List(list))
     }
 
+    fn decode_dict_key(&mut self, prev_key: Option<&[u8]>) -> Result<&'a [u8]> {
+        let start = self.pos;
+
+        while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+            self.pos += 1;
+        }
+
+        if start == self.pos {
+            return Err(DecodeError::InvalidFormat(
+                "missing string length".to_string(),
+            ));
+        }
+
+        let len_bytes = &self.input[start..self.pos];
+        let len_str = std::str::from_utf8(len_bytes)
+            .map_err(|_| DecodeError::InvalidFormat("invalid length UTF-8".to_string()))?;
+
+        let length: usize = len_str
+            .parse()
+            .map_err(|_| DecodeError::InvalidFormat("invalid length".to_string()))?;
+
+        if length > MAX_DICT_KEY_LENGTH {
+            return Err(DecodeError::InvalidFormat(
+                format!("dictionary key too large: {} bytes (max {})", length, MAX_DICT_KEY_LENGTH),
+            ));
+        }
+
+        self.expect(b':')?;
+
+        if self.pos + length > self.input.len() {
+            return Err(DecodeError::UnexpectedEof);
+        }
+
+        let bytes = &self.input[self.pos..self.pos + length];
+
+        if let Some(prev) = prev_key {
+            if bytes <= prev {
+                return Err(DecodeError::InvalidFormat(
+                    "dictionary keys must be sorted".to_string(),
+                ));
+            }
+        }
+
+        self.pos += length;
+        Ok(bytes)
+    }
+
     fn decode_dict(&mut self) -> Result<Value<'a>> {
         self.expect(b'd')?;
         self.depth += 1;
@@ -210,22 +258,7 @@ impl<'a> Decoder<'a> {
         let mut last_key: Option<&[u8]> = None;
 
         while self.peek()? != b'e' {
-            let key = match self.decode_byte_string()? {
-                Value::ByteString(bytes) => bytes,
-                _ => {
-                    return Err(DecodeError::InvalidFormat(
-                        "dictionary key must be byte string".to_string(),
-                    ))
-                }
-            };
-
-            if let Some(prev) = last_key {
-                if key <= prev {
-                    return Err(DecodeError::InvalidFormat(
-                        "dictionary keys must be sorted".to_string(),
-                    ));
-                }
-            }
+            let key = self.decode_dict_key(last_key)?;
             last_key = Some(key);
 
             let value = self.decode_value()?;

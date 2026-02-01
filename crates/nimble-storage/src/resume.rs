@@ -88,6 +88,16 @@ impl ResumeData {
             anyhow::bail!("bitfield length too large: {}", len);
         }
 
+        let expected_bytes = (expected_piece_count + 7) / 8;
+        if len != expected_bytes {
+            anyhow::bail!(
+                "bitfield length mismatch: expected {} bytes for {} pieces, got {} bytes",
+                expected_bytes,
+                expected_piece_count,
+                len
+            );
+        }
+
         let mut bitfield_bytes = vec![0u8; len];
         file.read_exact(&mut bitfield_bytes)
             .context("failed to read bitfield")?;

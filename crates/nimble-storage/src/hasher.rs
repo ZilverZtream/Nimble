@@ -1,8 +1,9 @@
 use sha1::{Digest, Sha1};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 
 const WORKER_THREADS: usize = 2;
+const VERIFY_QUEUE_DEPTH: usize = 128;
 
 pub struct VerifyRequest {
     pub piece_index: u64,
@@ -17,15 +18,15 @@ pub struct VerifyResult {
 }
 
 pub struct HashVerifier {
-    request_tx: Sender<VerifyRequest>,
+    request_tx: SyncSender<VerifyRequest>,
     result_rx: Receiver<VerifyResult>,
     _workers: Vec<JoinHandle<()>>,
 }
 
 impl HashVerifier {
     pub fn new() -> Self {
-        let (request_tx, request_rx) = mpsc::channel::<VerifyRequest>();
-        let (result_tx, result_rx) = mpsc::channel::<VerifyResult>();
+        let (request_tx, request_rx) = mpsc::sync_channel::<VerifyRequest>(VERIFY_QUEUE_DEPTH);
+        let (result_tx, result_rx) = mpsc::sync_channel::<VerifyResult>(VERIFY_QUEUE_DEPTH);
 
         let request_rx = std::sync::Arc::new(std::sync::Mutex::new(request_rx));
         let mut workers = Vec::with_capacity(WORKER_THREADS);
@@ -75,7 +76,7 @@ impl HashVerifier {
     }
 
     pub fn submit(&self, request: VerifyRequest) -> bool {
-        self.request_tx.send(request).is_ok()
+        self.request_tx.try_send(request).is_ok()
     }
 
     pub fn try_recv(&self) -> Option<VerifyResult> {

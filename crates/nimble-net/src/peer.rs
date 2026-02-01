@@ -16,10 +16,13 @@ use crate::ut_pex::parse_pex;
 const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
 const HANDSHAKE_LENGTH: usize = 68;
 const MAX_MESSAGE_LENGTH: u32 = 32768 + 9;
+const MAX_BITFIELD_BYTES: u32 = 262144;
 const MAX_EXTENDED_MESSAGE_LENGTH: u32 = 1024 * 1024;
 const BLOCK_SIZE: u32 = 16384;
+const MAX_BLOCK_SIZE: u32 = 32768;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 const MAX_PENDING_REQUESTS: usize = 16;
+const MAX_PEER_REQUESTS: usize = 500;
 const EXTENDED_MESSAGE_ID: u8 = 20;
 const PEX_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const TEMP_RECV_BUFFER_SIZE: usize = 8192;
@@ -219,6 +222,13 @@ impl PeerMessage {
             PeerMessageId::Piece => {
                 if data.len() < 9 {
                     anyhow::bail!("piece message too short");
+                }
+                let block_len = data.len() - 9;
+                if block_len > MAX_BLOCK_SIZE as usize {
+                    anyhow::bail!("piece block too large: {} bytes (max {})", block_len, MAX_BLOCK_SIZE);
+                }
+                if block_len == 0 {
+                    anyhow::bail!("piece block cannot be empty");
                 }
                 let index = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
                 let begin = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
@@ -613,8 +623,13 @@ impl PeerConnection {
                         let msg_len =
                             u32::from_be_bytes([self.recv_buffer[0], self.recv_buffer[1], self.recv_buffer[2], self.recv_buffer[3]]);
 
-                        if msg_len > MAX_MESSAGE_LENGTH {
-                            anyhow::bail!("message too large: {} bytes", msg_len);
+                        let expected_bitfield_bytes = ((self.piece_count + 7) / 8) as u32 + 1;
+                        let max_allowed = MAX_MESSAGE_LENGTH
+                            .max(expected_bitfield_bytes.min(MAX_BITFIELD_BYTES))
+                            .max(MAX_EXTENDED_MESSAGE_LENGTH);
+
+                        if msg_len > max_allowed {
+                            anyhow::bail!("message too large: {} bytes (max {})", msg_len, max_allowed);
                         }
 
                         if msg_len == 0 {
@@ -686,6 +701,10 @@ impl PeerConnection {
                 }
             }
             PeerMessage::Bitfield { bitfield } => {
+                let expected_bytes = (self.piece_count + 7) / 8;
+                if bitfield.len() > expected_bytes * 2 {
+                    return;
+                }
                 let mut bf = Bitfield::new(self.piece_count);
                 for (i, &byte) in bitfield.iter().enumerate() {
                     for bit in 0..8 {
@@ -702,14 +721,21 @@ impl PeerConnection {
             }
             PeerMessage::Request { index, begin, length } => {
                 if !self.am_choking && self.peer_interested {
-                    if *length <= BLOCK_SIZE {
-                        self.peer_requests.push(PendingRequest {
-                            index: *index,
-                            begin: *begin,
-                            length: *length,
-                            sent_at: Instant::now(),
-                        });
+                    if *length == 0 || *length > MAX_BLOCK_SIZE {
+                        return;
                     }
+                    if *index as usize >= self.piece_count {
+                        return;
+                    }
+                    if self.peer_requests.len() >= MAX_PEER_REQUESTS {
+                        return;
+                    }
+                    self.peer_requests.push(PendingRequest {
+                        index: *index,
+                        begin: *begin,
+                        length: *length,
+                        sent_at: Instant::now(),
+                    });
                 }
             }
             PeerMessage::Extended { ext_type, payload } => {

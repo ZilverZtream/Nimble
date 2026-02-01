@@ -101,6 +101,26 @@ impl PeerManager {
         }
     }
 
+    pub fn accept_incoming(&mut self, connection: PeerConnection, addr: SocketAddrV4) -> Result<()> {
+        if self.peers.len() >= MAX_PEERS_PER_TORRENT {
+            anyhow::bail!("peer limit reached");
+        }
+
+        if self.peers.contains_key(&addr) {
+            anyhow::bail!("peer already connected");
+        }
+
+        self.peers.insert(
+            addr,
+            ManagedPeer {
+                connection,
+                pending_blocks: Vec::new(),
+            },
+        );
+
+        Ok(())
+    }
+
     pub fn tick(&mut self, mut storage: Option<&mut DiskStorage>) -> Result<PeerManagerStats> {
         let mut stats = PeerManagerStats::default();
 
@@ -152,6 +172,17 @@ impl PeerManager {
                                     self.total_length,
                                     self.piece_count,
                                 );
+                            }
+
+                            if !self.metadata_only {
+                                if let Some(storage) = storage.as_mut() {
+                                    let requests = peer.connection.take_peer_requests();
+                                    for req in requests {
+                                        if let Ok(data) = storage.read_block(req.index as u64, req.begin, req.length) {
+                                            let _ = peer.connection.send_piece(req.index, req.begin, data);
+                                        }
+                                    }
+                                }
                             }
 
                             stats.downloaded = stats.downloaded.saturating_add(peer.connection.downloaded());

@@ -78,6 +78,25 @@ impl UtMetadataMessage {
         buf.extend_from_slice(b"ee");
         buf
     }
+
+    pub fn build_data(piece: u32, total_size: u32, data: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"d8:msg_typei1e5:piecei");
+        buf.extend_from_slice(piece.to_string().as_bytes());
+        buf.extend_from_slice(b"e10:total_sizei");
+        buf.extend_from_slice(total_size.to_string().as_bytes());
+        buf.extend_from_slice(b"ee");
+        buf.extend_from_slice(data);
+        buf
+    }
+
+    pub fn build_reject(piece: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"d8:msg_typei2e5:piecei");
+        buf.extend_from_slice(piece.to_string().as_bytes());
+        buf.extend_from_slice(b"ee");
+        buf
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -292,6 +292,7 @@ pub struct PeerConnection {
     bitfield: Option<Bitfield>,
     piece_count: usize,
     pending_requests: Vec<PendingRequest>,
+    peer_requests: Vec<PendingRequest>,
     last_message_sent: Instant,
     last_message_received: Instant,
     downloaded: u64,
@@ -356,6 +357,7 @@ impl PeerConnection {
             bitfield: None,
             piece_count,
             pending_requests: Vec::new(),
+            peer_requests: Vec::new(),
             last_message_sent: now,
             last_message_received: now,
             downloaded: 0,
@@ -376,6 +378,118 @@ impl PeerConnection {
             pex_dropped_v6: Vec::new(),
             last_pex_received: None,
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn from_accepted(
+        socket: windows_sys::Win32::Networking::WinSock::SOCKET,
+        addr: SocketAddrV4,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        their_peer_id: [u8; 20],
+        piece_count: usize,
+        listen_port: u16,
+    ) -> Result<Self> {
+        use crate::sockets::TcpSocket;
+        let socket = TcpSocket::from_raw_socket(socket, SocketAddr::V4(addr))?;
+        let now = Instant::now();
+
+        let mut conn = PeerConnection {
+            socket,
+            addr: SocketAddr::V4(addr),
+            state: PeerState::Connected,
+            info_hash,
+            our_peer_id,
+            their_peer_id: Some(their_peer_id),
+            am_choking: true,
+            am_interested: false,
+            peer_choking: true,
+            peer_interested: false,
+            bitfield: None,
+            piece_count,
+            pending_requests: Vec::new(),
+            peer_requests: Vec::new(),
+            last_message_sent: now,
+            last_message_received: now,
+            downloaded: 0,
+            uploaded: 0,
+            recv_buffer: Vec::new(),
+            recv_state: RecvState::ReadingLength,
+            temp_recv_buf: [0u8; TEMP_RECV_BUFFER_SIZE],
+            extensions_enabled: true,
+            extension_state: None,
+            listen_port,
+            metadata_size: None,
+            metadata_state: None,
+            metadata: None,
+            metadata_requests_sent: false,
+            pex_added: Vec::new(),
+            pex_added_v6: Vec::new(),
+            pex_dropped: Vec::new(),
+            pex_dropped_v6: Vec::new(),
+            last_pex_received: None,
+        };
+
+        conn.init_extension_state();
+        conn.send_extension_handshake()?;
+
+        Ok(conn)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn from_accepted(
+        stream: std::net::TcpStream,
+        addr: SocketAddrV4,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        their_peer_id: [u8; 20],
+        piece_count: usize,
+        listen_port: u16,
+    ) -> Result<Self> {
+        use crate::sockets::TcpSocket;
+        let socket = TcpSocket::from_raw_socket(stream, SocketAddr::V4(addr))?;
+        let now = Instant::now();
+
+        let mut conn = PeerConnection {
+            socket,
+            addr: SocketAddr::V4(addr),
+            state: PeerState::Connected,
+            info_hash,
+            our_peer_id,
+            their_peer_id: Some(their_peer_id),
+            am_choking: true,
+            am_interested: false,
+            peer_choking: true,
+            peer_interested: false,
+            bitfield: None,
+            piece_count,
+            pending_requests: Vec::new(),
+            peer_requests: Vec::new(),
+            last_message_sent: now,
+            last_message_received: now,
+            downloaded: 0,
+            uploaded: 0,
+            recv_buffer: Vec::new(),
+            recv_state: RecvState::ReadingLength,
+            temp_recv_buf: [0u8; TEMP_RECV_BUFFER_SIZE],
+            extensions_enabled: true,
+            extension_state: None,
+            listen_port,
+            metadata_size: None,
+            metadata_state: None,
+            metadata: None,
+            metadata_requests_sent: false,
+            pex_added: Vec::new(),
+            pex_added_v6: Vec::new(),
+            pex_dropped: Vec::new(),
+            pex_dropped_v6: Vec::new(),
+            last_pex_received: None,
+        };
+
+        conn.init_extension_state();
+        conn.send_extension_handshake()?;
+
+        Ok(conn)
     }
 
     pub fn connect(&mut self) -> Result<()> {
@@ -586,6 +700,18 @@ impl PeerConnection {
             PeerMessage::Piece { block, .. } => {
                 self.downloaded += block.len() as u64;
             }
+            PeerMessage::Request { index, begin, length } => {
+                if !self.am_choking && self.peer_interested {
+                    if *length <= BLOCK_SIZE {
+                        self.peer_requests.push(PendingRequest {
+                            index: *index,
+                            begin: *begin,
+                            length: *length,
+                            sent_at: Instant::now(),
+                        });
+                    }
+                }
+            }
             PeerMessage::Extended { ext_type, payload } => {
                 self.handle_extended_message(*ext_type, payload);
             }
@@ -651,7 +777,50 @@ impl PeerConnection {
         };
 
         match msg.msg_type {
-            UtMetadataMessageType::Request => {}
+            UtMetadataMessageType::Request => {
+                if let Some(metadata) = &self.metadata {
+                    let piece_index = msg.piece as usize;
+                    let total_size = metadata.len() as u32;
+                    let piece_size = 16 * 1024;
+                    let piece_count = (metadata.len() + piece_size - 1) / piece_size;
+
+                    if piece_index < piece_count {
+                        let start = piece_index * piece_size;
+                        let end = (start + piece_size).min(metadata.len());
+                        let piece_data = &metadata[start..end];
+
+                        let response = UtMetadataMessage::build_data(msg.piece, total_size, piece_data);
+                        if let Some(ut_metadata_id) = self.extension_state.as_ref()
+                            .and_then(|s| s.our_id_for(EXTENSION_UT_METADATA))
+                        {
+                            let _ = self.send_message(&PeerMessage::Extended {
+                                ext_type: ut_metadata_id,
+                                payload: response,
+                            });
+                        }
+                    } else {
+                        let response = UtMetadataMessage::build_reject(msg.piece);
+                        if let Some(ut_metadata_id) = self.extension_state.as_ref()
+                            .and_then(|s| s.our_id_for(EXTENSION_UT_METADATA))
+                        {
+                            let _ = self.send_message(&PeerMessage::Extended {
+                                ext_type: ut_metadata_id,
+                                payload: response,
+                            });
+                        }
+                    }
+                } else {
+                    let response = UtMetadataMessage::build_reject(msg.piece);
+                    if let Some(ut_metadata_id) = self.extension_state.as_ref()
+                        .and_then(|s| s.our_id_for(EXTENSION_UT_METADATA))
+                    {
+                        let _ = self.send_message(&PeerMessage::Extended {
+                            ext_type: ut_metadata_id,
+                            payload: response,
+                        });
+                    }
+                }
+            }
             UtMetadataMessageType::Reject => {}
             UtMetadataMessageType::Data => {
                 if self.metadata_state.is_none() {
@@ -788,6 +957,14 @@ impl PeerConnection {
             .retain(|r| !(r.index == index && r.begin == begin));
     }
 
+    pub fn take_peer_requests(&mut self) -> Vec<PendingRequest> {
+        std::mem::take(&mut self.peer_requests)
+    }
+
+    pub fn send_piece(&mut self, index: u32, begin: u32, block: Vec<u8>) -> Result<()> {
+        self.send_message(&PeerMessage::Piece { index, begin, block })
+    }
+
     pub fn send_keepalive(&mut self) -> Result<()> {
         if self.last_message_sent.elapsed() >= KEEPALIVE_INTERVAL {
             self.send_message(&PeerMessage::KeepAlive)?;
@@ -911,6 +1088,10 @@ impl PeerConnection {
 
     pub fn take_metadata(&mut self) -> Option<Vec<u8>> {
         self.metadata.take()
+    }
+
+    pub fn set_metadata(&mut self, metadata: Vec<u8>) {
+        self.metadata = Some(metadata);
     }
 
     pub fn disconnect(&mut self) {

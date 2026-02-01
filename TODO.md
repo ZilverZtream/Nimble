@@ -346,12 +346,12 @@ Leaving completed TODOs unchecked is considered a bug.
 
 # N. µTP (BEP-29)
 
-- [ ] N1. µTP socket implementation
-- [ ] N2. Congestion control
-- [ ] N3. Retransmission logic
-- [ ] N4. Connection lifecycle
-- [ ] N5. Scheduler integration
-- [ ] N6. Peer scoring integration
+- [x] N1. µTP socket implementation
+- [x] N2. Congestion control (LEDBAT)
+- [x] N3. Retransmission logic
+- [x] N4. Connection lifecycle
+- [x] N5. Scheduler integration (UtpPeerConnection)
+- [x] N6. Peer scoring integration (TransportType, update_utp_rtt)
 
 -------------------------------------------------------------------------------
 

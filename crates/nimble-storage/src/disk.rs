@@ -15,11 +15,13 @@ const BLOCK_SIZE: u32 = 16384;
 pub struct DiskStorage {
     layout: FileLayout,
     piece_length: u64,
+    total_length: u64,
     pieces: Vec<[u8; 20]>,
     bitfield: Bitfield,
     file_handles: HashMap<usize, File>,
     pending_pieces: HashMap<u64, PendingPiece>,
     verifying_pieces: HashMap<u64, ()>,
+    failed_pieces: Vec<u64>,
     info_hash: [u8; 20],
     download_dir: PathBuf,
     hasher: HashVerifier,
@@ -55,11 +57,13 @@ impl DiskStorage {
         Ok(DiskStorage {
             layout,
             piece_length: info.piece_length,
+            total_length: info.total_length,
             pieces: info.pieces.clone(),
             bitfield,
             file_handles: HashMap::new(),
             pending_pieces: HashMap::new(),
             verifying_pieces: HashMap::new(),
+            failed_pieces: Vec::new(),
             info_hash,
             download_dir,
             hasher: HashVerifier::new(),
@@ -92,12 +96,35 @@ impl DiskStorage {
         }
 
         let piece_len = self.get_piece_length(piece_index);
+
+        if block_offset % BLOCK_SIZE != 0 {
+            anyhow::bail!("block offset {} is not aligned to BLOCK_SIZE", block_offset);
+        }
+
+        if block_offset as u64 >= piece_len {
+            anyhow::bail!(
+                "block offset {} exceeds piece length {}",
+                block_offset,
+                piece_len
+            );
+        }
+
+        let expected_block_len = if block_offset as u64 + BLOCK_SIZE as u64 > piece_len {
+            (piece_len - block_offset as u64) as usize
+        } else {
+            BLOCK_SIZE as usize
+        };
+
+        if data.len() != expected_block_len {
+            anyhow::bail!(
+                "block data length {} does not match expected {}",
+                data.len(),
+                expected_block_len
+            );
+        }
+
         let block_count = ((piece_len + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64) as u32;
         let block_index = block_offset / BLOCK_SIZE;
-
-        if block_index >= block_count {
-            anyhow::bail!("invalid block offset: {}", block_offset);
-        }
 
         let pending = self.pending_pieces.entry(piece_index).or_insert_with(|| {
             PendingPiece {
@@ -111,8 +138,8 @@ impl DiskStorage {
         }
 
         let start = block_offset as usize;
-        let end = (start + data.len()).min(pending.data.len());
-        pending.data[start..end].copy_from_slice(&data[..end - start]);
+        let end = start + data.len();
+        pending.data[start..end].copy_from_slice(data);
         pending.received_blocks.set(block_index as usize, true);
 
         if pending.received_blocks.count_ones() == block_count as usize {
@@ -146,13 +173,20 @@ impl DiskStorage {
             if result.hash_matches {
                 if let Err(e) = self.finalize_verified_piece(result.piece_index, &result.data) {
                     eprintln!("Failed to finalize piece {}: {}", result.piece_index, e);
+                    self.failed_pieces.push(result.piece_index);
                     continue;
                 }
                 completed.push(result.piece_index);
+            } else {
+                self.failed_pieces.push(result.piece_index);
             }
         }
 
         completed
+    }
+
+    pub fn take_failed_pieces(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.failed_pieces)
     }
 
     fn finalize_verified_piece(&mut self, piece_index: u64, data: &[u8]) -> Result<()> {
@@ -207,12 +241,18 @@ impl DiskStorage {
 
     fn get_piece_length(&self, piece_index: u64) -> u64 {
         let total_pieces = self.pieces.len() as u64;
+        if total_pieces == 0 {
+            return 0;
+        }
         if piece_index < total_pieces - 1 {
             self.piece_length
         } else {
-            let total_length = (total_pieces - 1) * self.piece_length + self.piece_length;
-            let last_piece_length = total_length - (piece_index * self.piece_length);
-            last_piece_length.min(self.piece_length)
+            let remainder = self.total_length % self.piece_length;
+            if remainder == 0 {
+                self.piece_length
+            } else {
+                remainder
+            }
         }
     }
 

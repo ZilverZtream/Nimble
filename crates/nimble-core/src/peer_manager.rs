@@ -174,6 +174,10 @@ impl PeerManager {
                 pieces_received.push(piece_index as u32);
                 self.piece_picker.mark_completed(piece_index as usize);
             }
+
+            for piece_index in storage.take_failed_pieces() {
+                self.piece_picker.cancel_piece(piece_index as usize);
+            }
         }
 
         for piece_index in &pieces_received {
@@ -189,6 +193,14 @@ impl PeerManager {
                 for block in peer.pending_blocks {
                     self.piece_picker
                         .cancel_block(block.piece as usize, block.offset);
+                }
+
+                if let Some(bitfield) = peer.connection.bitfield() {
+                    for piece in 0..bitfield.len() {
+                        if bitfield.get(piece) {
+                            self.piece_picker.update_availability(piece, false);
+                        }
+                    }
                 }
 
                 let entry = self.failed_peers.entry(addr).or_insert((Instant::now(), 0));

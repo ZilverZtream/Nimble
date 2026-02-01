@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 const PEER_ID_PREFIX: &[u8; 8] = b"-NM0001-";
 
 pub fn peer_id_20() -> [u8; 20] {
@@ -35,34 +33,28 @@ pub fn generate_random_bytes<const N: usize>() -> [u8; N] {
         };
 
         if result != 0 {
-            fallback_random(&mut bytes);
+            panic!(
+                "BCryptGenRandom failed with status 0x{:08X} - this should never happen on Windows",
+                result
+            );
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(unix, not(target_os = "windows")))]
     {
-        fallback_random(&mut bytes);
+        use std::io::Read;
+        let mut file = std::fs::File::open("/dev/urandom")
+            .expect("Failed to open /dev/urandom");
+        file.read_exact(&mut bytes)
+            .expect("Failed to read from /dev/urandom");
+    }
+
+    #[cfg(not(any(target_os = "windows", unix)))]
+    {
+        compile_error!("No secure random number generator available for this platform");
     }
 
     bytes
-}
-
-fn fallback_random(bytes: &mut [u8]) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-
-    let pid = std::process::id() as u128;
-    let addr = bytes.as_ptr() as usize as u128;
-
-    let mut state = now ^ (pid << 32) ^ (addr << 64);
-
-    for byte in bytes.iter_mut() {
-        state = state.wrapping_mul(0x5851F42D4C957F2D);
-        state = state.wrapping_add(0x14057B7EF767814F);
-        *byte = (state >> 64) as u8;
-    }
 }
 
 #[cfg(test)]

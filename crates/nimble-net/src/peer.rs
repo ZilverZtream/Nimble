@@ -811,6 +811,10 @@ impl PeerConnection {
             .unwrap_or(false)
     }
 
+    pub fn bitfield(&self) -> Option<&Bitfield> {
+        self.bitfield.as_ref()
+    }
+
     pub fn is_choking(&self) -> bool {
         self.peer_choking
     }

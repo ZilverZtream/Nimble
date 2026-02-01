@@ -1,4 +1,11 @@
 use std::io::{self, Read, Write};
+use num_bigint::BigUint;
+use nimble_util::hash::sha1;
+
+const DH_PRIME_HEX: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A63A36210000000000090563";
+const DH_GENERATOR: u32 = 2;
+const VC_LENGTH: usize = 8;
+const KEY_LENGTH: usize = 96;
 
 pub struct Rc4 {
     state: [u8; 256],
@@ -42,12 +49,8 @@ impl Rc4 {
     }
 }
 
-pub struct MseHandshake {
-    stage: MseStage,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum MseStage {
+pub enum MseStage {
     Init,
     SendPublicKey,
     ReceivePublicKey,
@@ -56,22 +59,157 @@ enum MseStage {
     Established,
 }
 
+pub struct MseHandshake {
+    stage: MseStage,
+    private_key: BigUint,
+    public_key: Vec<u8>,
+    shared_secret: Option<Vec<u8>>,
+    send_cipher: Option<Rc4>,
+    recv_cipher: Option<Rc4>,
+    is_initiator: bool,
+}
+
 impl MseHandshake {
-    pub fn new_initiator() -> Self {
+    pub fn new_initiator(_info_hash: &[u8; 20]) -> Self {
+        let prime = BigUint::parse_bytes(DH_PRIME_HEX.as_bytes(), 16)
+            .expect("invalid DH prime");
+
+        let private_key = generate_random_key();
+        let public_key = compute_public_key(&private_key, &prime);
+
         MseHandshake {
             stage: MseStage::Init,
+            private_key,
+            public_key,
+            shared_secret: None,
+            send_cipher: None,
+            recv_cipher: None,
+            is_initiator: true,
         }
     }
 
     pub fn new_responder() -> Self {
+        let prime = BigUint::parse_bytes(DH_PRIME_HEX.as_bytes(), 16)
+            .expect("invalid DH prime");
+
+        let private_key = generate_random_key();
+        let public_key = compute_public_key(&private_key, &prime);
+
         MseHandshake {
             stage: MseStage::Init,
+            private_key,
+            public_key,
+            shared_secret: None,
+            send_cipher: None,
+            recv_cipher: None,
+            is_initiator: false,
+        }
+    }
+
+    pub fn get_public_key(&self) -> &[u8] {
+        &self.public_key
+    }
+
+    pub fn compute_shared_secret(&mut self, peer_public_key: &[u8], info_hash: &[u8; 20]) {
+        let prime = BigUint::parse_bytes(DH_PRIME_HEX.as_bytes(), 16)
+            .expect("invalid DH prime");
+
+        let peer_pub = BigUint::from_bytes_be(peer_public_key);
+        let shared = peer_pub.modpow(&self.private_key, &prime);
+        let mut shared_bytes = shared.to_bytes_be();
+
+        if shared_bytes.len() < KEY_LENGTH {
+            let mut padded = vec![0u8; KEY_LENGTH - shared_bytes.len()];
+            padded.extend_from_slice(&shared_bytes);
+            shared_bytes = padded;
+        } else if shared_bytes.len() > KEY_LENGTH {
+            shared_bytes = shared_bytes[shared_bytes.len() - KEY_LENGTH..].to_vec();
+        }
+
+        let send_key = derive_key(&shared_bytes, info_hash, self.is_initiator, true);
+        let recv_key = derive_key(&shared_bytes, info_hash, self.is_initiator, false);
+
+        let mut send_cipher = Rc4::new(&send_key);
+        send_cipher.discard(1024);
+
+        let mut recv_cipher = Rc4::new(&recv_key);
+        recv_cipher.discard(1024);
+
+        self.shared_secret = Some(shared_bytes);
+        self.send_cipher = Some(send_cipher);
+        self.recv_cipher = Some(recv_cipher);
+    }
+
+    pub fn encrypt(&mut self, data: &mut [u8]) {
+        if let Some(cipher) = self.send_cipher.as_mut() {
+            cipher.process(data);
+        }
+    }
+
+    pub fn decrypt(&mut self, data: &mut [u8]) {
+        if let Some(cipher) = self.recv_cipher.as_mut() {
+            cipher.process(data);
         }
     }
 
     pub fn is_established(&self) -> bool {
         self.stage == MseStage::Established
     }
+
+    pub fn set_stage(&mut self, stage: MseStage) {
+        self.stage = stage;
+    }
+
+    pub fn stage(&self) -> MseStage {
+        self.stage
+    }
+}
+
+fn generate_random_key() -> BigUint {
+    let mut bytes = [0u8; 20];
+    let r1 = fastrand::u64(..);
+    let r2 = fastrand::u64(..);
+    let r3 = fastrand::u32(..);
+
+    bytes[0..8].copy_from_slice(&r1.to_be_bytes());
+    bytes[8..16].copy_from_slice(&r2.to_be_bytes());
+    bytes[16..20].copy_from_slice(&r3.to_be_bytes()[0..4]);
+
+    BigUint::from_bytes_be(&bytes)
+}
+
+fn compute_public_key(private_key: &BigUint, prime: &BigUint) -> Vec<u8> {
+    let generator = BigUint::from(DH_GENERATOR);
+    let public = generator.modpow(private_key, prime);
+    let mut bytes = public.to_bytes_be();
+
+    if bytes.len() < KEY_LENGTH {
+        let mut padded = vec![0u8; KEY_LENGTH - bytes.len()];
+        padded.extend_from_slice(&bytes);
+        bytes = padded;
+    } else if bytes.len() > KEY_LENGTH {
+        bytes = bytes[bytes.len() - KEY_LENGTH..].to_vec();
+    }
+
+    bytes
+}
+
+fn derive_key(shared_secret: &[u8], info_hash: &[u8; 20], is_initiator: bool, is_send: bool) -> [u8; 20] {
+    let mut data = Vec::with_capacity(shared_secret.len() + info_hash.len());
+
+    let use_req = (is_initiator && is_send) || (!is_initiator && !is_send);
+
+    if use_req {
+        data.extend_from_slice(b"keyA");
+        data.extend_from_slice(shared_secret);
+        data.extend_from_slice(info_hash);
+    } else {
+        data.extend_from_slice(b"keyB");
+        data.extend_from_slice(shared_secret);
+        data.extend_from_slice(info_hash);
+    }
+
+    sha1(&data)
 }
 
 pub struct EncryptedStream<S> {
@@ -171,5 +309,44 @@ mod tests {
         cipher2.process(&mut data2);
 
         assert_eq!(data1, data2);
+    }
+
+    #[test]
+    fn test_dh_key_exchange() {
+        let info_hash = [0x12u8; 20];
+
+        let mut initiator = MseHandshake::new_initiator(&info_hash);
+        let mut responder = MseHandshake::new_responder();
+
+        let initiator_pubkey = initiator.get_public_key().to_vec();
+        let responder_pubkey = responder.get_public_key().to_vec();
+
+        initiator.compute_shared_secret(&responder_pubkey, &info_hash);
+        responder.compute_shared_secret(&initiator_pubkey, &info_hash);
+
+        assert_eq!(initiator.shared_secret, responder.shared_secret);
+    }
+
+    #[test]
+    fn test_mse_encryption() {
+        let info_hash = [0x34u8; 20];
+
+        let mut initiator = MseHandshake::new_initiator(&info_hash);
+        let mut responder = MseHandshake::new_responder();
+
+        let initiator_pubkey = initiator.get_public_key().to_vec();
+        let responder_pubkey = responder.get_public_key().to_vec();
+
+        initiator.compute_shared_secret(&responder_pubkey, &info_hash);
+        responder.compute_shared_secret(&initiator_pubkey, &info_hash);
+
+        let mut data = b"Test message".to_vec();
+        let original = data.clone();
+
+        initiator.encrypt(&mut data);
+        assert_ne!(data, original);
+
+        responder.decrypt(&mut data);
+        assert_eq!(data, original);
     }
 }

@@ -13,6 +13,7 @@ utp = []
         [dependencies]
         anyhow = { workspace = true }
         thiserror = { workspace = true }
+        fastrand = { workspace = true }
         nimble-util = { path = "../nimble-util" }
 nimble-bencode = { path = "../nimble-bencode" }
 nimble-storage = { path = "../nimble-storage" }

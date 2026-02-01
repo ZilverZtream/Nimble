@@ -227,7 +227,7 @@ impl PeerManager {
             attempts += 1;
 
             let mut conn =
-                PeerConnection::new(addr, self.info_hash, self.peer_id, self.piece_count);
+                PeerConnection::new_v4(addr, self.info_hash, self.peer_id, self.piece_count);
 
             match conn.connect() {
                 Ok(()) => {

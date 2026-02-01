@@ -336,10 +336,10 @@ Leaving completed TODOs unchecked is considered a bug.
 
 # M. IPv6 End-to-End
 
-- [ ] M1. IPv6 peer connections
-- [ ] M2. IPv6 inbound listener
-- [ ] M3. IPv6 tracker support
-- [ ] M4. IPv6 DHT integration
+- [x] M1. IPv6 peer connections
+- [x] M2. IPv6 inbound listener
+- [x] M3. IPv6 tracker support
+- [x] M4. IPv6 DHT integration
 - [ ] M5. UI visibility of IPv6 status
 
 -------------------------------------------------------------------------------

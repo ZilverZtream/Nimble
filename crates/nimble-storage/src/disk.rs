@@ -379,7 +379,8 @@ impl DiskStorage {
             self.file_lru.push_back(file_index);
         }
 
-        Ok(self.file_handles.get_mut(&file_index).unwrap())
+        self.file_handles.get_mut(&file_index)
+            .ok_or_else(|| anyhow::anyhow!("File handle missing after insertion for index {}", file_index))
     }
 
     fn get_piece_length(&self, piece_index: u64) -> u64 {

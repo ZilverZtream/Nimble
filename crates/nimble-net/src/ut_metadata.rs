@@ -54,7 +54,13 @@ impl UtMetadataMessage {
             .and_then(|v| if v >= 0 { Some(v as u32) } else { None });
 
         let data = match msg_type {
-            UtMetadataMessageType::Data => payload[consumed..].to_vec(),
+            UtMetadataMessageType::Data => {
+                let data_len = payload.len().saturating_sub(consumed);
+                if data_len > METADATA_PIECE_SIZE {
+                    return Err(anyhow!("ut_metadata data exceeds max piece size: {} > {}", data_len, METADATA_PIECE_SIZE));
+                }
+                payload[consumed..].to_vec()
+            }
             _ => {
                 if consumed != payload.len() {
                     return Err(anyhow!("ut_metadata unexpected trailing data"));

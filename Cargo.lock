@@ -328,6 +328,7 @@ dependencies = [
  "nimble-util",
  "num-bigint",
  "thiserror",
+ "ureq",
  "windows-sys",
 ]
 

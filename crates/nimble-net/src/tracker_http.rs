@@ -3,7 +3,17 @@ use nimble_util::hash::percent_encode;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::mpsc::Sender;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(windows))]
+use std::io::Read;
+#[cfg(not(windows))]
+use std::thread;
+#[cfg(not(windows))]
+use std::time::Duration;
+#[cfg(windows)]
 use windows_sys::core::w;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::GetLastError;
+#[cfg(windows)]
 use windows_sys::Win32::Networking::WinHttp::*;
 
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1MB cap for tracker responses
@@ -126,6 +136,7 @@ fn build_query_string(req: &AnnounceRequest) -> Result<String> {
     Ok(parts.join("&"))
 }
 
+#[cfg(windows)]
 fn http_get_async(url: &str, request_id: u64, sender: Sender<HttpAnnounceEvent>) -> Result<()> {
     unsafe {
         let h_session = WinHttpOpen(
@@ -144,6 +155,7 @@ fn http_get_async(url: &str, request_id: u64, sender: Sender<HttpAnnounceEvent>)
     }
 }
 
+#[cfg(windows)]
 unsafe fn http_get_async_inner(
     h_session: *mut std::ffi::c_void,
     url: &str,
@@ -215,16 +227,19 @@ unsafe fn http_get_async_inner(
     let callback = WinHttpSetStatusCallback(
         h_request,
         Some(status_callback),
-        WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS | WINHTTP_CALLBACK_FLAG_REQUEST_ERROR | WINHTTP_CALLBACK_FLAG_HANDLE_CLOSING,
+        WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS,
         0,
     );
 
-    if callback == WINHTTP_INVALID_STATUS_CALLBACK {
+    if callback.is_none() {
+        let err = unsafe { GetLastError() };
+        if err != 0 {
         WinHttpCloseHandle(h_request);
         WinHttpCloseHandle(h_connect);
         WinHttpCloseHandle(h_session);
         drop(Box::from_raw(context_ptr));
         return Err(anyhow!("WinHttpSetStatusCallback failed"));
+        }
     }
 
     let timeout_result = WinHttpSetTimeouts(
@@ -264,6 +279,7 @@ unsafe fn http_get_async_inner(
     Ok(())
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn status_callback(
     h_internet: *mut std::ffi::c_void,
     dw_context: usize,
@@ -371,6 +387,7 @@ unsafe extern "system" fn status_callback(
     }
 }
 
+#[cfg(windows)]
 unsafe fn complete_request(context_ptr: *mut TrackerContext, result: Result<AnnounceResponse>) {
     let context = &mut *context_ptr;
     if context.completed {
@@ -431,8 +448,55 @@ fn parse_url(url: &str) -> Result<ParsedUrl> {
     })
 }
 
+#[cfg(windows)]
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(not(windows))]
+fn http_get_async(url: &str, request_id: u64, sender: Sender<HttpAnnounceEvent>) -> Result<()> {
+    let url = url.to_string();
+    thread::spawn(move || {
+        let result = http_get_sync(&url);
+        let _ = sender.send(HttpAnnounceEvent::Completed { request_id, result });
+    });
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn http_get_sync(url: &str) -> Result<AnnounceResponse> {
+    if url.starts_with("https://") {
+        return Err(anyhow!("HTTPS trackers require WinHTTP on Windows builds"));
+    }
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(TIMEOUT_CONNECT_MS as u64))
+        .timeout_read(Duration::from_millis(TIMEOUT_RECEIVE_MS as u64))
+        .build();
+
+    let response = agent.get(url).call().map_err(|err| anyhow!(err))?;
+    if response.status() != 200 {
+        return Err(anyhow!("HTTP status {}", response.status()));
+    }
+
+    let mut reader = response.into_reader();
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; READ_BUFFER_SIZE];
+
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+
+        if buffer.len() + read > MAX_RESPONSE_SIZE {
+            return Err(anyhow!("response exceeded max size"));
+        }
+
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+
+    parse_announce_response(&buffer)
 }
 
 fn parse_announce_response(data: &[u8]) -> Result<AnnounceResponse> {

@@ -1,4 +1,5 @@
-use nimble_net::tracker_http::{announce_async, AnnounceRequest as HttpAnnounceRequest, HttpAnnounceEvent, TrackerEvent};
+use anyhow::Result;
+use nimble_net::tracker_http::{announce, announce_async, AnnounceRequest as HttpAnnounceRequest, HttpAnnounceEvent, TrackerEvent};
 use nimble_net::tracker_udp::{UdpTracker, UdpAnnounceRequest, UdpTrackerEvent};
 use std::net::{SocketAddrV4, ToSocketAddrs};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
@@ -235,6 +236,22 @@ impl AnnounceWorker {
                 Some(Self::http_result_from_task(task, result))
             }
         }
+    }
+
+    fn announce_http(task: &AnnounceTask) -> AnnounceResult {
+        let request = HttpAnnounceRequest {
+            info_hash: &task.info_hash,
+            peer_id: &task.peer_id,
+            port: task.port,
+            uploaded: task.uploaded,
+            downloaded: task.downloaded,
+            left: task.left,
+            compact: true,
+            event: task.event,
+        };
+
+        let result = announce(&task.url, &request);
+        Self::http_result_from_task(task.clone(), result)
     }
 
     fn http_result_from_task(task: AnnounceTask, result: Result<nimble_net::tracker_http::AnnounceResponse>) -> AnnounceResult {

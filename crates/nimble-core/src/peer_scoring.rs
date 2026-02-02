@@ -94,7 +94,7 @@ impl PeerScore {
 
     fn calculate_throughput_score(&self) -> f64 {
         let elapsed = self.download_start.elapsed();
-        if elapsed.as_secs() == 0 {
+        if elapsed.is_zero() {
             return 0.0;
         }
 
@@ -123,11 +123,11 @@ impl PeerScore {
     }
 
     fn calculate_reliability_score(&self) -> f64 {
-        if self.requests_sent == 0 {
-            return 1.0;
-        }
-
-        let delivery_rate = (self.blocks_received as f64) / (self.requests_sent as f64);
+        let delivery_rate = if self.requests_sent == 0 {
+            1.0
+        } else {
+            (self.blocks_received as f64) / (self.requests_sent as f64)
+        };
 
         let failure_penalty = (self.connection_failures as f64 * 0.1).min(0.5);
         let choke_penalty = (self.choke_count as f64 * 0.05).min(0.3);

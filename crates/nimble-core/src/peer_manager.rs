@@ -3,7 +3,7 @@ use nimble_net::peer::{AnyPeerConnection, PeerConnection, PeerMessage, PeerState
 use nimble_storage::disk::DiskStorage;
 use nimble_util::bitfield::Bitfield;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use crate::endgame::{BlockId, EndgameMode};
@@ -40,13 +40,13 @@ pub struct PeerManager {
     total_length: u64,
     metadata_only: bool,
     pending_metadata: Option<Vec<u8>>,
-    peers: HashMap<SocketAddrV4, ManagedPeer>,
-    candidate_peers: VecDeque<SocketAddrV4>,
-    peer_capabilities: HashMap<SocketAddrV4, PeerCapability>,
-    failed_peers: HashMap<SocketAddrV4, (Instant, usize)>,
+    peers: HashMap<SocketAddr, ManagedPeer>,
+    candidate_peers: VecDeque<SocketAddr>,
+    peer_capabilities: HashMap<SocketAddr, PeerCapability>,
+    failed_peers: HashMap<SocketAddr, (Instant, usize)>,
     piece_picker: PiecePicker,
     endgame: EndgameMode,
-    pending_upload_requests: Vec<(SocketAddrV4, u32, u32, u32)>,
+    pending_upload_requests: Vec<(SocketAddr, u32, u32, u32)>,
     connection_attempts: VecDeque<Instant>,
     last_connection_attempt: Instant,
     transport_preference: TransportPreference,
@@ -139,15 +139,15 @@ impl PeerManager {
         }
     }
 
-    pub fn add_peers(&mut self, addrs: &[SocketAddrV4]) {
+    pub fn add_peers(&mut self, addrs: &[SocketAddr]) {
         self.add_peers_with_capability(addrs, false)
     }
 
-    pub fn add_utp_peers(&mut self, addrs: &[SocketAddrV4]) {
+    pub fn add_utp_peers(&mut self, addrs: &[SocketAddr]) {
         self.add_peers_with_capability(addrs, true)
     }
 
-    fn add_peers_with_capability(&mut self, addrs: &[SocketAddrV4], from_utp_tracker: bool) {
+    fn add_peers_with_capability(&mut self, addrs: &[SocketAddr], from_utp_tracker: bool) {
         for &addr in addrs {
             if self.candidate_peers.len() >= MAX_CANDIDATE_PEERS {
                 break;
@@ -180,7 +180,7 @@ impl PeerManager {
         self.transport_preference = preference;
     }
 
-    fn should_use_utp(&self, addr: &SocketAddrV4) -> bool {
+    fn should_use_utp(&self, addr: &SocketAddr) -> bool {
         match self.transport_preference {
             TransportPreference::UtpOnly => true,
             TransportPreference::PreferUtp => {
@@ -193,7 +193,7 @@ impl PeerManager {
         }
     }
 
-    pub fn accept_incoming(&mut self, connection: AnyPeerConnection, addr: SocketAddrV4) -> Result<()> {
+    pub fn accept_incoming(&mut self, connection: AnyPeerConnection, addr: SocketAddr) -> Result<()> {
         if self.peers.len() >= MAX_PEERS_PER_TORRENT {
             anyhow::bail!("peer limit reached");
         }
@@ -213,7 +213,7 @@ impl PeerManager {
         Ok(())
     }
 
-    pub fn accept_incoming_tcp(&mut self, connection: PeerConnection, addr: SocketAddrV4) -> Result<()> {
+    pub fn accept_incoming_tcp(&mut self, connection: PeerConnection, addr: SocketAddr) -> Result<()> {
         self.accept_incoming(AnyPeerConnection::Tcp(connection), addr)
     }
 
@@ -234,11 +234,17 @@ impl PeerManager {
                     match Self::handle_peer_messages(peer, &mut self.piece_picker, &mut self.endgame, addr) {
                         Ok(blocks) => {
                             if let Some(update) = peer.connection.take_pex_updates() {
-                                for addr in update.added {
-                                    pex_added.insert(addr);
+                                for v4_addr in update.added {
+                                    pex_added.insert(SocketAddr::V4(v4_addr));
                                 }
-                                for addr in update.dropped {
-                                    pex_dropped.insert(addr);
+                                for v6_addr in update.added_v6 {
+                                    pex_added.insert(SocketAddr::V6(v6_addr));
+                                }
+                                for v4_addr in update.dropped {
+                                    pex_dropped.insert(SocketAddr::V4(v4_addr));
+                                }
+                                for v6_addr in update.dropped_v6 {
+                                    pex_dropped.insert(SocketAddr::V6(v6_addr));
                                 }
                             }
 
@@ -324,13 +330,16 @@ impl PeerManager {
             if let Some(storage) = storage.as_mut() {
                 for (addr, index, begin, length) in self.pending_upload_requests.drain(..) {
                     if self.peers.contains_key(&addr) {
-                        let _ = storage.request_read_block(index as u64, begin, length, Some(addr));
+                        if let SocketAddr::V4(v4_addr) = addr {
+                            let _ = storage.request_read_block(index as u64, begin, length, Some(v4_addr));
+                        }
                     }
                 }
 
                 let completed_reads = storage.poll_read_completions();
                 for (peer_addr, piece_index, block_offset, data) in completed_reads {
-                    if let Some(addr) = peer_addr {
+                    if let Some(v4_addr) = peer_addr {
+                        let addr = SocketAddr::V4(v4_addr);
                         if let Some(peer) = self.peers.get_mut(&addr) {
                             if peer.connection.state() == PeerState::Connected {
                                 let _ = peer.connection.send_piece(piece_index as u32, block_offset, data);
@@ -409,11 +418,18 @@ impl PeerManager {
             self.connection_attempts.push_back(now);
             attempts += 1;
 
+            let v4_addr = match addr {
+                SocketAddr::V4(a) => a,
+                SocketAddr::V6(_) => {
+                    continue;
+                }
+            };
+
             let use_utp = self.should_use_utp(&addr);
             let conn_result = if use_utp {
-                AnyPeerConnection::new_utp_v4(addr, self.info_hash, self.peer_id, self.piece_count)
+                AnyPeerConnection::new_utp_v4(v4_addr, self.info_hash, self.peer_id, self.piece_count)
             } else {
-                Ok(AnyPeerConnection::new_tcp_v4(addr, self.info_hash, self.peer_id, self.piece_count))
+                Ok(AnyPeerConnection::new_tcp_v4(v4_addr, self.info_hash, self.peer_id, self.piece_count))
             };
 
             let mut conn = match conn_result {
@@ -448,7 +464,7 @@ impl PeerManager {
         self.last_connection_attempt = now;
     }
 
-    fn apply_pex_dropped(&mut self, dropped: &HashSet<SocketAddrV4>) {
+    fn apply_pex_dropped(&mut self, dropped: &HashSet<SocketAddr>) {
         if dropped.is_empty() {
             return;
         }
@@ -515,7 +531,7 @@ impl PeerManager {
         peer: &mut ManagedPeer,
         picker: &mut PiecePicker,
         endgame: &mut EndgameMode,
-        peer_addr: SocketAddrV4,
+        peer_addr: SocketAddr,
     ) -> Result<Vec<(u32, u32, Vec<u8>)>> {
         let mut received_blocks = Vec::new();
 
@@ -574,7 +590,7 @@ impl PeerManager {
         peer: &mut ManagedPeer,
         picker: &mut PiecePicker,
         endgame: &mut EndgameMode,
-        peer_addr: SocketAddrV4,
+        peer_addr: SocketAddr,
         piece_length: u64,
         total_length: u64,
         piece_count: usize,
@@ -665,7 +681,7 @@ impl PeerManager {
 
     /// Returns raw socket handles for all connected peers along with their addresses.
     /// Used for select()-based readiness polling (RFC-101 Step 1).
-    pub fn get_socket_handles(&self) -> Vec<(SocketAddrV4, nimble_net::sockets::RawSocket)> {
+    pub fn get_socket_handles(&self) -> Vec<(SocketAddr, nimble_net::sockets::RawSocket)> {
         self.peers
             .iter()
             .filter(|(_, peer)| {
@@ -681,7 +697,7 @@ impl PeerManager {
     /// Tick a specific peer by address instead of iterating all peers.
     /// Returns received blocks if successful.
     /// Used by session to tick only peers that are ready (RFC-101 Step 1).
-    pub fn tick_peer(&mut self, addr: &SocketAddrV4) -> Result<Vec<(u32, u32, Vec<u8>)>> {
+    pub fn tick_peer(&mut self, addr: &SocketAddr) -> Result<Vec<(u32, u32, Vec<u8>)>> {
         let peer = self.peers.get_mut(addr)
             .ok_or_else(|| anyhow::anyhow!("peer not found"))?;
 
@@ -699,7 +715,7 @@ impl PeerManager {
 
     /// Request blocks for a specific peer that has been identified as unchoked.
     /// Called after tick_peer when the peer might have become unchoked.
-    pub fn request_blocks_for_peer(&mut self, addr: &SocketAddrV4) {
+    pub fn request_blocks_for_peer(&mut self, addr: &SocketAddr) {
         let Some(peer) = self.peers.get_mut(addr) else {
             return;
         };
@@ -727,7 +743,7 @@ impl PeerManager {
     }
 
     /// Take peer requests for a specific peer.
-    pub fn take_peer_requests_for(&mut self, addr: &SocketAddrV4) -> Vec<(u32, u32, u32)> {
+    pub fn take_peer_requests_for(&mut self, addr: &SocketAddr) -> Vec<(u32, u32, u32)> {
         if let Some(peer) = self.peers.get_mut(addr) {
             peer.connection
                 .take_peer_requests()
@@ -740,7 +756,7 @@ impl PeerManager {
     }
 
     /// Remove a failed peer from the manager.
-    pub fn remove_peer(&mut self, addr: &SocketAddrV4) {
+    pub fn remove_peer(&mut self, addr: &SocketAddr) {
         if let Some(peer) = self.peers.remove(addr) {
             for block in peer.pending_blocks {
                 self.piece_picker
@@ -764,7 +780,7 @@ impl PeerManager {
     }
 
     /// Check if a specific peer is connected.
-    pub fn is_peer_connected(&self, addr: &SocketAddrV4) -> bool {
+    pub fn is_peer_connected(&self, addr: &SocketAddr) -> bool {
         self.peers
             .get(addr)
             .map(|p| p.connection.state() == PeerState::Connected)

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use nimble_net::tracker_http::{announce, announce_async, AnnounceRequest as HttpAnnounceRequest, HttpAnnounceEvent, TrackerEvent};
-use nimble_net::tracker_udp::{UdpTracker, UdpAnnounceRequest, UdpTrackerEvent};
-use std::net::{SocketAddrV4, ToSocketAddrs};
+use nimble_net::tracker_udp::{UdpTracker, UdpAnnounceRequest, UdpTrackerEvent, parse_udp_tracker_url};
+use std::net::SocketAddr;
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,7 +39,7 @@ pub struct AnnounceTask {
 pub struct AnnounceResult {
     pub infohash_hex: String,
     pub success: bool,
-    pub peers: Vec<SocketAddrV4>,
+    pub peers: Vec<SocketAddr>,
     pub interval: Option<u32>,
     pub error: Option<String>,
 }
@@ -148,15 +148,15 @@ impl AnnounceWorker {
     }
 
     fn announce_udp(task: &AnnounceTask) -> AnnounceResult {
-        let addr = match Self::parse_udp_url(&task.url) {
-            Some(addr) => addr,
-            None => {
+        let addr = match parse_udp_tracker_url(&task.url) {
+            Ok(addr) => addr,
+            Err(e) => {
                 return AnnounceResult {
                     infohash_hex: task.infohash_hex.clone(),
                     success: false,
                     peers: Vec::new(),
                     interval: None,
-                    error: Some("Failed to parse UDP tracker URL".to_string()),
+                    error: Some(format!("Failed to parse UDP tracker URL: {}", e)),
                 };
             }
         };
@@ -212,23 +212,6 @@ impl AnnounceWorker {
         }
     }
 
-    fn parse_udp_url(url: &str) -> Option<SocketAddrV4> {
-        if !url.starts_with("udp://") {
-            return None;
-        }
-
-        let without_scheme = &url[6..];
-        let host_port = without_scheme.split('/').next()?;
-
-        host_port.to_socket_addrs().ok()?.find_map(|addr| {
-            if let std::net::SocketAddr::V4(v4) = addr {
-                Some(v4)
-            } else {
-                None
-            }
-        })
-    }
-
     fn handle_http_event(&mut self, event: HttpAnnounceEvent) -> Option<AnnounceResult> {
         match event {
             HttpAnnounceEvent::Completed { request_id, result } => {
@@ -266,10 +249,14 @@ impl AnnounceWorker {
                         error: Some(format!("Tracker failure: {}", failure)),
                     }
                 } else {
+                    let mut peers: Vec<SocketAddr> = Vec::new();
+                    peers.extend(response.peers.into_iter().map(SocketAddr::V4));
+                    peers.extend(response.peers6.into_iter().map(SocketAddr::V6));
+
                     AnnounceResult {
                         infohash_hex: task.infohash_hex,
                         success: true,
-                        peers: response.peers,
+                        peers,
                         interval: Some(response.interval),
                         error: None,
                     }

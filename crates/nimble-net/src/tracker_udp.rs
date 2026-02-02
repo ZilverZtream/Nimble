@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::time::{Duration, Instant};
 
 const PROTOCOL_ID: u64 = 0x41727101980;
@@ -39,7 +39,7 @@ pub struct UdpAnnounceResponse {
     pub interval: u32,
     pub leechers: u32,
     pub seeders: u32,
-    pub peers: Vec<SocketAddrV4>,
+    pub peers: Vec<SocketAddr>,
 }
 
 struct ConnectionState {
@@ -49,13 +49,18 @@ struct ConnectionState {
 
 pub struct UdpTracker {
     socket: UdpSocket,
-    addr: SocketAddrV4,
+    addr: SocketAddr,
     connection: Option<ConnectionState>,
 }
 
 impl UdpTracker {
-    pub fn new(addr: SocketAddrV4) -> Result<Self> {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
+    pub fn new(addr: SocketAddr) -> Result<Self> {
+        let bind_addr = match addr {
+            SocketAddr::V4(_) => "0.0.0.0:0",
+            SocketAddr::V6(_) => "[::]:0",
+        };
+
+        let socket = UdpSocket::bind(bind_addr)?;
         socket.set_read_timeout(Some(Duration::from_secs(BASE_TIMEOUT_SECS)))?;
         socket.set_write_timeout(Some(Duration::from_secs(BASE_TIMEOUT_SECS)))?;
         socket.connect(addr)?;
@@ -237,7 +242,7 @@ impl UdpTracker {
         }
     }
 
-    pub fn addr(&self) -> SocketAddrV4 {
+    pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 }
@@ -299,17 +304,35 @@ fn parse_announce_response(data: &[u8]) -> Result<UdpAnnounceResponse> {
     let seeders = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
 
     let peers_data = &data[20..];
-    if peers_data.len() % 6 != 0 {
-        return Err(anyhow!("peers data length is not a multiple of 6"));
-    }
-
     let mut peers = Vec::new();
-    for chunk in peers_data.chunks_exact(6) {
-        let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-        let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-        if port > 0 {
-            peers.push(SocketAddrV4::new(ip, port));
+
+    if peers_data.len() % 18 == 0 && peers_data.len() > 0 {
+        for chunk in peers_data.chunks_exact(18) {
+            let ip = Ipv6Addr::new(
+                u16::from_be_bytes([chunk[0], chunk[1]]),
+                u16::from_be_bytes([chunk[2], chunk[3]]),
+                u16::from_be_bytes([chunk[4], chunk[5]]),
+                u16::from_be_bytes([chunk[6], chunk[7]]),
+                u16::from_be_bytes([chunk[8], chunk[9]]),
+                u16::from_be_bytes([chunk[10], chunk[11]]),
+                u16::from_be_bytes([chunk[12], chunk[13]]),
+                u16::from_be_bytes([chunk[14], chunk[15]]),
+            );
+            let port = u16::from_be_bytes([chunk[16], chunk[17]]);
+            if port > 0 {
+                peers.push(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)));
+            }
         }
+    } else if peers_data.len() % 6 == 0 {
+        for chunk in peers_data.chunks_exact(6) {
+            let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+            let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+            if port > 0 {
+                peers.push(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+            }
+        }
+    } else {
+        return Err(anyhow!("peers data length is not a multiple of 6 or 18"));
     }
 
     Ok(UdpAnnounceResponse {
@@ -320,7 +343,7 @@ fn parse_announce_response(data: &[u8]) -> Result<UdpAnnounceResponse> {
     })
 }
 
-pub fn parse_udp_tracker_url(url: &str) -> Result<SocketAddrV4> {
+pub fn parse_udp_tracker_url(url: &str) -> Result<SocketAddr> {
     if !url.starts_with("udp://") {
         return Err(anyhow!("URL must start with udp://"));
     }
@@ -331,38 +354,70 @@ pub fn parse_udp_tracker_url(url: &str) -> Result<SocketAddrV4> {
         None => rest,
     };
 
-    let (host, port_str) = match host_port.rfind(':') {
-        Some(idx) => (&host_port[..idx], &host_port[idx + 1..]),
-        None => return Err(anyhow!("missing port in UDP tracker URL")),
-    };
+    if host_port.starts_with('[') {
+        let end_bracket = host_port.find(']')
+            .ok_or_else(|| anyhow!("missing closing bracket in IPv6 address"))?;
 
-    let port: u16 = port_str
-        .split('/')
-        .next()
-        .unwrap_or(port_str)
-        .parse()
-        .map_err(|_| anyhow!("invalid port"))?;
+        let ipv6_str = &host_port[1..end_bracket];
+        let port_part = &host_port[end_bracket + 1..];
 
-    let ip: Ipv4Addr = host
-        .parse()
-        .or_else(|_| resolve_hostname(host))
-        .map_err(|_| anyhow!("failed to resolve hostname: {}", host))?;
+        if !port_part.starts_with(':') {
+            return Err(anyhow!("missing port after IPv6 address"));
+        }
 
-    Ok(SocketAddrV4::new(ip, port))
+        let port_str = port_part[1..].split('/').next().unwrap_or(&port_part[1..]);
+        let port: u16 = port_str.parse()
+            .map_err(|_| anyhow!("invalid port"))?;
+
+        let ip: Ipv6Addr = ipv6_str.parse()
+            .map_err(|_| anyhow!("invalid IPv6 address: {}", ipv6_str))?;
+
+        Ok(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)))
+    } else {
+        let (host, port_str) = match host_port.rfind(':') {
+            Some(idx) => (&host_port[..idx], &host_port[idx + 1..]),
+            None => return Err(anyhow!("missing port in UDP tracker URL")),
+        };
+
+        let port: u16 = port_str
+            .split('/')
+            .next()
+            .unwrap_or(port_str)
+            .parse()
+            .map_err(|_| anyhow!("invalid port"))?;
+
+        if let Ok(ip) = host.parse::<Ipv4Addr>() {
+            Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+        } else if let Ok(ip) = host.parse::<Ipv6Addr>() {
+            Ok(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)))
+        } else {
+            resolve_hostname(host, port)
+        }
+    }
 }
 
-fn resolve_hostname(hostname: &str) -> Result<Ipv4Addr> {
+fn resolve_hostname(hostname: &str, port: u16) -> Result<SocketAddr> {
     use std::net::ToSocketAddrs;
 
-    let addrs: Vec<_> = format!("{}:0", hostname).to_socket_addrs()?.collect();
+    let addrs: Vec<_> = format!("{}:{}", hostname, port).to_socket_addrs()?.collect();
 
-    for addr in addrs {
-        if let std::net::SocketAddr::V4(v4) = addr {
-            return Ok(*v4.ip());
+    if addrs.is_empty() {
+        return Err(anyhow!("no addresses found for hostname: {}", hostname));
+    }
+
+    for addr in &addrs {
+        if let SocketAddr::V4(_) = addr {
+            return Ok(*addr);
         }
     }
 
-    Err(anyhow!("no IPv4 address found for hostname"))
+    for addr in &addrs {
+        if let SocketAddr::V6(_) = addr {
+            return Ok(*addr);
+        }
+    }
+
+    Err(anyhow!("no valid address found for hostname: {}", hostname))
 }
 
 pub fn announce(tracker_url: &str, request: &UdpAnnounceRequest) -> Result<UdpAnnounceResponse> {
@@ -428,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_announce_response() {
+    fn test_parse_announce_response_v4() {
         let mut data = vec![0u8; 32];
         data[8..12].copy_from_slice(&1800u32.to_be_bytes());
         data[12..16].copy_from_slice(&5u32.to_be_bytes());
@@ -444,27 +499,123 @@ mod tests {
         assert_eq!(response.leechers, 5);
         assert_eq!(response.seeders, 10);
         assert_eq!(response.peers.len(), 2);
-        assert_eq!(response.peers[0].ip(), &Ipv4Addr::new(127, 0, 0, 1));
-        assert_eq!(response.peers[0].port(), 6881);
-        assert_eq!(response.peers[1].ip(), &Ipv4Addr::new(192, 168, 1, 100));
-        assert_eq!(response.peers[1].port(), 6882);
+
+        match response.peers[0] {
+            SocketAddr::V4(addr) => {
+                assert_eq!(addr.ip(), &Ipv4Addr::new(127, 0, 0, 1));
+                assert_eq!(addr.port(), 6881);
+            }
+            _ => panic!("Expected IPv4 address"),
+        }
+
+        match response.peers[1] {
+            SocketAddr::V4(addr) => {
+                assert_eq!(addr.ip(), &Ipv4Addr::new(192, 168, 1, 100));
+                assert_eq!(addr.port(), 6882);
+            }
+            _ => panic!("Expected IPv4 address"),
+        }
     }
 
     #[test]
-    fn test_parse_udp_tracker_url() {
+    fn test_parse_announce_response_v6() {
+        let mut data = vec![0u8; 56];
+        data[8..12].copy_from_slice(&1800u32.to_be_bytes());
+        data[12..16].copy_from_slice(&5u32.to_be_bytes());
+        data[16..20].copy_from_slice(&10u32.to_be_bytes());
+
+        data[20..22].copy_from_slice(&0xfe80u16.to_be_bytes());
+        data[22..24].copy_from_slice(&0x0000u16.to_be_bytes());
+        data[24..26].copy_from_slice(&0x0000u16.to_be_bytes());
+        data[26..28].copy_from_slice(&0x0000u16.to_be_bytes());
+        data[28..30].copy_from_slice(&0x0000u16.to_be_bytes());
+        data[30..32].copy_from_slice(&0x0000u16.to_be_bytes());
+        data[32..34].copy_from_slice(&0x0000u16.to_be_bytes());
+        data[34..36].copy_from_slice(&0x0001u16.to_be_bytes());
+        data[36..38].copy_from_slice(&6881u16.to_be_bytes());
+
+        data[38..40].copy_from_slice(&0x2001u16.to_be_bytes());
+        data[40..42].copy_from_slice(&0x0db8u16.to_be_bytes());
+        data[42..44].copy_from_slice(&0x0000u16.to_be_bytes());
+        data[44..46].copy_from_slice(&0x0000u16.to_be_bytes());
+        data[46..48].copy_from_slice(&0x0000u16.to_be_bytes());
+        data[48..50].copy_from_slice(&0x0000u16.to_be_bytes());
+        data[50..52].copy_from_slice(&0x0000u16.to_be_bytes());
+        data[52..54].copy_from_slice(&0x0001u16.to_be_bytes());
+        data[54..56].copy_from_slice(&6882u16.to_be_bytes());
+
+        let response = parse_announce_response(&data).unwrap();
+
+        assert_eq!(response.interval, 1800);
+        assert_eq!(response.leechers, 5);
+        assert_eq!(response.seeders, 10);
+        assert_eq!(response.peers.len(), 2);
+
+        match response.peers[0] {
+            SocketAddr::V6(addr) => {
+                assert_eq!(addr.ip(), &Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+                assert_eq!(addr.port(), 6881);
+            }
+            _ => panic!("Expected IPv6 address"),
+        }
+
+        match response.peers[1] {
+            SocketAddr::V6(addr) => {
+                assert_eq!(addr.ip(), &Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1));
+                assert_eq!(addr.port(), 6882);
+            }
+            _ => panic!("Expected IPv6 address"),
+        }
+    }
+
+    #[test]
+    fn test_parse_udp_tracker_url_v4() {
         let result = parse_udp_tracker_url("udp://127.0.0.1:6969/announce");
         assert!(result.is_ok());
         let addr = result.unwrap();
-        assert_eq!(addr.ip(), &Ipv4Addr::new(127, 0, 0, 1));
-        assert_eq!(addr.port(), 6969);
+        match addr {
+            SocketAddr::V4(v4) => {
+                assert_eq!(v4.ip(), &Ipv4Addr::new(127, 0, 0, 1));
+                assert_eq!(v4.port(), 6969);
+            }
+            _ => panic!("Expected IPv4 address"),
+        }
     }
 
     #[test]
-    fn test_parse_udp_tracker_url_no_path() {
+    fn test_parse_udp_tracker_url_v4_no_path() {
         let result = parse_udp_tracker_url("udp://127.0.0.1:6969");
         assert!(result.is_ok());
         let addr = result.unwrap();
         assert_eq!(addr.port(), 6969);
+    }
+
+    #[test]
+    fn test_parse_udp_tracker_url_v6() {
+        let result = parse_udp_tracker_url("udp://[::1]:6969/announce");
+        assert!(result.is_ok());
+        let addr = result.unwrap();
+        match addr {
+            SocketAddr::V6(v6) => {
+                assert_eq!(v6.ip(), &Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
+                assert_eq!(v6.port(), 6969);
+            }
+            _ => panic!("Expected IPv6 address"),
+        }
+    }
+
+    #[test]
+    fn test_parse_udp_tracker_url_v6_full() {
+        let result = parse_udp_tracker_url("udp://[2001:db8::1]:6969");
+        assert!(result.is_ok());
+        let addr = result.unwrap();
+        match addr {
+            SocketAddr::V6(v6) => {
+                assert_eq!(v6.ip(), &Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+                assert_eq!(v6.port(), 6969);
+            }
+            _ => panic!("Expected IPv6 address"),
+        }
     }
 
     #[test]

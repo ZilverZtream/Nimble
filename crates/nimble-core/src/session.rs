@@ -13,7 +13,7 @@ use nimble_storage::disk::DiskStorage;
 use nimble_util::ids::peer_id_20;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::{SocketAddrV4, UdpSocket};
+use std::net::{SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -73,7 +73,7 @@ pub struct TrackerState {
     pub last_announce: Option<Instant>,
     pub next_announce: Option<Instant>,
     pub interval: Duration,
-    pub peers: Vec<SocketAddrV4>,
+    pub peers: Vec<SocketAddr>,
     pub consecutive_failures: u32,
     pub current_tier: usize,
     pub current_tracker_in_tier: usize,
@@ -1234,10 +1234,10 @@ impl Session {
 
             let result = match torrent {
                 TorrentEntry::Active(t) => {
-                    t.peer_manager.accept_incoming_tcp(connection, accepted_peer.addr)
+                    t.peer_manager.accept_incoming_tcp(connection, SocketAddr::V4(accepted_peer.addr))
                 }
                 TorrentEntry::Magnet(t) => {
-                    t.peer_manager.accept_incoming_tcp(connection, accepted_peer.addr)
+                    t.peer_manager.accept_incoming_tcp(connection, SocketAddr::V4(accepted_peer.addr))
                 }
             };
 
@@ -1288,10 +1288,10 @@ impl Session {
                         let any_conn = AnyPeerConnection::Utp(connection);
                         let result = match torrent {
                             TorrentEntry::Active(t) => {
-                                t.peer_manager.accept_incoming(any_conn, v4_addr)
+                                t.peer_manager.accept_incoming(any_conn, SocketAddr::V4(v4_addr))
                             }
                             TorrentEntry::Magnet(t) => {
-                                t.peer_manager.accept_incoming(any_conn, v4_addr)
+                                t.peer_manager.accept_incoming(any_conn, SocketAddr::V4(v4_addr))
                             }
                         };
 
@@ -1327,7 +1327,7 @@ impl Session {
         let mut buf = [0u8; 4096];
         let mut packets_processed = 0;
         const MAX_PACKETS_PER_TICK: usize = 100;
-        let mut all_discovered_peers: HashMap<[u8; 20], Vec<SocketAddrV4>> = HashMap::new();
+        let mut all_discovered_peers: HashMap<[u8; 20], Vec<SocketAddr>> = HashMap::new();
 
         loop {
             if packets_processed >= MAX_PACKETS_PER_TICK {
@@ -1345,11 +1345,11 @@ impl Session {
                                 let _ = socket.send_to(&response_payload, v4_addr);
                             }
 
-                            for (peer_addr, info_hash) in outcome.discovered_peers {
+                            for (peer_v4_addr, info_hash) in outcome.discovered_peers {
                                 all_discovered_peers
                                     .entry(info_hash)
                                     .or_insert_with(Vec::new)
-                                    .push(peer_addr);
+                                    .push(SocketAddr::V4(peer_v4_addr));
                             }
                         }
                     }
@@ -1393,7 +1393,7 @@ impl Session {
         let mut log_lines = Vec::new();
 
         // Phase 1: Collect all socket handles across all active torrents
-        let mut all_handles: Vec<(String, SocketAddrV4, RawSocket)> = Vec::new();
+        let mut all_handles: Vec<(String, SocketAddr, RawSocket)> = Vec::new();
 
         for (infohash, torrent) in self.torrents.iter() {
             let peer_manager = match torrent {
@@ -1438,8 +1438,8 @@ impl Session {
         };
 
         // Phase 3: Process only ready peers
-        let mut pex_updates: HashMap<String, (HashSet<SocketAddrV4>, HashSet<SocketAddrV4>)> = HashMap::new();
-        let mut peers_to_remove: Vec<(String, SocketAddrV4)> = Vec::new();
+        let mut pex_updates: HashMap<String, (HashSet<SocketAddr>, HashSet<SocketAddr>)> = HashMap::new();
+        let mut peers_to_remove: Vec<(String, SocketAddr)> = Vec::new();
 
         for idx in &ready_indices {
             let (infohash, addr, _) = &all_handles[*idx];

@@ -1,5 +1,5 @@
 use nimble_util::ids::dht_node_id_20;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 #[cfg(feature = "ipv6")]
 use std::net::SocketAddrV6;
@@ -73,6 +73,7 @@ pub struct DhtNode {
     routing6: RoutingTable6,
     tokens: TokenIssuer,
     peers: HashMap<[u8; 20], Vec<StoredPeer>>,
+    peers_lru: VecDeque<[u8; 20]>,
     rate_limiter: RateLimiter,
     pending_outbound: Vec<(SocketAddrV4, Vec<u8>)>,
     #[cfg(feature = "ipv6")]
@@ -123,6 +124,7 @@ impl DhtNode {
             routing6,
             tokens: TokenIssuer::new(),
             peers: HashMap::new(),
+            peers_lru: VecDeque::new(),
             rate_limiter: RateLimiter::new(RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_QUERIES),
             pending_outbound: Vec::new(),
             #[cfg(feature = "ipv6")]
@@ -352,7 +354,11 @@ impl DhtNode {
         std::mem::take(&mut self.pending_outbound6)
     }
 
-    pub fn announce_peer(&mut self, info_hash: [u8; 20]) {
+    pub fn announce_peer(&mut self, info_hash: [u8; 20], is_private: bool) {
+        if is_private {
+            return;
+        }
+
         let now_ms = Instant::now()
             .checked_duration_since(self.clock_start)
             .unwrap_or(Duration::from_millis(0))
@@ -532,10 +538,20 @@ impl DhtNode {
         let now_ms = self.elapsed_ms();
 
         if self.peers.len() >= MAX_INFOHASHES && !self.peers.contains_key(&info_hash) {
-            if let Some(key) = self.peers.keys().next().copied() {
-                self.peers.remove(&key);
+            if let Some(oldest_key) = self.peers_lru.pop_front() {
+                self.peers.remove(&oldest_key);
             }
         }
+
+        if self.peers.contains_key(&info_hash) {
+            if let Some(pos) = self.peers_lru.iter().position(|k| k == &info_hash) {
+                self.peers_lru.remove(pos);
+            }
+            self.peers_lru.push_back(info_hash);
+        } else {
+            self.peers_lru.push_back(info_hash);
+        }
+
         let entry = self.peers.entry(info_hash).or_insert_with(Vec::new);
         if let Some(existing) = entry.iter_mut().find(|p| p.addr == peer) {
             existing.stored_at_ms = now_ms;

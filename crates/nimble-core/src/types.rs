@@ -59,5 +59,5 @@ pub enum TorrentState {
     Error,
 }
 
-pub type CommandSender = mpsc::Sender<Command>;
+pub type CommandSender = mpsc::SyncSender<Command>;
 pub type EventReceiver = mpsc::Receiver<Event>;

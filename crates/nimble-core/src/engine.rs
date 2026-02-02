@@ -10,6 +10,8 @@ use crate::types::{Command, CommandSender, EngineStats, Event, EventReceiver};
 
 const TICK_INTERVAL_MS: u64 = 20;
 const STATS_UPDATE_INTERVAL_MS: u64 = 1000;
+const COMMAND_CHANNEL_SIZE: usize = 128;
+const EVENT_CHANNEL_SIZE: usize = 1024;
 
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -17,8 +19,8 @@ pub struct EngineHandle {
 }
 
 pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
-    let (evt_tx, evt_rx) = mpsc::channel::<Event>();
+    let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(COMMAND_CHANNEL_SIZE);
+    let (evt_tx, evt_rx) = mpsc::sync_channel::<Event>(EVENT_CHANNEL_SIZE);
 
     thread::spawn(move || {
         let _ = evt_tx.send(Event::Started);

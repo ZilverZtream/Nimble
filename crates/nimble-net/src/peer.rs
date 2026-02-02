@@ -411,7 +411,7 @@ impl PeerConnection {
         info_hash: [u8; 20],
         our_peer_id: [u8; 20],
         piece_count: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::with_options(addr, info_hash, our_peer_id, piece_count, 6881, None)
     }
 
@@ -420,7 +420,7 @@ impl PeerConnection {
         info_hash: [u8; 20],
         our_peer_id: [u8; 20],
         piece_count: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new(SocketAddr::V4(addr), info_hash, our_peer_id, piece_count)
     }
 
@@ -431,11 +431,12 @@ impl PeerConnection {
         piece_count: usize,
         listen_port: u16,
         metadata_size: Option<u32>,
-    ) -> Self {
+    ) -> Result<Self> {
         let now = Instant::now();
-        let socket = TcpSocket::new_for_addr(&addr).expect("failed to create socket");
+        let socket = TcpSocket::new_for_addr(&addr)
+            .context("failed to create socket")?;
         let mse_handshake = Some(MseHandshake::new_initiator(&info_hash));
-        PeerConnection {
+        Ok(PeerConnection {
             socket,
             addr,
             state: PeerState::Connecting,
@@ -477,7 +478,7 @@ impl PeerConnection {
             // RFC-101 Step 4: Initialize empty outbound queue
             outbound_queue: Vec::with_capacity(MAX_QUEUE_BYTES),
             queue_first_message_time: None,
-        }
+        })
     }
 
     #[cfg(target_os = "windows")]
@@ -849,7 +850,6 @@ impl PeerConnection {
                     self.handshake_phase = None;
                     self.recv_cursor = 0;
                     self.recv_state = RecvState::ReadingLength;
-                    self.socket.set_nonblocking(false)?;
 
                     if self.extensions_enabled {
                         self.init_extension_state();
@@ -1602,8 +1602,8 @@ impl AnyPeerConnection {
         info_hash: [u8; 20],
         our_peer_id: [u8; 20],
         piece_count: usize,
-    ) -> Self {
-        AnyPeerConnection::Tcp(PeerConnection::new(addr, info_hash, our_peer_id, piece_count))
+    ) -> Result<Self> {
+        Ok(AnyPeerConnection::Tcp(PeerConnection::new(addr, info_hash, our_peer_id, piece_count)?))
     }
 
     pub fn new_tcp_v4(
@@ -1611,8 +1611,8 @@ impl AnyPeerConnection {
         info_hash: [u8; 20],
         our_peer_id: [u8; 20],
         piece_count: usize,
-    ) -> Self {
-        AnyPeerConnection::Tcp(PeerConnection::new_v4(addr, info_hash, our_peer_id, piece_count))
+    ) -> Result<Self> {
+        Ok(AnyPeerConnection::Tcp(PeerConnection::new_v4(addr, info_hash, our_peer_id, piece_count)?))
     }
 
     pub fn new_utp(

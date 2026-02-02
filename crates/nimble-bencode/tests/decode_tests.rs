@@ -205,7 +205,7 @@ fn test_decode_torrent_like_structure() {
 
 #[test]
 fn test_string_length_cap() {
-    let huge_len = (8 * 1024 * 1024 + 1).to_string();
+    let huge_len = (64 * 1024 * 1024 + 1).to_string();
     let mut input = huge_len.into_bytes();
     input.push(b':');
 

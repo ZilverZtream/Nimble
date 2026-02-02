@@ -5,10 +5,6 @@
         license.workspace = true
         rust-version.workspace = true
 
-        [features]
-default = []
-sha1_crate = ["dep:sha1"]
-
         [dependencies]
         anyhow = { workspace = true }
         thiserror = { workspace = true }
@@ -17,4 +13,4 @@ sha1_crate = ["dep:sha1"]
   "Win32_System_SystemInformation",
   "Win32_Security_Cryptography",
 ] }
-sha1 = { workspace = true, optional = true }
+sha1 = { workspace = true }

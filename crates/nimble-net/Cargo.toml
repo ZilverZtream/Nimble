@@ -20,7 +20,7 @@ utp = []
   "Win32_Networking_WinHttp",
   "Win32_System_Threading",
 ] }
-nimble-util = { path = "../nimble-util", features = ["sha1_crate"] }
+nimble-util = { path = "../nimble-util" }
 nimble-bencode = { path = "../nimble-bencode" }
 num-bigint = { version = "0.4", default-features = false }
 fastrand = { version = "2", default-features = true }

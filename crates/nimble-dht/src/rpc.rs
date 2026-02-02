@@ -323,6 +323,54 @@ fn read_optional_int(value: Option<&Value<'_>>) -> Result<Option<i64>, RpcError>
     })
 }
 
+fn is_valid_peer_ip_v4(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+
+    if octets[0] == 0 {
+        return false;
+    }
+    if octets[0] == 10 {
+        return false;
+    }
+    if octets[0] == 127 {
+        return false;
+    }
+    if octets[0] == 172 && (octets[1] >= 16 && octets[1] <= 31) {
+        return false;
+    }
+    if octets[0] == 192 && octets[1] == 168 {
+        return false;
+    }
+    if octets[0] == 169 && octets[1] == 254 {
+        return false;
+    }
+    if octets[0] >= 224 {
+        return false;
+    }
+    if ip.is_broadcast() {
+        return false;
+    }
+
+    true
+}
+
+#[cfg(feature = "ipv6")]
+fn is_valid_peer_ip_v6(ip: &Ipv6Addr) -> bool {
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    if ip.is_unicast_link_local() || ip.is_unique_local() {
+        return false;
+    }
+
+    let segments = ip.segments();
+    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        return false;
+    }
+
+    true
+}
+
 fn parse_nodes(value: Option<&Value<'_>>) -> Result<Vec<NodeEntry>, RpcError> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -344,6 +392,9 @@ fn parse_nodes(value: Option<&Value<'_>>) -> Result<Vec<NodeEntry>, RpcError> {
         id.copy_from_slice(&chunk[..NODE_ID_LEN]);
         let ip = Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23]);
         let port = u16::from_be_bytes([chunk[24], chunk[25]]);
+        if port == 0 || !is_valid_peer_ip_v4(&ip) {
+            continue;
+        }
         nodes.push(NodeEntry {
             id,
             addr: SocketAddrV4::new(ip, port),
@@ -374,6 +425,9 @@ fn parse_peers(value: Option<&Value<'_>>) -> Result<Vec<SocketAddrV4>, RpcError>
         }
         let ip = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
         let port = u16::from_be_bytes([bytes[4], bytes[5]]);
+        if port == 0 || !is_valid_peer_ip_v4(&ip) {
+            continue;
+        }
         peers.push(SocketAddrV4::new(ip, port));
     }
 
@@ -404,6 +458,9 @@ fn parse_nodes6(value: Option<&Value<'_>>) -> Result<Vec<NodeEntry6>, RpcError> 
         ip_bytes.copy_from_slice(&chunk[20..36]);
         let ip = Ipv6Addr::from(ip_bytes);
         let port = u16::from_be_bytes([chunk[36], chunk[37]]);
+        if port == 0 || !is_valid_peer_ip_v6(&ip) {
+            continue;
+        }
         nodes.push(NodeEntry6 {
             id,
             addr: SocketAddrV6::new(ip, port, 0, 0),
@@ -437,6 +494,9 @@ fn parse_peers6(value: Option<&Value<'_>>) -> Result<Vec<SocketAddrV6>, RpcError
         ip_bytes.copy_from_slice(&bytes[0..16]);
         let ip = Ipv6Addr::from(ip_bytes);
         let port = u16::from_be_bytes([bytes[16], bytes[17]]);
+        if port == 0 || !is_valid_peer_ip_v6(&ip) {
+            continue;
+        }
         peers.push(SocketAddrV6::new(ip, port, 0, 0));
     }
 
@@ -724,6 +784,38 @@ mod tests {
         id
     }
 
+    fn node_bytes_v4(id: [u8; NODE_ID_LEN], ip: Ipv4Addr, port: u16) -> [u8; 26] {
+        let mut out = [0u8; 26];
+        out[..NODE_ID_LEN].copy_from_slice(&id);
+        out[20..24].copy_from_slice(&ip.octets());
+        out[24..26].copy_from_slice(&port.to_be_bytes());
+        out
+    }
+
+    fn peer_bytes_v4(ip: Ipv4Addr, port: u16) -> [u8; 6] {
+        let mut out = [0u8; 6];
+        out[0..4].copy_from_slice(&ip.octets());
+        out[4..6].copy_from_slice(&port.to_be_bytes());
+        out
+    }
+
+    #[cfg(feature = "ipv6")]
+    fn node_bytes_v6(id: [u8; NODE_ID_LEN], ip: Ipv6Addr, port: u16) -> [u8; 38] {
+        let mut out = [0u8; 38];
+        out[..NODE_ID_LEN].copy_from_slice(&id);
+        out[20..36].copy_from_slice(&ip.octets());
+        out[36..38].copy_from_slice(&port.to_be_bytes());
+        out
+    }
+
+    #[cfg(feature = "ipv6")]
+    fn peer_bytes_v6(ip: Ipv6Addr, port: u16) -> [u8; 18] {
+        let mut out = [0u8; 18];
+        out[0..16].copy_from_slice(&ip.octets());
+        out[16..18].copy_from_slice(&port.to_be_bytes());
+        out
+    }
+
     #[test]
     fn encode_decode_ping_query() {
         let query = Query {
@@ -785,5 +877,120 @@ mod tests {
         let encoded = encode_message(&Message::Response(response.clone()));
         let decoded = decode_message(&encoded).unwrap();
         assert_eq!(decoded, Message::Response(response));
+    }
+
+    #[test]
+    fn parse_nodes_filters_unroutable_and_zero_port() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&node_bytes_v4(
+            id_with_last_byte(1),
+            Ipv4Addr::new(192, 168, 1, 10),
+            6881,
+        ));
+        bytes.extend_from_slice(&node_bytes_v4(
+            id_with_last_byte(2),
+            Ipv4Addr::new(1, 2, 3, 4),
+            0,
+        ));
+        bytes.extend_from_slice(&node_bytes_v4(
+            id_with_last_byte(3),
+            Ipv4Addr::new(8, 8, 8, 8),
+            6881,
+        ));
+
+        let value = Value::ByteString(&bytes);
+        let nodes = parse_nodes(Some(&value)).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].addr,
+            SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 6881)
+        );
+    }
+
+    #[test]
+    fn parse_peers_filters_unroutable_and_zero_port() {
+        let peer1 = peer_bytes_v4(Ipv4Addr::new(10, 0, 0, 1), 6881);
+        let peer2 = peer_bytes_v4(Ipv4Addr::new(1, 1, 1, 1), 0);
+        let peer3 = peer_bytes_v4(Ipv4Addr::new(8, 8, 4, 4), 6881);
+        let peer_entries = vec![
+            Value::ByteString(&peer1),
+            Value::ByteString(&peer2),
+            Value::ByteString(&peer3),
+        ];
+        let value = Value::List(peer_entries);
+        let peers = parse_peers(Some(&value)).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0],
+            SocketAddrV4::new(Ipv4Addr::new(8, 8, 4, 4), 6881)
+        );
+    }
+
+    #[cfg(feature = "ipv6")]
+    #[test]
+    fn parse_nodes6_filters_unroutable_and_zero_port() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&node_bytes_v6(
+            id_with_last_byte(1),
+            Ipv6Addr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            6881,
+        ));
+        bytes.extend_from_slice(&node_bytes_v6(
+            id_with_last_byte(2),
+            Ipv6Addr::from([0x20, 0x01, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            0,
+        ));
+        bytes.extend_from_slice(&node_bytes_v6(
+            id_with_last_byte(3),
+            Ipv6Addr::from([0x20, 0x01, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+            6881,
+        ));
+
+        let value = Value::ByteString(&bytes);
+        let nodes = parse_nodes6(Some(&value)).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].addr,
+            SocketAddrV6::new(
+                Ipv6Addr::from([0x20, 0x01, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+                6881,
+                0,
+                0
+            )
+        );
+    }
+
+    #[cfg(feature = "ipv6")]
+    #[test]
+    fn parse_peers6_filters_unroutable_and_zero_port() {
+        let peer1 = peer_bytes_v6(
+            Ipv6Addr::from([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            6881,
+        );
+        let peer2 = peer_bytes_v6(
+            Ipv6Addr::from([0x20, 0x01, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            0,
+        );
+        let peer3 = peer_bytes_v6(
+            Ipv6Addr::from([0x20, 0x01, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+            6881,
+        );
+        let peer_entries = vec![
+            Value::ByteString(&peer1),
+            Value::ByteString(&peer2),
+            Value::ByteString(&peer3),
+        ];
+        let value = Value::List(peer_entries);
+        let peers = parse_peers6(Some(&value)).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0],
+            SocketAddrV6::new(
+                Ipv6Addr::from([0x20, 0x01, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+                6881,
+                0,
+                0
+            )
+        );
     }
 }

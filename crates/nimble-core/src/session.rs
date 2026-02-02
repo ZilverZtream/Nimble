@@ -541,6 +541,14 @@ impl Session {
                         TorrentMode::MultiFile { name, .. } => name.clone(),
                     };
 
+                    let trackers = if !state.info.announce_list.is_empty() {
+                        state.info.announce_list.iter().flat_map(|tier| tier.iter().cloned()).collect()
+                    } else if let Some(announce) = &state.info.announce {
+                        vec![announce.clone()]
+                    } else {
+                        Vec::new()
+                    };
+
                     TorrentInfo {
                         infohash: infohash.clone(),
                         name,
@@ -551,6 +559,8 @@ impl Session {
                         uploaded: state.stats.uploaded,
                         connected_peers: state.stats.connected_peers,
                         total_size: state.info.total_length,
+                        trackers,
+                        is_private: state.info.private,
                     }
                 }
                 TorrentEntry::Magnet(state) => {
@@ -568,10 +578,60 @@ impl Session {
                         uploaded: state.stats.uploaded,
                         connected_peers: state.stats.connected_peers,
                         total_size: 0,
+                        trackers: state.trackers.clone(),
+                        is_private: false,
                     }
                 }
             }
         }).collect()
+    }
+
+    pub fn get_magnet_link(&self, infohash: &str) -> Result<String> {
+        let torrent = self.torrents.get(infohash)
+            .ok_or_else(|| anyhow::anyhow!("torrent not found"))?;
+
+        let mut magnet = format!("magnet:?xt=urn:btih:{}", infohash);
+
+        match torrent {
+            TorrentEntry::Active(state) => {
+                let name = match &state.info.mode {
+                    nimble_bencode::torrent::TorrentMode::SingleFile { name, .. } => name.clone(),
+                    nimble_bencode::torrent::TorrentMode::MultiFile { name, .. } => name.clone(),
+                };
+                magnet.push_str(&format!("&dn={}", Self::url_encode(&name)));
+
+                for tracker in &state.info.announce_list.iter().flat_map(|tier| tier.iter()).collect::<Vec<_>>() {
+                    magnet.push_str(&format!("&tr={}", Self::url_encode(tracker)));
+                }
+                if state.info.announce_list.is_empty() {
+                    if let Some(announce) = &state.info.announce {
+                        magnet.push_str(&format!("&tr={}", Self::url_encode(announce)));
+                    }
+                }
+            }
+            TorrentEntry::Magnet(state) => {
+                for tracker in &state.trackers {
+                    magnet.push_str(&format!("&tr={}", Self::url_encode(tracker)));
+                }
+            }
+        }
+
+        Ok(magnet)
+    }
+
+    fn url_encode(s: &str) -> String {
+        let mut encoded = String::new();
+        for byte in s.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    encoded.push(byte as char);
+                }
+                _ => {
+                    encoded.push_str(&format!("%{:02X}", byte));
+                }
+            }
+        }
+        encoded
     }
 
     pub fn active_count(&self) -> u32 {

@@ -33,6 +33,8 @@ const IDM_REMOVE_DATA: usize = 2004;
 const IDM_RECHECK: usize = 2005;
 #[cfg(windows)]
 const IDM_OPEN_FOLDER: usize = 2006;
+#[cfg(windows)]
+const IDM_COPY_MAGNET: usize = 2007;
 
 #[cfg(windows)]
 const WM_UPDATE_LIST: u32 = WM_USER + 1;
@@ -346,11 +348,15 @@ unsafe fn show_context_menu(hwnd: HWND, data: &mut StatusWindowData) {
 
     AppendMenuW(hmenu, MF_STRING, pause_id, widestr(pause_text).as_ptr());
     AppendMenuW(hmenu, MF_SEPARATOR, 0, std::ptr::null());
-    AppendMenuW(hmenu, MF_STRING, IDM_REMOVE, widestr("Remove").as_ptr());
-    AppendMenuW(hmenu, MF_STRING, IDM_REMOVE_DATA, widestr("Remove + Delete Data").as_ptr());
+    AppendMenuW(hmenu, MF_STRING, IDM_OPEN_FOLDER, widestr("Open Containing Folder").as_ptr());
+    if !torrent.is_private {
+        AppendMenuW(hmenu, MF_STRING, IDM_COPY_MAGNET, widestr("Copy Magnet Link").as_ptr());
+    }
     AppendMenuW(hmenu, MF_SEPARATOR, 0, std::ptr::null());
     AppendMenuW(hmenu, MF_STRING, IDM_RECHECK, widestr("Force Recheck").as_ptr());
-    AppendMenuW(hmenu, MF_STRING, IDM_OPEN_FOLDER, widestr("Open Folder").as_ptr());
+    AppendMenuW(hmenu, MF_SEPARATOR, 0, std::ptr::null());
+    AppendMenuW(hmenu, MF_STRING, IDM_REMOVE, widestr("Remove").as_ptr());
+    AppendMenuW(hmenu, MF_STRING, IDM_REMOVE_DATA, widestr("Remove + Delete Data").as_ptr());
 
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
@@ -373,6 +379,7 @@ unsafe fn handle_context_menu_command(data: &mut StatusWindowData, cmd_id: usize
         IDM_REMOVE_DATA => Command::RemoveTorrentWithData { infohash },
         IDM_RECHECK => Command::ForceRecheck { infohash },
         IDM_OPEN_FOLDER => Command::OpenFolder { infohash },
+        IDM_COPY_MAGNET => Command::CopyMagnetLink { infohash },
         _ => return,
     };
 

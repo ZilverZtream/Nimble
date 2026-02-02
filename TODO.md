@@ -382,6 +382,23 @@ Leaving completed TODOs unchecked is considered a bug.
 - [ ] O4.4 Limits configuration
 - [ ] O4.5 Disk/cache settings
 
+## O5. Queue management
+- [ ] O5.1 Add priority field to Session torrents
+- [ ] O5.2 Implement move up/down queue operations
+- [ ] O5.3 Queue-based auto-start logic
+- [ ] O5.4 Context menu: Move Up Queue
+- [ ] O5.5 Context menu: Move Down Queue
+- [ ] O5.6 Context menu: Move to Top
+- [ ] O5.7 Context menu: Move to Bottom
+
+## O6. Per-torrent bandwidth limits
+- [ ] O6.1 Add per-torrent bandwidth limit fields
+- [ ] O6.2 Implement SetBandwidthLimit command
+- [ ] O6.3 Integrate with existing bandwidth limiter
+- [ ] O6.4 Bandwidth submenu in context menu
+- [ ] O6.5 UI for setting download limit
+- [ ] O6.6 UI for setting upload limit
+
 -------------------------------------------------------------------------------
 
 # P. Reliability & Testing

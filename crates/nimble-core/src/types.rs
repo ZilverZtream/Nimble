@@ -12,6 +12,7 @@ pub enum Command {
     RemoveTorrentWithData { infohash: String },
     ForceRecheck { infohash: String },
     OpenFolder { infohash: String },
+    CopyMagnetLink { infohash: String },
     GetTorrentList,
     Shutdown,
 }
@@ -22,6 +23,7 @@ pub enum Event {
     Stopped,
     Stats(EngineStats),
     TorrentList(Vec<TorrentInfo>),
+    MagnetLink(String),
     LogLine(String),
 }
 
@@ -44,6 +46,8 @@ pub struct TorrentInfo {
     pub uploaded: u64,
     pub connected_peers: u32,
     pub total_size: u64,
+    pub trackers: Vec<String>,
+    pub is_private: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

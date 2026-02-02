@@ -151,6 +151,18 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
                     }
                 },
 
+                Ok(Command::CopyMagnetLink { infohash }) => match session.get_magnet_link(&infohash) {
+                    Ok(magnet) => {
+                        let _ = evt_tx.send(Event::MagnetLink(magnet));
+                        let msg = format!("Copied magnet link for {}", &infohash[..8]);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to get magnet link for {}: {}", &infohash[..8], e);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                },
+
                 Ok(Command::GetTorrentList) => {
                     let torrent_list = session.get_torrent_list();
                     let _ = evt_tx.send(Event::TorrentList(torrent_list));

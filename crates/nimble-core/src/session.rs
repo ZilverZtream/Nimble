@@ -869,33 +869,6 @@ impl Session {
                             self.announce_worker.submit_announce(task);
                         }
                     }
-
-                    match torrent.peer_manager.tick(Some(&mut torrent.storage)) {
-                        Ok(peer_stats) => {
-                            torrent.stats.downloaded = peer_stats.downloaded;
-                            torrent.stats.uploaded = peer_stats.uploaded;
-                            torrent.stats.connected_peers = peer_stats.connected_peers;
-                            torrent.stats.pieces_completed = peer_stats.pieces_completed;
-                            torrent.stats.pieces_total = peer_stats.pieces_total;
-
-                            if peer_stats.connected_peers > 0 || peer_stats.pieces_completed > 0 {
-                                log_lines.push(format!(
-                                    "{}: {} peers, {}/{} pieces",
-                                    &infohash[..8],
-                                    peer_stats.connected_peers,
-                                    peer_stats.pieces_completed,
-                                    peer_stats.pieces_total
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            log_lines.push(format!(
-                                "Peer manager error for {}: {}",
-                                &infohash[..8],
-                                e
-                            ));
-                        }
-                    }
                 }
                 TorrentEntry::Magnet(torrent) => {
                     if torrent.paused {
@@ -925,53 +898,38 @@ impl Session {
                             self.announce_worker.submit_announce(task);
                         }
                     }
+                }
+            }
+        }
 
-                    match torrent.peer_manager.tick(None) {
-                        Ok(peer_stats) => {
-                            torrent.stats.downloaded = peer_stats.downloaded;
-                            torrent.stats.uploaded = peer_stats.uploaded;
-                            torrent.stats.connected_peers = peer_stats.connected_peers;
-                            torrent.stats.pieces_completed = 0;
-                            torrent.stats.pieces_total = 0;
+        log_lines.extend(self.tick_torrents_optimized());
 
-                            if peer_stats.connected_peers > 0 {
-                                log_lines.push(format!(
-                                    "{}: {} peers, waiting for metadata",
-                                    &infohash[..8],
-                                    peer_stats.connected_peers
-                                ));
-                            }
+        for (infohash, torrent) in self.torrents.iter_mut() {
+            if let TorrentEntry::Magnet(torrent) = torrent {
+                if torrent.paused {
+                    continue;
+                }
+
+                if let Some(metadata) = torrent.peer_manager.take_metadata() {
+                    match Self::promote_magnet(
+                        metadata,
+                        torrent,
+                        self.download_dir.clone(),
+                        self.peer_id,
+                    ) {
+                        Ok(active) => {
+                            upgrades.push((infohash.clone(), active));
+                            log_lines.push(format!(
+                                "{}: metadata received, starting torrent",
+                                &infohash[..8]
+                            ));
                         }
                         Err(e) => {
                             log_lines.push(format!(
-                                "Peer manager error for {}: {}",
+                                "Magnet metadata parse failed for {}: {}",
                                 &infohash[..8],
                                 e
                             ));
-                        }
-                    }
-
-                    if let Some(metadata) = torrent.peer_manager.take_metadata() {
-                        match Self::promote_magnet(
-                            metadata,
-                            torrent,
-                            self.download_dir.clone(),
-                            self.peer_id,
-                        ) {
-                            Ok(active) => {
-                                upgrades.push((infohash.clone(), active));
-                                log_lines.push(format!(
-                                    "{}: metadata received, starting torrent",
-                                    &infohash[..8]
-                                ));
-                            }
-                            Err(e) => {
-                                log_lines.push(format!(
-                                    "Magnet metadata parse failed for {}: {}",
-                                    &infohash[..8],
-                                    e
-                                ));
-                            }
                         }
                     }
                 }

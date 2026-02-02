@@ -76,7 +76,7 @@ impl DiskStorage {
         let mut pending_pieces = HashMap::new();
         let mut pending_memory = 0u64;
 
-        if let Ok(Some(checkpoint)) = checkpoint_manager.load_checkpoint() {
+        if let Ok(Some(checkpoint)) = checkpoint_manager.load_checkpoint(piece_count) {
             let piece_len = if checkpoint.piece_index == piece_count as u64 - 1 {
                 let remainder = info.total_length % info.piece_length;
                 if remainder > 0 {

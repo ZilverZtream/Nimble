@@ -88,7 +88,7 @@ impl CheckpointManager {
         Ok(())
     }
 
-    pub fn load_checkpoint(&mut self) -> Result<Option<PieceCheckpoint>> {
+    pub fn load_checkpoint(&mut self, piece_count: usize) -> Result<Option<PieceCheckpoint>> {
         self.checkpoint_file.seek(SeekFrom::Start(0))
             .context("seek failed")?;
 
@@ -119,6 +119,10 @@ impl CheckpointManager {
             .context("failed to read piece index")?;
         let piece_index = u64::from_le_bytes(piece_index_bytes);
 
+        if piece_index >= piece_count as u64 {
+            return Ok(None);
+        }
+
         let mut bitfield_len_bytes = [0u8; 4];
         self.checkpoint_file.read_exact(&mut bitfield_len_bytes)
             .context("failed to read bitfield length")?;
@@ -138,10 +142,22 @@ impl CheckpointManager {
         let mut data_len_bytes = [0u8; 8];
         self.checkpoint_file.read_exact(&mut data_len_bytes)
             .context("failed to read data length")?;
-        let _data_len = u64::from_le_bytes(data_len_bytes);
+        let data_len = u64::from_le_bytes(data_len_bytes);
 
         let data_offset = self.checkpoint_file.stream_position()
             .context("failed to get stream position")?;
+
+        if data_len > self.piece_length {
+            return Ok(None);
+        }
+
+        if data_offset.checked_add(data_len).is_none() {
+            return Ok(None);
+        }
+
+        if data_offset + data_len > file_len {
+            return Ok(None);
+        }
 
         Ok(Some(PieceCheckpoint {
             piece_index,
@@ -215,7 +231,7 @@ mod tests {
 
         manager.write_partial_piece(piece_index, &received_blocks, &test_data).unwrap();
 
-        let loaded = manager.load_checkpoint().unwrap();
+        let loaded = manager.load_checkpoint(100).unwrap();
         assert!(loaded.is_some());
 
         let checkpoint = loaded.unwrap();
@@ -250,7 +266,7 @@ mod tests {
 
         manager.clear().unwrap();
 
-        let loaded = manager.load_checkpoint().unwrap();
+        let loaded = manager.load_checkpoint(100).unwrap();
         assert!(loaded.is_none());
     }
 }

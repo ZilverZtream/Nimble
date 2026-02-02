@@ -6,6 +6,7 @@ use std::net::SocketAddrV6;
 use std::time::{Duration, Instant};
 
 use crate::bootstrap::default_bootstrap_nodes;
+use crate::peer_ip::{is_valid_peer_ip_v4, is_valid_peer_ip_v6};
 use crate::rpc::{
     decode_message, encode_message, ErrorMessage, Message, NodeEntry, Query, QueryKind, Response,
     ResponseKind, RpcError,
@@ -31,11 +32,18 @@ const REFRESH_BATCH_SIZE: usize = 8;
 const QUERY_TIMEOUT_MS: u64 = 5_000;
 const MAX_PENDING_QUERIES: usize = 256;
 const MAX_NODE_IDS_PER_IP: usize = 3;
+const NODE_ID_PER_IP_TTL_MS: u64 = 900_000;
 
 #[derive(Debug, Clone, Copy)]
 struct StoredPeer {
     addr: std::net::SocketAddr,
     stored_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct NodeIdEntry {
+    node_id: [u8; 20],
+    last_seen_ms: u64,
 }
 
 fn validate_node_id_for_ipv4v4(node_id: &[u8; 20], ip: &Ipv4Addr) -> bool {
@@ -66,31 +74,8 @@ fn validate_node_id_for_ipv4v4(node_id: &[u8; 20], ip: &Ipv4Addr) -> bool {
 }
 
 #[cfg(feature = "ipv6")]
-fn validate_node_id_for_ipv4v6(node_id: &[u8; 20], ip: &std::net::Ipv6Addr) -> bool {
-    let ip_bytes = ip.octets();
-    let rand = node_id[19];
-
-    let mut v = [0u8; 4];
-    v[0] = (ip_bytes[0] & 0x03) | ((rand & 0x07) << 5);
-    v[1] = (ip_bytes[1] & 0x0f) | ((rand >> 3) & 0x70);
-    v[2] = (ip_bytes[2] & 0x3f) | ((rand >> 5) & 0xc0);
-    v[3] = ip_bytes[3];
-
-    let expected_0 = ((v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | v[3] as u32)
-        .wrapping_mul(0x9E3779B1);
-    let expected_0 = ((expected_0 >> 24) & 0xFF) as u8;
-
-    let expected_1 = ((v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | v[3] as u32)
-        .wrapping_mul(0x9E3779B1)
-        .wrapping_add(0x12345678);
-    let expected_1 = ((expected_1 >> 24) & 0xFF) as u8;
-
-    let expected_2 = ((v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | v[3] as u32)
-        .wrapping_mul(0x9E3779B1)
-        .wrapping_add(0x23456789);
-    let expected_2 = ((expected_2 >> 24) & 0xFF) as u8;
-
-    node_id[0] == expected_0 && node_id[1] == expected_1 && node_id[2] == expected_2
+fn validate_node_id_for_ipv4v6(_node_id: &[u8; 20], _ip: &std::net::Ipv6Addr) -> bool {
+    true
 }
 
 pub struct DhtNode {
@@ -114,9 +99,9 @@ pub struct DhtNode {
     last_bootstrap_ms: Option<u64>,
     next_refresh_ms: u64,
     clock_start: Instant,
-    node_ids_per_ip_v4: HashMap<Ipv4Addr, HashSet<[u8; 20]>>,
+    node_ids_per_ip_v4: HashMap<Ipv4Addr, Vec<NodeIdEntry>>,
     #[cfg(feature = "ipv6")]
-    node_ids_per_ip_v6: HashMap<std::net::Ipv6Addr, HashSet<[u8; 20]>>,
+    node_ids_per_ip_v6: HashMap<std::net::Ipv6Addr, Vec<NodeIdEntry>>,
 }
 
 pub struct PacketOutcome {
@@ -215,6 +200,7 @@ impl DhtNode {
 
         self.cleanup_stale_queries(now_ms);
         self.prune_expired_peers();
+        self.cleanup_stale_node_ids(now_ms);
 
         if !self.bootstrap_done {
             if self.routing.is_empty() {
@@ -458,22 +444,25 @@ impl DhtNode {
             return false;
         }
 
+        let now_ms = self.elapsed_ms();
         let ip = *addr.ip();
-        let node_ids = self.node_ids_per_ip_v4.entry(ip).or_insert_with(HashSet::new);
+        let node_ids = self.node_ids_per_ip_v4.entry(ip).or_insert_with(Vec::new);
 
-        if !node_ids.contains(&id) && node_ids.len() >= MAX_NODE_IDS_PER_IP {
-            return false;
+        if let Some(entry) = node_ids.iter_mut().find(|e| e.node_id == id) {
+            entry.last_seen_ms = now_ms;
+        } else {
+            if node_ids.len() >= MAX_NODE_IDS_PER_IP {
+                return false;
+            }
+            node_ids.push(NodeIdEntry {
+                node_id: id,
+                last_seen_ms: now_ms,
+            });
         }
-
-        node_ids.insert(id);
 
         let result = self.routing.insert(id, addr);
 
         if let InsertResult::PingOldest { addr: ping_addr, id: ping_id } = result {
-            let now_ms = Instant::now()
-                .checked_duration_since(self.clock_start)
-                .unwrap_or(Duration::from_millis(0))
-                .as_millis() as u64;
             self.queue_verification_ping(ping_addr, ping_id, now_ms);
         }
 
@@ -482,18 +471,21 @@ impl DhtNode {
 
     #[cfg(feature = "ipv6")]
     pub fn observe_node6(&mut self, id: [u8; 20], addr: std::net::SocketAddrV6) -> bool {
-        if !validate_node_id_for_ipv4v6(&id, addr.ip()) {
-            return false;
-        }
-
+        let now_ms = self.elapsed_ms();
         let ip = *addr.ip();
-        let node_ids = self.node_ids_per_ip_v6.entry(ip).or_insert_with(HashSet::new);
+        let node_ids = self.node_ids_per_ip_v6.entry(ip).or_insert_with(Vec::new);
 
-        if !node_ids.contains(&id) && node_ids.len() >= MAX_NODE_IDS_PER_IP {
-            return false;
+        if let Some(entry) = node_ids.iter_mut().find(|e| e.node_id == id) {
+            entry.last_seen_ms = now_ms;
+        } else {
+            if node_ids.len() >= MAX_NODE_IDS_PER_IP {
+                return false;
+            }
+            node_ids.push(NodeIdEntry {
+                node_id: id,
+                last_seen_ms: now_ms,
+            });
         }
-
-        node_ids.insert(id);
 
         self.routing6.insert(id, addr);
         true
@@ -743,6 +735,14 @@ impl DhtNode {
                         message: b"invalid token".to_vec(),
                     }));
                 }
+                use crate::peer_ip::is_valid_peer_ip_v4;
+                if !is_valid_peer_ip_v4(source.ip()) {
+                    return Some(Message::Error(ErrorMessage {
+                        transaction_id: query.transaction_id.clone(),
+                        code: 203,
+                        message: b"invalid peer IP".to_vec(),
+                    }));
+                }
                 let peer_addr = std::net::SocketAddr::V4(SocketAddrV4::new(*source.ip(), peer_port));
                 self.store_peer(*info_hash, peer_addr);
                 Some(Message::Response(Response {
@@ -821,6 +821,14 @@ impl DhtNode {
                         message: b"invalid token".to_vec(),
                     }));
                 }
+                use crate::peer_ip::is_valid_peer_ip_v6;
+                if !is_valid_peer_ip_v6(source.ip()) {
+                    return Some(Message::Error(ErrorMessage {
+                        transaction_id: query.transaction_id.clone(),
+                        code: 203,
+                        message: b"invalid peer IP".to_vec(),
+                    }));
+                }
                 let peer_addr = std::net::SocketAddr::V6(SocketAddrV6::new(
                     *source.ip(),
                     peer_port,
@@ -895,6 +903,24 @@ impl DhtNode {
         let now_ms = self.elapsed_ms();
         for peers in self.peers.values_mut() {
             peers.retain(|p| now_ms.saturating_sub(p.stored_at_ms) < PEER_TTL_MS);
+        }
+
+        self.peers.retain(|_, peers| !peers.is_empty());
+        self.peers_lru.retain(|key| self.peers.contains_key(key));
+    }
+
+    fn cleanup_stale_node_ids(&mut self, now_ms: u64) {
+        for (_ip, entries) in self.node_ids_per_ip_v4.iter_mut() {
+            entries.retain(|entry| now_ms.saturating_sub(entry.last_seen_ms) < NODE_ID_PER_IP_TTL_MS);
+        }
+        self.node_ids_per_ip_v4.retain(|_, entries| !entries.is_empty());
+
+        #[cfg(feature = "ipv6")]
+        {
+            for (_ip, entries) in self.node_ids_per_ip_v6.iter_mut() {
+                entries.retain(|entry| now_ms.saturating_sub(entry.last_seen_ms) < NODE_ID_PER_IP_TTL_MS);
+            }
+            self.node_ids_per_ip_v6.retain(|_, entries| !entries.is_empty());
         }
     }
 }

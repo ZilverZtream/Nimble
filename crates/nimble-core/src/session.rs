@@ -141,7 +141,7 @@ impl Session {
                 None
             };
             #[cfg(not(feature = "ipv6"))]
-            let socket_v6 = None;
+            let socket_v6: Option<UdpSocket> = None;
             #[cfg(feature = "ipv6")]
             if socket_v6.is_some() {
                 eprintln!("DHT: IPv6 socket bound on port {}", listen_port);

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use nimble_util::bitfield::Bitfield;
+use std::collections::HashSet;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::{Duration, Instant};
 
@@ -17,7 +18,7 @@ use crate::ut_pex::parse_pex;
 
 const MAX_MESSAGE_LENGTH: u32 = 32768 + 9;
 const MAX_BITFIELD_BYTES: u32 = 262144;
-const MAX_EXTENDED_MESSAGE_LENGTH: u32 = 1024 * 1024;
+const MAX_EXTENDED_MESSAGE_LENGTH: u32 = 256 * 1024;
 const BLOCK_SIZE: u32 = 16384;
 const MAX_BLOCK_SIZE: u32 = 32768;
 const MAX_REASONABLE_PIECE_SIZE: u64 = 64 * 1024 * 1024;
@@ -29,6 +30,7 @@ const PEX_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const UT_METADATA_MAX_REQUESTS_PER_SECOND: usize = 10;
 const UT_METADATA_RATE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_PEX_PEERS_PER_MESSAGE: usize = 200;
+const UT_METADATA_MAX_IN_FLIGHT: usize = 3;
 
 /// RFC-101 Step 2: Fixed-size receive buffer for zero-allocation message parsing.
 /// 256KB is required to support bitfields up to MAX_BITFIELD_BYTES (262144).
@@ -391,6 +393,7 @@ pub struct PeerConnection {
     metadata_state: Option<UtMetadataState>,
     metadata: Option<Vec<u8>>,
     metadata_requests_sent: bool,
+    metadata_in_flight: HashSet<u32>,
     pex_added: Vec<SocketAddrV4>,
     pex_added_v6: Vec<SocketAddrV6>,
     pex_dropped: Vec<SocketAddrV4>,
@@ -480,6 +483,7 @@ impl PeerConnection {
             metadata_state: None,
             metadata: None,
             metadata_requests_sent: false,
+            metadata_in_flight: HashSet::new(),
             pex_added: Vec::new(),
             pex_added_v6: Vec::new(),
             pex_dropped: Vec::new(),
@@ -543,6 +547,7 @@ impl PeerConnection {
             metadata_state: None,
             metadata: None,
             metadata_requests_sent: false,
+            metadata_in_flight: HashSet::new(),
             pex_added: Vec::new(),
             pex_added_v6: Vec::new(),
             pex_dropped: Vec::new(),
@@ -611,6 +616,7 @@ impl PeerConnection {
             metadata_state: None,
             metadata: None,
             metadata_requests_sent: false,
+            metadata_in_flight: HashSet::new(),
             pex_added: Vec::new(),
             pex_added_v6: Vec::new(),
             pex_dropped: Vec::new(),
@@ -1252,8 +1258,12 @@ impl PeerConnection {
                     }
                 }
             }
-            UtMetadataMessageType::Reject => {}
+            UtMetadataMessageType::Reject => {
+                self.metadata_in_flight.remove(&msg.piece);
+            }
             UtMetadataMessageType::Data => {
+                self.metadata_in_flight.remove(&msg.piece);
+
                 if self.metadata_state.is_none() {
                     if let Some(size) = msg.total_size {
                         self.init_metadata_state(size);
@@ -1265,11 +1275,11 @@ impl PeerConnection {
                         if verify_metadata_infohash(&metadata, self.info_hash) {
                             self.metadata = Some(metadata);
                             self.metadata_state = None;
-                            self.metadata_requests_sent = true;
+                            self.metadata_in_flight.clear();
                         } else {
                             self.metadata_state = None;
                             self.metadata = None;
-                            self.metadata_requests_sent = false;
+                            self.metadata_in_flight.clear();
                         }
                     }
                 }
@@ -1279,22 +1289,27 @@ impl PeerConnection {
     }
 
     fn maybe_request_metadata(&mut self) {
-        if self.metadata_requests_sent {
-            return;
-        }
-
         let (state, ut_metadata_id) =
             match (self.metadata_state.as_ref(), self.ut_metadata_peer_id()) {
                 (Some(state), Some(id)) => (state, id),
                 _ => return,
             };
 
-        for piece in 0..state.piece_count() as u32 {
-            let payload = UtMetadataMessage::build_request(piece);
-            let _ = self.send_extended_message(ut_metadata_id, &payload);
-        }
+        let total_pieces = state.piece_count() as u32;
+        for piece in 0..total_pieces {
+            if self.metadata_in_flight.contains(&piece) {
+                continue;
+            }
 
-        self.metadata_requests_sent = true;
+            if self.metadata_in_flight.len() >= UT_METADATA_MAX_IN_FLIGHT {
+                break;
+            }
+
+            let payload = UtMetadataMessage::build_request(piece);
+            if self.send_extended_message(ut_metadata_id, &payload).is_ok() {
+                self.metadata_in_flight.insert(piece);
+            }
+        }
     }
 
     fn handle_ut_pex(&mut self, payload: &[u8]) {

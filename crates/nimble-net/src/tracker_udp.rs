@@ -13,6 +13,7 @@ const BASE_TIMEOUT_SECS: u64 = 15;
 const MAX_TIMEOUT_SECS: u64 = 3840;
 const MAX_RESPONSE_SIZE: usize = 2048;
 const CONNECTION_ID_LIFETIME: Duration = Duration::from_secs(60);
+const MAX_PEERS_FROM_TRACKER: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpTrackerEvent {
@@ -221,7 +222,7 @@ impl UdpTracker {
                         ));
                     }
 
-                    return parse_announce_response(&buf[..n]);
+                    return parse_announce_response(&buf[..n], self.addr.is_ipv4());
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     retries += 1;
@@ -292,7 +293,7 @@ fn build_announce_request(
     buf
 }
 
-fn parse_announce_response(data: &[u8]) -> Result<UdpAnnounceResponse> {
+fn parse_announce_response(data: &[u8], is_ipv4: bool) -> Result<UdpAnnounceResponse> {
     if data.len() < 20 {
         return Err(anyhow!("announce response too short"));
     }
@@ -308,16 +309,28 @@ fn parse_announce_response(data: &[u8]) -> Result<UdpAnnounceResponse> {
     let peers_data = &data[20..];
     let mut peers = Vec::new();
 
-    if peers_data.len() % 6 == 0 && peers_data.len() % 18 != 0 {
-        for chunk in peers_data.chunks_exact(6) {
+    if is_ipv4 {
+        if peers_data.len() % 6 != 0 {
+            return Err(anyhow!("IPv4 peers data length is not a multiple of 6"));
+        }
+        let peer_count = (peers_data.len() / 6).min(MAX_PEERS_FROM_TRACKER);
+        peers.reserve(peer_count);
+
+        for chunk in peers_data.chunks_exact(6).take(MAX_PEERS_FROM_TRACKER) {
             let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
             let port = u16::from_be_bytes([chunk[4], chunk[5]]);
             if port > 0 && is_valid_peer_ip_v4(&ip) {
                 peers.push(SocketAddr::V4(SocketAddrV4::new(ip, port)));
             }
         }
-    } else if peers_data.len() % 18 == 0 && peers_data.len() > 0 {
-        for chunk in peers_data.chunks_exact(18) {
+    } else {
+        if peers_data.len() % 18 != 0 {
+            return Err(anyhow!("IPv6 peers data length is not a multiple of 18"));
+        }
+        let peer_count = (peers_data.len() / 18).min(MAX_PEERS_FROM_TRACKER);
+        peers.reserve(peer_count);
+
+        for chunk in peers_data.chunks_exact(18).take(MAX_PEERS_FROM_TRACKER) {
             let ip = Ipv6Addr::new(
                 u16::from_be_bytes([chunk[0], chunk[1]]),
                 u16::from_be_bytes([chunk[2], chunk[3]]),
@@ -333,8 +346,6 @@ fn parse_announce_response(data: &[u8]) -> Result<UdpAnnounceResponse> {
                 peers.push(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)));
             }
         }
-    } else {
-        return Err(anyhow!("peers data length is not a multiple of 6 or 18"));
     }
 
     Ok(UdpAnnounceResponse {
@@ -495,7 +506,7 @@ mod tests {
         data[26..30].copy_from_slice(&[1, 1, 1, 1]);
         data[30..32].copy_from_slice(&6882u16.to_be_bytes());
 
-        let response = parse_announce_response(&data).unwrap();
+        let response = parse_announce_response(&data, true).unwrap();
 
         assert_eq!(response.interval, 1800);
         assert_eq!(response.leechers, 5);
@@ -538,7 +549,7 @@ mod tests {
         data[52..54].copy_from_slice(&0x8888u16.to_be_bytes());
         data[54..56].copy_from_slice(&6882u16.to_be_bytes());
 
-        let response = parse_announce_response(&data).unwrap();
+        let response = parse_announce_response(&data, false).unwrap();
 
         assert_eq!(response.interval, 1800);
         assert_eq!(response.leechers, 5);

@@ -75,12 +75,37 @@ const MAX_FILES_IN_TORRENT: usize = 50_000;
 const MAX_PATH_DEPTH: usize = 32;
 const MAX_TOTAL_PATH_LENGTH: usize = 4096;
 const MAX_TRACKERS: usize = 200;
+const MAX_BITFIELD_BYTES: usize = 262144;
+const MAX_PIECES: usize = MAX_BITFIELD_BYTES * 8;
+const MAX_TRACKER_URL_LENGTH: usize = 2048;
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
     "CON", "PRN", "AUX", "NUL",
     "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
     "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 const WINDOWS_FORBIDDEN_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
+
+fn validate_tracker_url(url: &str) -> Result<()> {
+    if url.len() > MAX_TRACKER_URL_LENGTH {
+        return Err(TorrentError::InvalidAnnounce);
+    }
+
+    if url.is_empty() {
+        return Err(TorrentError::InvalidAnnounce);
+    }
+
+    let lower = url.to_lowercase();
+    if !lower.starts_with("http://")
+        && !lower.starts_with("https://")
+        && !lower.starts_with("udp://")
+        && !lower.starts_with("wss://")
+        && !lower.starts_with("ws://")
+    {
+        return Err(TorrentError::InvalidAnnounce);
+    }
+
+    Ok(())
+}
 
 fn sanitize_path_component(component: &str) -> Result<String> {
     if component.is_empty() {
@@ -215,7 +240,11 @@ pub fn parse_torrent(data: &[u8]) -> Result<TorrentInfo> {
     let announce = root_dict
         .get(b"announce".as_ref())
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .map(|s| {
+            validate_tracker_url(s)?;
+            Ok::<String, TorrentError>(s.to_string())
+        })
+        .transpose()?;
 
     let mut announce_list = Vec::new();
     let mut total_tracker_count = if announce.is_some() { 1 } else { 0 };
@@ -233,6 +262,7 @@ pub fn parse_torrent(data: &[u8]) -> Result<TorrentInfo> {
                                     MAX_TRACKERS,
                                 ));
                             }
+                            validate_tracker_url(url)?;
                             tier_urls.push(url.to_string());
                         }
                     }
@@ -293,6 +323,13 @@ fn parse_info_dict_fields(
 
     if pieces_bytes.len() % 20 != 0 {
         return Err(TorrentError::InvalidPiecesLength);
+    }
+
+    let piece_count = pieces_bytes.len() / 20;
+    if piece_count > MAX_PIECES {
+        return Err(TorrentError::InvalidFieldType(
+            "piece count exceeds protocol bitfield limit",
+        ));
     }
 
     let mut pieces = Vec::new();
@@ -505,44 +542,48 @@ fn find_bencode_value_end(data: &[u8], start: usize) -> Option<usize> {
 
     let mut pos = start;
     let first = data[pos];
+    let mut depth = 0usize;
 
     match first {
         b'i' => {
-            pos += 1;
+            pos = pos.checked_add(1)?;
             while pos < data.len() && data[pos] != b'e' {
-                pos += 1;
+                pos = pos.checked_add(1)?;
             }
             if pos < data.len() {
-                Some(pos + 1)
+                pos.checked_add(1)
             } else {
                 None
             }
         }
         b'l' | b'd' => {
-            pos += 1;
-            let mut depth = 1;
+            pos = pos.checked_add(1)?;
+            depth = 1;
 
             while pos < data.len() && depth > 0 {
                 match data[pos] {
-                    b'l' | b'd' => depth += 1,
-                    b'e' => depth -= 1,
+                    b'l' | b'd' => depth = depth.checked_add(1)?,
+                    b'e' => depth = depth.saturating_sub(1),
                     b'i' => {
-                        pos += 1;
+                        pos = pos.checked_add(1)?;
                         while pos < data.len() && data[pos] != b'e' {
-                            pos += 1;
+                            pos = pos.checked_add(1)?;
                         }
                     }
                     b'0'..=b'9' => {
                         let len_start = pos;
                         while pos < data.len() && data[pos].is_ascii_digit() {
-                            pos += 1;
+                            pos = pos.checked_add(1)?;
                         }
                         if pos < data.len() && data[pos] == b':' {
                             let len_bytes = &data[len_start..pos];
                             if let Ok(len_str) = std::str::from_utf8(len_bytes) {
                                 if let Ok(len) = len_str.parse::<usize>() {
-                                    pos += 1;
-                                    pos += len;
+                                    pos = pos.checked_add(1)?;
+                                    pos = pos.checked_add(len)?;
+                                    if pos > data.len() {
+                                        return None;
+                                    }
                                     continue;
                                 }
                             }
@@ -551,7 +592,7 @@ fn find_bencode_value_end(data: &[u8], start: usize) -> Option<usize> {
                     }
                     _ => {}
                 }
-                pos += 1;
+                pos = pos.checked_add(1)?;
             }
 
             if depth == 0 {
@@ -563,14 +604,17 @@ fn find_bencode_value_end(data: &[u8], start: usize) -> Option<usize> {
         b'0'..=b'9' => {
             let len_start = pos;
             while pos < data.len() && data[pos].is_ascii_digit() {
-                pos += 1;
+                pos = pos.checked_add(1)?;
             }
             if pos < data.len() && data[pos] == b':' {
                 let len_bytes = &data[len_start..pos];
                 if let Ok(len_str) = std::str::from_utf8(len_bytes) {
                     if let Ok(len) = len_str.parse::<usize>() {
-                        pos += 1;
-                        pos += len;
+                        pos = pos.checked_add(1)?;
+                        pos = pos.checked_add(len)?;
+                        if pos > data.len() {
+                            return None;
+                        }
                         return Some(pos);
                     }
                 }

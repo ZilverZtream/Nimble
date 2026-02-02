@@ -159,7 +159,7 @@ mod windows_impl {
             socket
         }
 
-        fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+        pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
             let mut mode: u32 = if nonblocking { 1 } else { 0 };
             let result = unsafe {
                 WinSock::ioctlsocket(self.socket, FIONBIO as i32, &mut mode)
@@ -721,6 +721,13 @@ mod unix_impl {
 
         pub fn connect_v4(&mut self, addr: SocketAddrV4) -> Result<()> {
             self.connect(SocketAddr::V4(addr))
+        }
+
+        pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+            let stream = self.stream.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("not connected"))?;
+            stream.set_nonblocking(nonblocking)?;
+            Ok(())
         }
 
         pub fn send(&mut self, data: &[u8]) -> Result<usize> {

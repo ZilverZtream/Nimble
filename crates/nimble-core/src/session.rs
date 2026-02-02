@@ -1234,10 +1234,10 @@ impl Session {
 
             let result = match torrent {
                 TorrentEntry::Active(t) => {
-                    t.peer_manager.accept_incoming_tcp(connection, SocketAddr::V4(accepted_peer.addr))
+                    t.peer_manager.accept_incoming_tcp(connection, accepted_peer.addr)
                 }
                 TorrentEntry::Magnet(t) => {
-                    t.peer_manager.accept_incoming_tcp(connection, SocketAddr::V4(accepted_peer.addr))
+                    t.peer_manager.accept_incoming_tcp(connection, accepted_peer.addr)
                 }
             };
 

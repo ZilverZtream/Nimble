@@ -1,15 +1,17 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::*;
     use crate::encryption::{MseHandshake, MseStage, MSE_KEY_LENGTH};
+    use std::net::SocketAddrV6;
     use windows_sys::Win32::Networking::WinSock::{
-        self, AF_INET, FD_SET, FIONBIO, INVALID_SOCKET, IPPROTO_TCP, SOCKADDR_IN, SOCKET,
-        SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR, TIMEVAL, WSADATA,
+        self, AF_INET, AF_INET6, FD_SET, FIONBIO, INVALID_SOCKET, IPPROTO_TCP, IPPROTO_IPV6,
+        SOCKADDR_IN, SOCKADDR_IN6, SOCKET, SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR,
+        TIMEVAL, WSADATA, IPV6_V6ONLY,
     };
 
     const MAX_PENDING_HANDSHAKES: usize = 32;
@@ -54,7 +56,8 @@ mod windows_impl {
     }
 
     pub struct PeerListener {
-        socket: SOCKET,
+        socket_v4: SOCKET,
+        socket_v6: SOCKET,
         port: u16,
         pending: HashMap<SOCKET, PendingHandshake>,
         infohash_registry: HashMap<[u8; 20], InfoHashEntry>,
@@ -62,7 +65,7 @@ mod windows_impl {
 
     struct PendingHandshake {
         socket: SOCKET,
-        addr: SocketAddrV4,
+        addr: SocketAddr,
         started_at: Instant,
         recv_buffer: Vec<u8>,
         mse_state: Option<MseState>,
@@ -88,7 +91,7 @@ mod windows_impl {
 
     pub struct AcceptedPeer {
         pub socket: SOCKET,
-        pub addr: SocketAddrV4,
+        pub addr: SocketAddr,
         pub info_hash: [u8; 20],
         pub their_peer_id: [u8; 20],
         pub mse_handshake: Option<MseHandshake>,
@@ -99,12 +102,12 @@ mod windows_impl {
             init_winsock()?;
 
             let raw_socket = unsafe { WinSock::socket(AF_INET as i32, SOCK_STREAM, IPPROTO_TCP) };
-            let socket = SafeSocket::new(raw_socket)?;
+            let socket_v4 = SafeSocket::new(raw_socket)?;
 
             let enable: i32 = 1;
             unsafe {
                 WinSock::setsockopt(
-                    socket.raw(),
+                    socket_v4.raw(),
                     SOL_SOCKET,
                     SO_REUSEADDR,
                     &enable as *const i32 as *const u8,
@@ -112,7 +115,7 @@ mod windows_impl {
                 );
             }
 
-            let sockaddr = SOCKADDR_IN {
+            let sockaddr_v4 = SOCKADDR_IN {
                 sin_family: AF_INET,
                 sin_port: port.to_be(),
                 sin_addr: WinSock::IN_ADDR {
@@ -125,8 +128,8 @@ mod windows_impl {
 
             let bind_result = unsafe {
                 WinSock::bind(
-                    socket.raw(),
-                    &sockaddr as *const SOCKADDR_IN as *const WinSock::SOCKADDR,
+                    socket_v4.raw(),
+                    &sockaddr_v4 as *const SOCKADDR_IN as *const WinSock::SOCKADDR,
                     std::mem::size_of::<SOCKADDR_IN>() as i32,
                 )
             };
@@ -135,17 +138,75 @@ mod windows_impl {
                 return Err(anyhow!("bind() failed: {}", get_last_error()));
             }
 
-            let listen_result = unsafe { WinSock::listen(socket.raw(), 16) };
+            let assigned_port = if port == 0 {
+                get_bound_port_v4(socket_v4.raw())?
+            } else {
+                port
+            };
 
-            if listen_result == SOCKET_ERROR {
-                return Err(anyhow!("listen() failed: {}", get_last_error()));
+            let raw_socket_v6 = unsafe { WinSock::socket(AF_INET6 as i32, SOCK_STREAM, IPPROTO_TCP) };
+            let socket_v6 = SafeSocket::new(raw_socket_v6)?;
+
+            unsafe {
+                WinSock::setsockopt(
+                    socket_v6.raw(),
+                    SOL_SOCKET,
+                    SO_REUSEADDR,
+                    &enable as *const i32 as *const u8,
+                    std::mem::size_of::<i32>() as i32,
+                );
             }
 
-            set_nonblocking(socket.raw())?;
+            let v6_only: i32 = 1;
+            unsafe {
+                WinSock::setsockopt(
+                    socket_v6.raw(),
+                    IPPROTO_IPV6 as i32,
+                    IPV6_V6ONLY as i32,
+                    &v6_only as *const i32 as *const u8,
+                    std::mem::size_of::<i32>() as i32,
+                );
+            }
+
+            let sockaddr_v6 = SOCKADDR_IN6 {
+                sin6_family: AF_INET6,
+                sin6_port: assigned_port.to_be(),
+                sin6_flowinfo: 0,
+                sin6_addr: WinSock::IN6_ADDR {
+                    u: WinSock::IN6_ADDR_0 { Byte: [0; 16] },
+                },
+                sin6_scope_id: 0,
+            };
+
+            let bind_v6_result = unsafe {
+                WinSock::bind(
+                    socket_v6.raw(),
+                    &sockaddr_v6 as *const SOCKADDR_IN6 as *const WinSock::SOCKADDR,
+                    std::mem::size_of::<SOCKADDR_IN6>() as i32,
+                )
+            };
+
+            if bind_v6_result == SOCKET_ERROR {
+                return Err(anyhow!("bind(v6) failed: {}", get_last_error()));
+            }
+
+            let listen_result = unsafe { WinSock::listen(socket_v4.raw(), 16) };
+            if listen_result == SOCKET_ERROR {
+                return Err(anyhow!("listen(v4) failed: {}", get_last_error()));
+            }
+
+            let listen_v6_result = unsafe { WinSock::listen(socket_v6.raw(), 16) };
+            if listen_v6_result == SOCKET_ERROR {
+                return Err(anyhow!("listen(v6) failed: {}", get_last_error()));
+            }
+
+            set_nonblocking(socket_v4.raw())?;
+            set_nonblocking(socket_v6.raw())?;
 
             Ok(PeerListener {
-                socket: socket.into_raw(),
-                port,
+                socket_v4: socket_v4.into_raw(),
+                socket_v6: socket_v6.into_raw(),
+                port: assigned_port,
                 pending: HashMap::new(),
                 infohash_registry: HashMap::new(),
             })
@@ -180,43 +241,106 @@ mod windows_impl {
         }
 
         fn accept_new_connections(&mut self) -> Result<()> {
-            while self.pending.len() < MAX_PENDING_HANDSHAKES {
-                let mut addr: SOCKADDR_IN = unsafe { std::mem::zeroed() };
-                let mut addr_len = std::mem::size_of::<SOCKADDR_IN>() as i32;
-
-                let client = unsafe {
-                    WinSock::accept(
-                        self.socket,
-                        &mut addr as *mut SOCKADDR_IN as *mut WinSock::SOCKADDR,
-                        &mut addr_len,
-                    )
-                };
-
-                if client == INVALID_SOCKET {
+            loop {
+                if self.pending.len() >= MAX_PENDING_HANDSHAKES {
                     break;
                 }
 
-                set_nonblocking(client)?;
+                let mut accepted_any = false;
+                if let Some((client, peer_addr)) = self.accept_v4()? {
+                    self.insert_pending(client, peer_addr);
+                    accepted_any = true;
+                }
 
-                let ip_bytes = unsafe { addr.sin_addr.S_un.S_addr.to_ne_bytes() };
-                let ip = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
-                let port = u16::from_be(addr.sin_port);
-                let peer_addr = SocketAddrV4::new(ip, port);
+                if self.pending.len() >= MAX_PENDING_HANDSHAKES {
+                    break;
+                }
 
-                self.pending.insert(
-                    client,
-                    PendingHandshake {
-                        socket: client,
-                        addr: peer_addr,
-                        started_at: Instant::now(),
-                        recv_buffer: Vec::with_capacity(HANDSHAKE_LENGTH),
-                        mse_state: None,
-                        force_mse: false,
-                    },
-                );
+                if let Some((client, peer_addr)) = self.accept_v6()? {
+                    self.insert_pending(client, peer_addr);
+                    accepted_any = true;
+                }
+
+                if !accepted_any {
+                    break;
+                }
             }
 
             Ok(())
+        }
+
+        fn accept_v4(&self) -> Result<Option<(SOCKET, SocketAddr)>> {
+            let mut addr: SOCKADDR_IN = unsafe { std::mem::zeroed() };
+            let mut addr_len = std::mem::size_of::<SOCKADDR_IN>() as i32;
+
+            let client = unsafe {
+                WinSock::accept(
+                    self.socket_v4,
+                    &mut addr as *mut SOCKADDR_IN as *mut WinSock::SOCKADDR,
+                    &mut addr_len,
+                )
+            };
+
+            if client == INVALID_SOCKET {
+                let err = get_last_error();
+                if err != WSAEWOULDBLOCK && err != WSAEINPROGRESS {
+                    return Err(anyhow!("accept(v4) failed: {}", err));
+                }
+                return Ok(None);
+            }
+
+            set_nonblocking(client)?;
+
+            let ip_bytes = unsafe { addr.sin_addr.S_un.S_addr.to_ne_bytes() };
+            let ip = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+            let port = u16::from_be(addr.sin_port);
+            let peer_addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
+
+            Ok(Some((client, peer_addr)))
+        }
+
+        fn accept_v6(&self) -> Result<Option<(SOCKET, SocketAddr)>> {
+            let mut addr: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
+            let mut addr_len = std::mem::size_of::<SOCKADDR_IN6>() as i32;
+
+            let client = unsafe {
+                WinSock::accept(
+                    self.socket_v6,
+                    &mut addr as *mut SOCKADDR_IN6 as *mut WinSock::SOCKADDR,
+                    &mut addr_len,
+                )
+            };
+
+            if client == INVALID_SOCKET {
+                let err = get_last_error();
+                if err != WSAEWOULDBLOCK && err != WSAEINPROGRESS {
+                    return Err(anyhow!("accept(v6) failed: {}", err));
+                }
+                return Ok(None);
+            }
+
+            set_nonblocking(client)?;
+
+            let ip_bytes = unsafe { addr.sin6_addr.u.Byte };
+            let ip = std::net::Ipv6Addr::from(ip_bytes);
+            let port = u16::from_be(addr.sin6_port);
+            let peer_addr = SocketAddr::V6(SocketAddrV6::new(ip, port, addr.sin6_flowinfo, addr.sin6_scope_id));
+
+            Ok(Some((client, peer_addr)))
+        }
+
+        fn insert_pending(&mut self, client: SOCKET, peer_addr: SocketAddr) {
+            self.pending.insert(
+                client,
+                PendingHandshake {
+                    socket: client,
+                    addr: peer_addr,
+                    started_at: Instant::now(),
+                    recv_buffer: Vec::with_capacity(HANDSHAKE_LENGTH),
+                    mse_state: None,
+                    force_mse: false,
+                },
+            );
         }
 
         fn process_pending_handshakes(&mut self, accepted: &mut Vec<AcceptedPeer>) -> Result<()> {
@@ -552,11 +676,18 @@ mod windows_impl {
                 }
             }
 
-            if self.socket != INVALID_SOCKET {
+            if self.socket_v4 != INVALID_SOCKET {
                 unsafe {
-                    WinSock::closesocket(self.socket);
+                    WinSock::closesocket(self.socket_v4);
                 }
-                self.socket = INVALID_SOCKET;
+                self.socket_v4 = INVALID_SOCKET;
+            }
+
+            if self.socket_v6 != INVALID_SOCKET {
+                unsafe {
+                    WinSock::closesocket(self.socket_v6);
+                }
+                self.socket_v6 = INVALID_SOCKET;
             }
         }
     }
@@ -579,6 +710,22 @@ mod windows_impl {
 
     fn get_last_error() -> i32 {
         unsafe { WinSock::WSAGetLastError() }
+    }
+
+    fn get_bound_port_v4(socket: SOCKET) -> Result<u16> {
+        let mut addr: SOCKADDR_IN = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<SOCKADDR_IN>() as i32;
+        let result = unsafe {
+            WinSock::getsockname(
+                socket,
+                &mut addr as *mut SOCKADDR_IN as *mut WinSock::SOCKADDR,
+                &mut len,
+            )
+        };
+        if result == SOCKET_ERROR {
+            return Err(anyhow!("getsockname() failed: {}", get_last_error()));
+        }
+        Ok(u16::from_be(addr.sin_port))
     }
 
     static WINSOCK_INIT: std::sync::Once = std::sync::Once::new();
@@ -611,6 +758,7 @@ mod unix_impl {
     use crate::encryption::{MseHandshake, MseStage, MSE_KEY_LENGTH};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::os::unix::io::FromRawFd;
 
     const MAX_PENDING_HANDSHAKES: usize = 32;
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -621,7 +769,8 @@ mod unix_impl {
     const MAX_MSE_INFOHASH_ATTEMPTS: usize = 8;
 
     pub struct PeerListener {
-        listener: TcpListener,
+        listener_v4: TcpListener,
+        listener_v6: TcpListener,
         port: u16,
         pending: HashMap<usize, PendingHandshake>,
         infohash_registry: HashMap<[u8; 20], InfoHashEntry>,
@@ -630,7 +779,7 @@ mod unix_impl {
 
     struct PendingHandshake {
         stream: TcpStream,
-        addr: SocketAddrV4,
+        addr: SocketAddr,
         started_at: Instant,
         recv_buffer: Vec<u8>,
         mse_state: Option<MseState>,
@@ -656,7 +805,7 @@ mod unix_impl {
 
     pub struct AcceptedPeer {
         pub stream: TcpStream,
-        pub addr: SocketAddrV4,
+        pub addr: SocketAddr,
         pub info_hash: [u8; 20],
         pub their_peer_id: [u8; 20],
         pub mse_handshake: Option<MseHandshake>,
@@ -665,12 +814,16 @@ mod unix_impl {
     impl PeerListener {
         pub fn new(port: u16) -> Result<Self> {
             let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
-            let listener = TcpListener::bind(addr)?;
-            listener.set_nonblocking(true)?;
+            let listener_v4 = TcpListener::bind(addr)?;
+            listener_v4.set_nonblocking(true)?;
+            let assigned_port = listener_v4.local_addr()?.port();
+            let listener_v6 = bind_v6_listener(assigned_port)?;
+            listener_v6.set_nonblocking(true)?;
 
             Ok(PeerListener {
-                listener,
-                port,
+                listener_v4,
+                listener_v6,
+                port: assigned_port,
                 pending: HashMap::new(),
                 infohash_registry: HashMap::new(),
                 next_id: 0,
@@ -706,32 +859,47 @@ mod unix_impl {
         }
 
         fn accept_new_connections(&mut self) -> Result<()> {
-            while self.pending.len() < MAX_PENDING_HANDSHAKES {
-                match self.listener.accept() {
-                    Ok((stream, addr)) => {
-                        stream.set_nonblocking(true)?;
+            loop {
+                if self.pending.len() >= MAX_PENDING_HANDSHAKES {
+                    break;
+                }
 
-                        if let std::net::SocketAddr::V4(v4_addr) = addr {
-                            let id = self.next_id;
-                            self.next_id += 1;
-                            self.pending.insert(
-                                id,
-                                PendingHandshake {
-                                    stream,
-                                    addr: v4_addr,
-                                    started_at: Instant::now(),
-                                    recv_buffer: Vec::with_capacity(HANDSHAKE_LENGTH),
-                                    mse_state: None,
-                                    force_mse: false,
-                                },
-                            );
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+                let mut accepted_any = false;
+                if let Some((stream, addr)) = accept_stream(&self.listener_v4)? {
+                    self.insert_pending(stream, addr);
+                    accepted_any = true;
+                }
+
+                if self.pending.len() >= MAX_PENDING_HANDSHAKES {
+                    break;
+                }
+
+                if let Some((stream, addr)) = accept_stream(&self.listener_v6)? {
+                    self.insert_pending(stream, addr);
+                    accepted_any = true;
+                }
+
+                if !accepted_any {
+                    break;
                 }
             }
             Ok(())
+        }
+
+        fn insert_pending(&mut self, stream: TcpStream, addr: SocketAddr) {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.pending.insert(
+                id,
+                PendingHandshake {
+                    stream,
+                    addr,
+                    started_at: Instant::now(),
+                    recv_buffer: Vec::with_capacity(HANDSHAKE_LENGTH),
+                    mse_state: None,
+                    force_mse: false,
+                },
+            );
         }
 
         fn process_pending_handshakes(&mut self, accepted: &mut Vec<AcceptedPeer>) -> Result<()> {
@@ -1009,6 +1177,66 @@ mod unix_impl {
             self.pending.clear();
         }
     }
+
+    fn accept_stream(listener: &TcpListener) -> Result<Option<(TcpStream, SocketAddr)>> {
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                stream.set_nonblocking(true)?;
+                Ok(Some((stream, addr)))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(anyhow!("accept failed: {}", e)),
+        }
+    }
+
+    fn bind_v6_listener(port: u16) -> Result<TcpListener> {
+        use libc::{bind, close, listen, setsockopt, sockaddr_in6, socket, AF_INET6, IPV6_V6ONLY};
+
+        unsafe {
+            let fd = socket(AF_INET6, libc::SOCK_STREAM, 0);
+            if fd < 0 {
+                return Err(anyhow!("socket(AF_INET6) failed"));
+            }
+
+            let v6_only: i32 = 1;
+            let set_result = setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                IPV6_V6ONLY,
+                &v6_only as *const i32 as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            );
+            if set_result != 0 {
+                close(fd);
+                return Err(anyhow!("setsockopt(IPV6_V6ONLY) failed"));
+            }
+
+            let addr = sockaddr_in6 {
+                sin6_family: AF_INET6 as libc::sa_family_t,
+                sin6_port: port.to_be(),
+                sin6_flowinfo: 0,
+                sin6_addr: libc::in6_addr { s6_addr: [0; 16] },
+                sin6_scope_id: 0,
+            };
+
+            let bind_result = bind(
+                fd,
+                &addr as *const sockaddr_in6 as *const libc::sockaddr,
+                std::mem::size_of::<sockaddr_in6>() as libc::socklen_t,
+            );
+            if bind_result != 0 {
+                close(fd);
+                return Err(anyhow!("bind(AF_INET6) failed"));
+            }
+
+            if listen(fd, 16) != 0 {
+                close(fd);
+                return Err(anyhow!("listen(AF_INET6) failed"));
+            }
+
+            Ok(TcpListener::from_raw_fd(fd))
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1020,6 +1248,9 @@ pub use unix_impl::{AcceptedPeer, PeerListener};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, TcpStream};
+    use std::thread;
 
     #[test]
     fn test_listener_creation() {
@@ -1033,5 +1264,39 @@ mod tests {
         let info_hash = [1u8; 20];
         let peer_id = [2u8; 20];
         listener.register_infohash(info_hash, peer_id, 100);
+    }
+
+    #[test]
+    fn test_accept_ipv6_peer() {
+        let mut listener = PeerListener::new(0).unwrap();
+        let info_hash = [3u8; 20];
+        let peer_id = [4u8; 20];
+        listener.register_infohash(info_hash, peer_id, 1);
+
+        let port = listener.port();
+        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0));
+        let mut stream = TcpStream::connect(addr).unwrap();
+
+        let mut handshake = Vec::with_capacity(68);
+        handshake.push(19);
+        handshake.extend_from_slice(b"BitTorrent protocol");
+        handshake.extend_from_slice(&[0u8; 8]);
+        handshake.extend_from_slice(&info_hash);
+        handshake.extend_from_slice(&peer_id);
+        stream.write_all(&handshake).unwrap();
+
+        let start = Instant::now();
+        let mut accepted_v6 = None;
+        while start.elapsed() < Duration::from_secs(1) {
+            if let Ok(accepted) = listener.poll() {
+                accepted_v6 = accepted.into_iter().find(|peer| matches!(peer.addr, SocketAddr::V6(_)));
+                if accepted_v6.is_some() {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(accepted_v6.is_some());
     }
 }

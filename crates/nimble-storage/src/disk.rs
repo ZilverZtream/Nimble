@@ -1,20 +1,18 @@
 use anyhow::{Context, Result};
 use nimble_bencode::torrent::TorrentInfo;
 use nimble_util::bitfield::Bitfield;
-use std::collections::{HashMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::hasher::{HashVerifier, VerifyRequest};
 use crate::layout::FileLayout;
 use crate::resume::ResumeData;
 use crate::checkpoint::CheckpointManager;
+use crate::disk_worker::{DiskWorker, DiskRequest, DiskResult};
 
 const BLOCK_SIZE: u32 = 16384;
 const RESUME_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const STALE_PIECE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-const MAX_OPEN_FILE_HANDLES: usize = 128;
 
 pub struct DiskStorage {
     layout: FileLayout,
@@ -22,14 +20,16 @@ pub struct DiskStorage {
     total_length: u64,
     pieces: Vec<[u8; 20]>,
     bitfield: Bitfield,
-    file_handles: HashMap<usize, File>,
-    file_lru: VecDeque<usize>,
     pending_pieces: HashMap<u64, PendingPiece>,
     verifying_pieces: HashMap<u64, ()>,
+    writing_pieces: HashMap<u64, ()>,
     failed_pieces: Vec<u64>,
     info_hash: [u8; 20],
     download_dir: PathBuf,
     hasher: HashVerifier,
+    disk_worker: DiskWorker,
+    next_disk_request_id: u64,
+    pending_read_requests: HashMap<u64, (u64, u32, u32)>,
     last_resume_save: std::time::Instant,
     resume_dirty: bool,
     checkpoint_manager: CheckpointManager,
@@ -96,20 +96,24 @@ impl DiskStorage {
             }
         }
 
+        let disk_worker = DiskWorker::new(layout.clone(), info.piece_length, info.total_length);
+
         Ok(DiskStorage {
             layout,
             piece_length: info.piece_length,
             total_length: info.total_length,
             pieces: info.pieces.clone(),
             bitfield,
-            file_handles: HashMap::new(),
-            file_lru: VecDeque::new(),
             pending_pieces,
             verifying_pieces: HashMap::new(),
+            writing_pieces: HashMap::new(),
             failed_pieces: Vec::new(),
             info_hash,
             download_dir,
             hasher: HashVerifier::new(),
+            disk_worker,
+            next_disk_request_id: 0,
+            pending_read_requests: HashMap::new(),
             last_resume_save: std::time::Instant::now(),
             resume_dirty: false,
             checkpoint_manager,
@@ -204,7 +208,7 @@ impl DiskStorage {
         }
     }
 
-    pub fn read_block(&mut self, piece_index: u64, block_offset: u32, length: u32) -> Result<Vec<u8>> {
+    pub fn request_read_block(&mut self, piece_index: u64, block_offset: u32, length: u32, peer_addr: Option<std::net::SocketAddrV4>) -> Result<u64> {
         if piece_index >= self.pieces.len() as u64 {
             anyhow::bail!("invalid piece index: {}", piece_index);
         }
@@ -236,34 +240,50 @@ impl DiskStorage {
             anyhow::bail!("requested length {} exceeds max block size", length);
         }
 
-        let global_start = piece_index * self.piece_length + block_offset as u64;
-        let global_end = global_start + length as u64;
+        let request_id = self.next_disk_request_id;
+        self.next_disk_request_id += 1;
 
-        let segments = self.layout.map_range(global_start, global_end);
-        let mut data = vec![0u8; length as usize];
-        let mut data_offset = 0;
+        let request = DiskRequest::ReadBlock {
+            piece_index,
+            block_offset,
+            length,
+            request_id,
+            peer_addr,
+        };
 
-        for segment in segments {
-            let file_handle = self.get_or_create_file(segment.file_index)?;
-            file_handle.seek(SeekFrom::Start(segment.file_offset))
-                .context("seek failed")?;
-
-            let read_length = segment.length as usize;
-            file_handle.read_exact(&mut data[data_offset..data_offset + read_length])
-                .context("read failed")?;
-
-            data_offset += read_length;
+        if !self.disk_worker.submit(request) {
+            anyhow::bail!("disk queue full");
         }
 
-        if data_offset != length as usize {
-            anyhow::bail!(
-                "incomplete read: expected {} bytes, got {}",
-                length,
-                data_offset
-            );
+        self.pending_read_requests.insert(request_id, (piece_index, block_offset, length));
+        Ok(request_id)
+    }
+
+    pub fn poll_read_completions(&mut self) -> Vec<(Option<std::net::SocketAddrV4>, u64, u32, Vec<u8>)> {
+        let mut completed_reads = Vec::new();
+
+        while let Some(result) = self.disk_worker.try_recv() {
+            match result {
+                DiskResult::ReadBlockComplete { piece_index, block_offset, request_id, peer_addr, result } => {
+                    self.pending_read_requests.remove(&request_id);
+                    if let Ok(data) = result {
+                        completed_reads.push((peer_addr, piece_index, block_offset, data));
+                    }
+                }
+                DiskResult::WritePieceComplete { piece_index, request_id, result } => {
+                    self.writing_pieces.remove(&piece_index);
+                    if let Err(e) = result {
+                        eprintln!("Failed to write piece {}: {}", piece_index, e);
+                        self.failed_pieces.push(piece_index);
+                    } else {
+                        self.bitfield.set(piece_index as usize, true);
+                        self.resume_dirty = true;
+                    }
+                }
+            }
         }
 
-        Ok(data)
+        completed_reads
     }
 
     fn submit_piece_for_verification(&mut self, piece_index: u64) {
@@ -287,14 +307,30 @@ impl DiskStorage {
             self.verifying_pieces.remove(&result.piece_index);
 
             if result.hash_matches {
-                if let Err(e) = self.finalize_verified_piece(result.piece_index, &result.data) {
-                    eprintln!("Failed to finalize piece {}: {}", result.piece_index, e);
+                if let Err(e) = self.submit_write_piece(result.piece_index, result.data) {
+                    eprintln!("Failed to submit piece write {}: {}", result.piece_index, e);
                     self.failed_pieces.push(result.piece_index);
                     continue;
                 }
-                completed.push(result.piece_index);
             } else {
                 self.failed_pieces.push(result.piece_index);
+            }
+        }
+
+        while let Some(result) = self.disk_worker.try_recv() {
+            match result {
+                DiskResult::WritePieceComplete { piece_index, request_id: _, result } => {
+                    self.writing_pieces.remove(&piece_index);
+                    if let Err(e) = result {
+                        eprintln!("Failed to write piece {}: {}", piece_index, e);
+                        self.failed_pieces.push(piece_index);
+                    } else {
+                        self.bitfield.set(piece_index as usize, true);
+                        self.resume_dirty = true;
+                        completed.push(piece_index);
+                    }
+                }
+                DiskResult::ReadBlockComplete { .. } => {}
             }
         }
 
@@ -305,10 +341,21 @@ impl DiskStorage {
         std::mem::take(&mut self.failed_pieces)
     }
 
-    fn finalize_verified_piece(&mut self, piece_index: u64, data: &[u8]) -> Result<()> {
-        self.write_piece_to_disk(piece_index, data)?;
-        self.bitfield.set(piece_index as usize, true);
-        self.resume_dirty = true;
+    fn submit_write_piece(&mut self, piece_index: u64, data: Vec<u8>) -> Result<()> {
+        let request_id = self.next_disk_request_id;
+        self.next_disk_request_id += 1;
+
+        let request = DiskRequest::WritePiece {
+            piece_index,
+            data,
+            request_id,
+        };
+
+        if !self.disk_worker.submit(request) {
+            anyhow::bail!("disk queue full");
+        }
+
+        self.writing_pieces.insert(piece_index, ());
         Ok(())
     }
 
@@ -327,61 +374,6 @@ impl DiskStorage {
         Ok(())
     }
 
-    fn write_piece_to_disk(&mut self, piece_index: u64, data: &[u8]) -> Result<()> {
-        let segments = self.layout.map_piece(piece_index);
-        let mut offset = 0;
-
-        for segment in segments {
-            let file_handle = self.get_or_create_file(segment.file_index)?;
-
-            file_handle.seek(SeekFrom::Start(segment.file_offset))
-                .context("seek failed")?;
-
-            let end = offset + segment.length as usize;
-            file_handle.write_all(&data[offset..end])
-                .context("write failed")?;
-
-            offset = end;
-        }
-
-        Ok(())
-    }
-
-    fn get_or_create_file(&mut self, file_index: usize) -> Result<&mut File> {
-        if self.file_handles.contains_key(&file_index) {
-            self.file_lru.retain(|&idx| idx != file_index);
-            self.file_lru.push_back(file_index);
-        } else {
-            if self.file_handles.len() >= MAX_OPEN_FILE_HANDLES {
-                if let Some(lru_index) = self.file_lru.pop_front() {
-                    if let Some(mut file) = self.file_handles.remove(&lru_index) {
-                        let _ = file.flush();
-                    }
-                }
-            }
-
-            let path = self.layout.file_path(file_index)
-                .context("invalid file index")?;
-
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .context("failed to create parent directories")?;
-            }
-
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(path)
-                .context("failed to open file")?;
-
-            self.file_handles.insert(file_index, file);
-            self.file_lru.push_back(file_index);
-        }
-
-        self.file_handles.get_mut(&file_index)
-            .ok_or_else(|| anyhow::anyhow!("File handle missing after insertion for index {}", file_index))
-    }
 
     fn get_piece_length(&self, piece_index: u64) -> u64 {
         let total_pieces = self.pieces.len() as u64;
@@ -404,10 +396,6 @@ impl DiskStorage {
         if self.resume_dirty {
             self.save_resume_data()?;
             self.resume_dirty = false;
-        }
-
-        for (_, mut file) in self.file_handles.drain() {
-            file.flush().context("failed to flush file")?;
         }
         Ok(())
     }

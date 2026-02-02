@@ -13,6 +13,37 @@ pub struct PexMessage {
     pub dropped: Vec<SocketAddrV4>,
 }
 
+fn is_valid_peer_ip(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+
+    if octets[0] == 0 {
+        return false;
+    }
+    if octets[0] == 10 {
+        return false;
+    }
+    if octets[0] == 127 {
+        return false;
+    }
+    if octets[0] == 172 && (octets[1] >= 16 && octets[1] <= 31) {
+        return false;
+    }
+    if octets[0] == 192 && octets[1] == 168 {
+        return false;
+    }
+    if octets[0] == 169 && octets[1] == 254 {
+        return false;
+    }
+    if octets[0] >= 224 {
+        return false;
+    }
+    if ip.is_broadcast() {
+        return false;
+    }
+
+    true
+}
+
 pub fn parse_pex(payload: &[u8]) -> Result<PexMessage> {
     let value = decode(payload)
         .map_err(|e| anyhow!("ut_pex payload decode failed: {e}"))?;
@@ -50,6 +81,9 @@ fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddrV4>> {
         let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
         if port == 0 {
+            continue;
+        }
+        if !is_valid_peer_ip(&ip) {
             continue;
         }
         peers.push(SocketAddrV4::new(ip, port));

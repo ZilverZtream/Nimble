@@ -5,3 +5,4 @@ pub mod resume;
 pub mod hasher;
 pub mod io_pool;
 pub mod checkpoint;
+pub mod disk_worker;

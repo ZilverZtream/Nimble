@@ -5,7 +5,7 @@ use nimble_util::hash::sha1;
 const DH_PRIME_HEX: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A63A36210000000000090563";
 const DH_GENERATOR: u32 = 2;
 const VC_LENGTH: usize = 8;
-const KEY_LENGTH: usize = 96;
+pub const MSE_KEY_LENGTH: usize = 96;
 
 pub struct Rc4 {
     state: [u8; 256],
@@ -118,12 +118,12 @@ impl MseHandshake {
         let shared = peer_pub.modpow(&self.private_key, &prime);
         let mut shared_bytes = shared.to_bytes_be();
 
-        if shared_bytes.len() < KEY_LENGTH {
-            let mut padded = vec![0u8; KEY_LENGTH - shared_bytes.len()];
+        if shared_bytes.len() < MSE_KEY_LENGTH {
+            let mut padded = vec![0u8; MSE_KEY_LENGTH - shared_bytes.len()];
             padded.extend_from_slice(&shared_bytes);
             shared_bytes = padded;
-        } else if shared_bytes.len() > KEY_LENGTH {
-            shared_bytes = shared_bytes[shared_bytes.len() - KEY_LENGTH..].to_vec();
+        } else if shared_bytes.len() > MSE_KEY_LENGTH {
+            shared_bytes = shared_bytes[shared_bytes.len() - MSE_KEY_LENGTH..].to_vec();
         }
 
         let send_key = derive_key(&shared_bytes, info_hash, self.is_initiator, true);
@@ -163,6 +163,18 @@ impl MseHandshake {
     pub fn stage(&self) -> MseStage {
         self.stage
     }
+
+    pub fn clone_without_ciphers(&self) -> Self {
+        MseHandshake {
+            stage: MseStage::Init,
+            private_key: self.private_key.clone(),
+            public_key: self.public_key.clone(),
+            shared_secret: None,
+            send_cipher: None,
+            recv_cipher: None,
+            is_initiator: self.is_initiator,
+        }
+    }
 }
 
 fn generate_random_key() -> BigUint {
@@ -183,12 +195,12 @@ fn compute_public_key(private_key: &BigUint, prime: &BigUint) -> Vec<u8> {
     let public = generator.modpow(private_key, prime);
     let mut bytes = public.to_bytes_be();
 
-    if bytes.len() < KEY_LENGTH {
-        let mut padded = vec![0u8; KEY_LENGTH - bytes.len()];
+    if bytes.len() < MSE_KEY_LENGTH {
+        let mut padded = vec![0u8; MSE_KEY_LENGTH - bytes.len()];
         padded.extend_from_slice(&bytes);
         bytes = padded;
-    } else if bytes.len() > KEY_LENGTH {
-        bytes = bytes[bytes.len() - KEY_LENGTH..].to_vec();
+    } else if bytes.len() > MSE_KEY_LENGTH {
+        bytes = bytes[bytes.len() - MSE_KEY_LENGTH..].to_vec();
     }
 
     bytes
@@ -348,5 +360,25 @@ mod tests {
 
         responder.decrypt(&mut data);
         assert_eq!(data, original);
+    }
+
+    #[test]
+    fn test_clone_without_ciphers_preserves_keys() {
+        let info_hash = [0x56u8; 20];
+
+        let responder = MseHandshake::new_responder();
+        let responder_clone = responder.clone_without_ciphers();
+
+        assert_eq!(responder.get_public_key(), responder_clone.get_public_key());
+
+        let peer_pubkey = responder.get_public_key().to_vec();
+
+        let mut derived = responder.clone_without_ciphers();
+        let mut derived_clone = responder_clone.clone_without_ciphers();
+
+        derived.compute_shared_secret(&peer_pubkey, &info_hash);
+        derived_clone.compute_shared_secret(&peer_pubkey, &info_hash);
+
+        assert_eq!(derived.shared_secret, derived_clone.shared_secret);
     }
 }

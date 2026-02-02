@@ -982,6 +982,7 @@ impl Session {
                 accepted_peer.their_peer_id,
                 piece_count,
                 self.listen_port,
+                accepted_peer.mse_handshake,
             ) {
                 Ok(conn) => conn,
                 Err(_) => continue,
@@ -996,6 +997,7 @@ impl Session {
                 accepted_peer.their_peer_id,
                 piece_count,
                 self.listen_port,
+                accepted_peer.mse_handshake,
             ) {
                 Ok(conn) => conn,
                 Err(_) => continue,

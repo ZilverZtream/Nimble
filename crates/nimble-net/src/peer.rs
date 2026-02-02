@@ -405,11 +405,13 @@ impl PeerConnection {
         their_peer_id: [u8; 20],
         piece_count: usize,
         listen_port: u16,
+        mse_handshake: Option<MseHandshake>,
     ) -> Result<Self> {
         use crate::sockets::TcpSocket;
         let socket = TcpSocket::from_raw_socket(socket, SocketAddr::V4(addr))?;
         let now = Instant::now();
 
+        let encryption_enabled = mse_handshake.is_some();
         let mut conn = PeerConnection {
             socket,
             addr: SocketAddr::V4(addr),
@@ -444,8 +446,8 @@ impl PeerConnection {
             pex_dropped: Vec::new(),
             pex_dropped_v6: Vec::new(),
             last_pex_received: None,
-            mse_handshake: None,
-            encryption_enabled: false,
+            mse_handshake,
+            encryption_enabled,
         };
 
         conn.init_extension_state();
@@ -463,11 +465,13 @@ impl PeerConnection {
         their_peer_id: [u8; 20],
         piece_count: usize,
         listen_port: u16,
+        mse_handshake: Option<MseHandshake>,
     ) -> Result<Self> {
         use crate::sockets::TcpSocket;
         let socket = TcpSocket::from_raw_socket(stream, SocketAddr::V4(addr))?;
         let now = Instant::now();
 
+        let encryption_enabled = mse_handshake.is_some();
         let mut conn = PeerConnection {
             socket,
             addr: SocketAddr::V4(addr),
@@ -502,8 +506,8 @@ impl PeerConnection {
             pex_dropped: Vec::new(),
             pex_dropped_v6: Vec::new(),
             last_pex_received: None,
-            mse_handshake: None,
-            encryption_enabled: false,
+            mse_handshake,
+            encryption_enabled,
         };
 
         conn.init_extension_state();

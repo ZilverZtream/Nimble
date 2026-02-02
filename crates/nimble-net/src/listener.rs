@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::*;
+    use crate::encryption::{MseHandshake, MseStage, MSE_KEY_LENGTH};
     use windows_sys::Win32::Networking::WinSock::{
         self, AF_INET, FD_SET, FIONBIO, INVALID_SOCKET, IPPROTO_TCP, SOCKADDR_IN, SOCKET,
         SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR, TIMEVAL, WSADATA,
@@ -16,6 +17,7 @@ mod windows_impl {
     const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
     const PROTOCOL_STRING_LENGTH: u8 = 19;
     const HANDSHAKE_LENGTH: usize = 68;
+    const MSE_VC_LENGTH: usize = 8;
     const WSAEWOULDBLOCK: i32 = 10035;
     const WSAEINPROGRESS: i32 = 10036;
 
@@ -62,6 +64,20 @@ mod windows_impl {
         addr: SocketAddrV4,
         started_at: Instant,
         recv_buffer: Vec<u8>,
+        mse_state: Option<MseState>,
+        force_mse: bool,
+    }
+
+    enum MseState {
+        AwaitingVc {
+            base: MseHandshake,
+            peer_pubkey: Vec<u8>,
+        },
+        AwaitingHandshake {
+            mse: MseHandshake,
+            info_hash: [u8; 20],
+            our_peer_id: [u8; 20],
+        },
     }
 
     struct InfoHashEntry {
@@ -69,12 +85,12 @@ mod windows_impl {
         piece_count: usize,
     }
 
-    #[derive(Debug)]
     pub struct AcceptedPeer {
         pub socket: SOCKET,
         pub addr: SocketAddrV4,
         pub info_hash: [u8; 20],
         pub their_peer_id: [u8; 20],
+        pub mse_handshake: Option<MseHandshake>,
     }
 
     impl PeerListener {
@@ -193,6 +209,8 @@ mod windows_impl {
                         addr: peer_addr,
                         started_at: Instant::now(),
                         recv_buffer: Vec::with_capacity(HANDSHAKE_LENGTH),
+                        mse_state: None,
+                        force_mse: false,
                     },
                 );
             }
@@ -203,38 +221,77 @@ mod windows_impl {
         fn process_pending_handshakes(&mut self, accepted: &mut Vec<AcceptedPeer>) -> Result<()> {
             let mut completed = Vec::new();
             let mut failed = Vec::new();
+            let registry = &self.infohash_registry;
 
             for (&sock, pending) in self.pending.iter_mut() {
-                let mut buf = [0u8; HANDSHAKE_LENGTH];
-                let remaining = HANDSHAKE_LENGTH - pending.recv_buffer.len();
-
-                if remaining > 0 {
-                    let n = unsafe {
-                        WinSock::recv(sock, buf.as_mut_ptr(), remaining as i32, 0)
+                if pending.mse_state.is_none() {
+                    let target_len = match pending.recv_buffer.first().copied() {
+                        Some(PROTOCOL_STRING_LENGTH) if !pending.force_mse => HANDSHAKE_LENGTH,
+                        Some(_) => MSE_KEY_LENGTH,
+                        None => HANDSHAKE_LENGTH,
                     };
 
-                    if n > 0 {
-                        pending.recv_buffer.extend_from_slice(&buf[..n as usize]);
-                    } else if n == 0 {
-                        failed.push(sock);
-                        continue;
-                    } else {
-                        let err = get_last_error();
-                        if err != WSAEWOULDBLOCK && err != WSAEINPROGRESS {
+                    let remaining = target_len.saturating_sub(pending.recv_buffer.len());
+                    if remaining > 0 {
+                        let mut buf = [0u8; MSE_KEY_LENGTH];
+                        let read_len = remaining.min(MSE_KEY_LENGTH);
+                        let n = unsafe {
+                            WinSock::recv(sock, buf.as_mut_ptr(), read_len as i32, 0)
+                        };
+
+                        if n > 0 {
+                            pending.recv_buffer.extend_from_slice(&buf[..n as usize]);
+                        } else if n == 0 {
                             failed.push(sock);
+                            continue;
+                        } else {
+                            let err = get_last_error();
+                            if err != WSAEWOULDBLOCK && err != WSAEINPROGRESS {
+                                failed.push(sock);
+                            }
+                            continue;
                         }
-                        continue;
+                    }
+
+                    if pending.recv_buffer.len() >= target_len {
+                        if pending.recv_buffer.first().copied() == Some(PROTOCOL_STRING_LENGTH) && !pending.force_mse {
+                            if pending.recv_buffer.len() >= HANDSHAKE_LENGTH
+                                && &pending.recv_buffer[1..20] == PROTOCOL_STRING
+                            {
+                                match Self::validate_and_respond_plain(registry, sock, pending) {
+                                    Ok(peer) => completed.push((sock, peer)),
+                                    Err(_) => failed.push(sock),
+                                }
+                                continue;
+                            }
+                            pending.force_mse = true;
+                        }
+
+                        if pending.recv_buffer.len() >= MSE_KEY_LENGTH {
+                            let peer_pubkey = pending.recv_buffer.drain(..MSE_KEY_LENGTH).collect();
+                            let base = MseHandshake::new_responder();
+                            let sent = unsafe {
+                                WinSock::send(
+                                    sock,
+                                    base.get_public_key().as_ptr(),
+                                    base.get_public_key().len() as i32,
+                                    0,
+                                )
+                            };
+                            if sent != MSE_KEY_LENGTH as i32 {
+                                failed.push(sock);
+                                continue;
+                            }
+                            pending.mse_state = Some(MseState::AwaitingVc { base, peer_pubkey });
+                        }
                     }
                 }
 
-                if pending.recv_buffer.len() >= HANDSHAKE_LENGTH {
-                    match self.validate_and_respond(sock, pending) {
-                        Ok(peer) => {
-                            completed.push((sock, peer));
-                        }
-                        Err(_) => {
-                            failed.push(sock);
-                        }
+                if pending.mse_state.is_some() {
+                    match Self::process_mse_handshake(registry, sock, pending) {
+                        Ok(Some(peer)) => completed.push((sock, peer)),
+                        Ok(None) => {}
+                        Err(_) => failed.push(sock),
                     }
                 }
             }
@@ -255,8 +312,8 @@ mod windows_impl {
             Ok(())
         }
 
-        fn validate_and_respond(
-            &self,
+        fn validate_and_respond_plain(
+            registry: &HashMap<[u8; 20], InfoHashEntry>,
             sock: SOCKET,
             pending: &PendingHandshake,
         ) -> Result<AcceptedPeer> {
@@ -277,8 +334,7 @@ mod windows_impl {
                 .try_into()
                 .map_err(|_| anyhow!("invalid peer id length"))?;
 
-            let entry = self
-                .infohash_registry
+            let entry = registry
                 .get(&their_info_hash)
                 .ok_or_else(|| anyhow!("unknown infohash"))?;
 
@@ -306,7 +362,161 @@ mod windows_impl {
                 addr: pending.addr,
                 info_hash: their_info_hash,
                 their_peer_id,
+                mse_handshake: None,
             })
+        }
+
+        fn process_mse_handshake(
+            registry: &HashMap<[u8; 20], InfoHashEntry>,
+            sock: SOCKET,
+            pending: &mut PendingHandshake,
+        ) -> Result<Option<AcceptedPeer>> {
+            match pending.mse_state.take() {
+                Some(MseState::AwaitingVc { base, peer_pubkey }) => {
+                    if pending.recv_buffer.len() < MSE_VC_LENGTH {
+                        let remaining = MSE_VC_LENGTH - pending.recv_buffer.len();
+                        let mut buf = [0u8; MSE_VC_LENGTH];
+                        let n = unsafe {
+                            WinSock::recv(sock, buf.as_mut_ptr(), remaining as i32, 0)
+                        };
+
+                        if n > 0 {
+                            pending.recv_buffer.extend_from_slice(&buf[..n as usize]);
+                        } else if n == 0 {
+                            return Err(anyhow!("connection closed"));
+                        } else {
+                            let err = get_last_error();
+                            if err != WSAEWOULDBLOCK && err != WSAEINPROGRESS {
+                                return Err(anyhow!("recv failed: {}", err));
+                            }
+                            pending.mse_state = Some(MseState::AwaitingVc { base, peer_pubkey });
+                            return Ok(None);
+                        }
+                    }
+
+                    if pending.recv_buffer.len() < MSE_VC_LENGTH {
+                        pending.mse_state = Some(MseState::AwaitingVc { base, peer_pubkey });
+                        return Ok(None);
+                    }
+
+                    let encrypted_vc: Vec<u8> = pending.recv_buffer.drain(..MSE_VC_LENGTH).collect();
+
+                    let Some((info_hash, our_peer_id, mut mse)) =
+                        Self::select_mse_handshake(registry, &base, &peer_pubkey, &encrypted_vc)
+                    else {
+                        return Err(anyhow!("unable to resolve MSE infohash"));
+                    };
+
+                    let mut vc = [0u8; MSE_VC_LENGTH];
+                    mse.encrypt(&mut vc);
+                    let sent = unsafe {
+                        WinSock::send(sock, vc.as_ptr(), vc.len() as i32, 0)
+                    };
+                    if sent != MSE_VC_LENGTH as i32 {
+                        return Err(anyhow!("failed to send MSE verification constant"));
+                    }
+
+                    mse.set_stage(MseStage::Established);
+                    pending.mse_state = Some(MseState::AwaitingHandshake { mse, info_hash, our_peer_id });
+                    Ok(None)
+                }
+                Some(MseState::AwaitingHandshake { mut mse, info_hash, our_peer_id }) => {
+                    if pending.recv_buffer.len() < HANDSHAKE_LENGTH {
+                        let remaining = HANDSHAKE_LENGTH - pending.recv_buffer.len();
+                        let mut buf = [0u8; HANDSHAKE_LENGTH];
+                        let n = unsafe {
+                            WinSock::recv(sock, buf.as_mut_ptr(), remaining as i32, 0)
+                        };
+
+                        if n > 0 {
+                            pending.recv_buffer.extend_from_slice(&buf[..n as usize]);
+                        } else if n == 0 {
+                            return Err(anyhow!("connection closed"));
+                        } else {
+                            let err = get_last_error();
+                            if err != WSAEWOULDBLOCK && err != WSAEINPROGRESS {
+                                return Err(anyhow!("recv failed: {}", err));
+                            }
+                            pending.mse_state = Some(MseState::AwaitingHandshake { mse, info_hash, our_peer_id });
+                            return Ok(None);
+                        }
+                    }
+
+                    if pending.recv_buffer.len() < HANDSHAKE_LENGTH {
+                        pending.mse_state = Some(MseState::AwaitingHandshake { mse, info_hash, our_peer_id });
+                        return Ok(None);
+                    }
+
+                    let mut handshake: Vec<u8> = pending.recv_buffer.drain(..HANDSHAKE_LENGTH).collect();
+                    mse.decrypt(&mut handshake);
+
+                    if handshake[0] != PROTOCOL_STRING_LENGTH {
+                        return Err(anyhow!("invalid protocol string length"));
+                    }
+
+                    if &handshake[1..20] != PROTOCOL_STRING {
+                        return Err(anyhow!("invalid protocol string"));
+                    }
+
+                    let their_info_hash: [u8; 20] = handshake[28..48]
+                        .try_into()
+                        .map_err(|_| anyhow!("invalid info hash length"))?;
+                    let their_peer_id: [u8; 20] = handshake[48..68]
+                        .try_into()
+                        .map_err(|_| anyhow!("invalid peer id length"))?;
+
+                    if their_info_hash != info_hash {
+                        return Err(anyhow!("info hash mismatch"));
+                    }
+
+                    let mut response = Vec::with_capacity(HANDSHAKE_LENGTH);
+                    response.push(PROTOCOL_STRING_LENGTH);
+                    response.extend_from_slice(PROTOCOL_STRING);
+
+                    let mut reserved = [0u8; 8];
+                    reserved[5] |= 0x10;
+                    response.extend_from_slice(&reserved);
+
+                    response.extend_from_slice(&info_hash);
+                    response.extend_from_slice(&our_peer_id);
+
+                    mse.encrypt(&mut response);
+                    let sent = unsafe {
+                        WinSock::send(sock, response.as_ptr(), response.len() as i32, 0)
+                    };
+
+                    if sent != HANDSHAKE_LENGTH as i32 {
+                        return Err(anyhow!("failed to send encrypted handshake response"));
+                    }
+
+                    Ok(Some(AcceptedPeer {
+                        socket: sock,
+                        addr: pending.addr,
+                        info_hash,
+                        their_peer_id,
+                        mse_handshake: Some(mse),
+                    }))
+                }
+                None => Ok(None),
+            }
+        }
+
+        fn select_mse_handshake(
+            registry: &HashMap<[u8; 20], InfoHashEntry>,
+            base: &MseHandshake,
+            peer_pubkey: &[u8],
+            encrypted_vc: &[u8],
+        ) -> Option<([u8; 20], [u8; 20], MseHandshake)> {
+            for (info_hash, entry) in registry.iter() {
+                let mut candidate = base.clone_without_ciphers();
+                candidate.compute_shared_secret(peer_pubkey, info_hash);
+                let mut vc = encrypted_vc.to_vec();
+                candidate.decrypt(&mut vc);
+                if vc == [0u8; MSE_VC_LENGTH] {
+                    return Some((*info_hash, entry.peer_id, candidate));
+                }
+            }
+            None
         }
 
         fn cleanup_timed_out(&mut self) {
@@ -389,6 +599,7 @@ mod windows_impl {
 #[cfg(not(target_os = "windows"))]
 mod unix_impl {
     use super::*;
+    use crate::encryption::{MseHandshake, MseStage, MSE_KEY_LENGTH};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
 
@@ -397,6 +608,7 @@ mod unix_impl {
     const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
     const PROTOCOL_STRING_LENGTH: u8 = 19;
     const HANDSHAKE_LENGTH: usize = 68;
+    const MSE_VC_LENGTH: usize = 8;
 
     pub struct PeerListener {
         listener: TcpListener,
@@ -411,6 +623,20 @@ mod unix_impl {
         addr: SocketAddrV4,
         started_at: Instant,
         recv_buffer: Vec<u8>,
+        mse_state: Option<MseState>,
+        force_mse: bool,
+    }
+
+    enum MseState {
+        AwaitingVc {
+            base: MseHandshake,
+            peer_pubkey: Vec<u8>,
+        },
+        AwaitingHandshake {
+            mse: MseHandshake,
+            info_hash: [u8; 20],
+            our_peer_id: [u8; 20],
+        },
     }
 
     struct InfoHashEntry {
@@ -418,12 +644,12 @@ mod unix_impl {
         piece_count: usize,
     }
 
-    #[derive(Debug)]
     pub struct AcceptedPeer {
         pub stream: TcpStream,
         pub addr: SocketAddrV4,
         pub info_hash: [u8; 20],
         pub their_peer_id: [u8; 20],
+        pub mse_handshake: Option<MseHandshake>,
     }
 
     impl PeerListener {
@@ -485,6 +711,8 @@ mod unix_impl {
                                     addr: v4_addr,
                                     started_at: Instant::now(),
                                     recv_buffer: Vec::with_capacity(HANDSHAKE_LENGTH),
+                                    mse_state: None,
+                                    force_mse: false,
                                 },
                             );
                         }
@@ -499,49 +727,71 @@ mod unix_impl {
         fn process_pending_handshakes(&mut self, accepted: &mut Vec<AcceptedPeer>) -> Result<()> {
             let mut completed = Vec::new();
             let mut failed = Vec::new();
+            let registry = &self.infohash_registry;
 
             for (&id, pending) in self.pending.iter_mut() {
-                let mut buf = [0u8; HANDSHAKE_LENGTH];
-                let remaining = HANDSHAKE_LENGTH - pending.recv_buffer.len();
+                if pending.mse_state.is_none() {
+                    let target_len = match pending.recv_buffer.first().copied() {
+                        Some(PROTOCOL_STRING_LENGTH) if !pending.force_mse => HANDSHAKE_LENGTH,
+                        Some(_) => MSE_KEY_LENGTH,
+                        None => HANDSHAKE_LENGTH,
+                    };
 
-                if remaining > 0 {
-                    match pending.stream.read(&mut buf[..remaining]) {
-                        Ok(0) => {
-                            failed.push(id);
-                            continue;
+                    let remaining = target_len.saturating_sub(pending.recv_buffer.len());
+                    if remaining > 0 {
+                        let mut buf = [0u8; MSE_KEY_LENGTH];
+                        let read_len = remaining.min(MSE_KEY_LENGTH);
+                        match pending.stream.read(&mut buf[..read_len]) {
+                            Ok(0) => {
+                                failed.push(id);
+                                continue;
+                            }
+                            Ok(n) => {
+                                pending.recv_buffer.extend_from_slice(&buf[..n]);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => {
+                                failed.push(id);
+                                continue;
+                            }
                         }
-                        Ok(n) => {
-                            pending.recv_buffer.extend_from_slice(&buf[..n]);
+                    }
+
+                    if pending.recv_buffer.len() >= target_len {
+                        if pending.recv_buffer.first().copied() == Some(PROTOCOL_STRING_LENGTH) && !pending.force_mse {
+                            if pending.recv_buffer.len() >= HANDSHAKE_LENGTH
+                                && &pending.recv_buffer[1..20] == PROTOCOL_STRING
+                            {
+                                match Self::validate_and_respond_plain(registry, pending) {
+                                    Ok((info_hash, their_peer_id)) => {
+                                        completed.push((id, info_hash, their_peer_id, None));
+                                    }
+                                    Err(_) => failed.push(id),
+                                }
+                                continue;
+                            }
+                            pending.force_mse = true;
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                        Err(_) => {
-                            failed.push(id);
-                            continue;
+
+                        if pending.recv_buffer.len() >= MSE_KEY_LENGTH {
+                            let peer_pubkey = pending.recv_buffer.drain(..MSE_KEY_LENGTH).collect();
+                            let base = MseHandshake::new_responder();
+                            if pending.stream.write_all(base.get_public_key()).is_err() {
+                                failed.push(id);
+                                continue;
+                            }
+                            pending.mse_state = Some(MseState::AwaitingVc { base, peer_pubkey });
                         }
                     }
                 }
 
-                if pending.recv_buffer.len() >= HANDSHAKE_LENGTH {
-                    match Self::validate_handshake(&pending.recv_buffer, &self.infohash_registry) {
-                        Ok((info_hash, their_peer_id, our_peer_id)) => {
-                            let mut response = Vec::with_capacity(HANDSHAKE_LENGTH);
-                            response.push(PROTOCOL_STRING_LENGTH);
-                            response.extend_from_slice(PROTOCOL_STRING);
-                            let mut reserved = [0u8; 8];
-                            reserved[5] |= 0x10;
-                            response.extend_from_slice(&reserved);
-                            response.extend_from_slice(&info_hash);
-                            response.extend_from_slice(&our_peer_id);
-
-                            if pending.stream.write_all(&response).is_ok() {
-                                completed.push((id, info_hash, their_peer_id));
-                            } else {
-                                failed.push(id);
-                            }
+                if pending.mse_state.is_some() {
+                    match Self::process_mse_handshake(registry, pending) {
+                        Ok(Some((info_hash, their_peer_id, mse_handshake))) => {
+                            completed.push((id, info_hash, their_peer_id, Some(mse_handshake)));
                         }
-                        Err(_) => {
-                            failed.push(id);
-                        }
+                        Ok(None) => {}
+                        Err(_) => failed.push(id),
                     }
                 }
             }
@@ -550,13 +800,14 @@ mod unix_impl {
                 self.pending.remove(&id);
             }
 
-            for (id, info_hash, their_peer_id) in completed {
+            for (id, info_hash, their_peer_id, mse_handshake) in completed {
                 if let Some(pending) = self.pending.remove(&id) {
                     accepted.push(AcceptedPeer {
                         stream: pending.stream,
                         addr: pending.addr,
                         info_hash,
                         their_peer_id,
+                        mse_handshake,
                     });
                 }
             }
@@ -564,10 +815,11 @@ mod unix_impl {
             Ok(())
         }
 
-        fn validate_handshake(
-            data: &[u8],
+        fn validate_and_respond_plain(
             registry: &HashMap<[u8; 20], InfoHashEntry>,
-        ) -> Result<([u8; 20], [u8; 20], [u8; 20])> {
+            pending: &mut PendingHandshake,
+        ) -> Result<([u8; 20], [u8; 20])> {
+            let data = &pending.recv_buffer;
             if data[0] != PROTOCOL_STRING_LENGTH {
                 return Err(anyhow!("invalid protocol string length"));
             }
@@ -587,7 +839,139 @@ mod unix_impl {
                 .get(&their_info_hash)
                 .ok_or_else(|| anyhow!("unknown infohash"))?;
 
-            Ok((their_info_hash, their_peer_id, entry.peer_id))
+            let mut response = Vec::with_capacity(HANDSHAKE_LENGTH);
+            response.push(PROTOCOL_STRING_LENGTH);
+            response.extend_from_slice(PROTOCOL_STRING);
+            let mut reserved = [0u8; 8];
+            reserved[5] |= 0x10;
+            response.extend_from_slice(&reserved);
+            response.extend_from_slice(&their_info_hash);
+            response.extend_from_slice(&entry.peer_id);
+
+            pending.stream.write_all(&response)?;
+
+            Ok((their_info_hash, their_peer_id))
+        }
+
+        fn process_mse_handshake(
+            registry: &HashMap<[u8; 20], InfoHashEntry>,
+            pending: &mut PendingHandshake,
+        ) -> Result<Option<([u8; 20], [u8; 20], MseHandshake)>> {
+            match pending.mse_state.take() {
+                Some(MseState::AwaitingVc { base, peer_pubkey }) => {
+                    if pending.recv_buffer.len() < MSE_VC_LENGTH {
+                        let remaining = MSE_VC_LENGTH - pending.recv_buffer.len();
+                        let mut buf = [0u8; MSE_VC_LENGTH];
+                        match pending.stream.read(&mut buf[..remaining]) {
+                            Ok(0) => return Err(anyhow!("connection closed")),
+                            Ok(n) => pending.recv_buffer.extend_from_slice(&buf[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                pending.mse_state = Some(MseState::AwaitingVc { base, peer_pubkey });
+                                return Ok(None);
+                            }
+                            Err(_) => return Err(anyhow!("recv failed")),
+                        }
+                    }
+
+                    if pending.recv_buffer.len() < MSE_VC_LENGTH {
+                        pending.mse_state = Some(MseState::AwaitingVc { base, peer_pubkey });
+                        return Ok(None);
+                    }
+
+                    let encrypted_vc: Vec<u8> = pending.recv_buffer.drain(..MSE_VC_LENGTH).collect();
+
+                    let Some((info_hash, our_peer_id, mut mse)) =
+                        Self::select_mse_handshake(registry, &base, &peer_pubkey, &encrypted_vc)
+                    else {
+                        return Err(anyhow!("unable to resolve MSE infohash"));
+                    };
+
+                    let mut vc = [0u8; MSE_VC_LENGTH];
+                    mse.encrypt(&mut vc);
+                    pending.stream.write_all(&vc)?;
+
+                    mse.set_stage(MseStage::Established);
+                    pending.mse_state = Some(MseState::AwaitingHandshake { mse, info_hash, our_peer_id });
+                    Ok(None)
+                }
+                Some(MseState::AwaitingHandshake { mut mse, info_hash, our_peer_id }) => {
+                    if pending.recv_buffer.len() < HANDSHAKE_LENGTH {
+                        let remaining = HANDSHAKE_LENGTH - pending.recv_buffer.len();
+                        let mut buf = [0u8; HANDSHAKE_LENGTH];
+                        match pending.stream.read(&mut buf[..remaining]) {
+                            Ok(0) => return Err(anyhow!("connection closed")),
+                            Ok(n) => pending.recv_buffer.extend_from_slice(&buf[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                pending.mse_state = Some(MseState::AwaitingHandshake { mse, info_hash, our_peer_id });
+                                return Ok(None);
+                            }
+                            Err(_) => return Err(anyhow!("recv failed")),
+                        }
+                    }
+
+                    if pending.recv_buffer.len() < HANDSHAKE_LENGTH {
+                        pending.mse_state = Some(MseState::AwaitingHandshake { mse, info_hash, our_peer_id });
+                        return Ok(None);
+                    }
+
+                    let mut handshake: Vec<u8> = pending.recv_buffer.drain(..HANDSHAKE_LENGTH).collect();
+                    mse.decrypt(&mut handshake);
+
+                    if handshake[0] != PROTOCOL_STRING_LENGTH {
+                        return Err(anyhow!("invalid protocol string length"));
+                    }
+
+                    if &handshake[1..20] != PROTOCOL_STRING {
+                        return Err(anyhow!("invalid protocol string"));
+                    }
+
+                    let their_info_hash: [u8; 20] = handshake[28..48]
+                        .try_into()
+                        .map_err(|_| anyhow!("invalid info hash length"))?;
+                    let their_peer_id: [u8; 20] = handshake[48..68]
+                        .try_into()
+                        .map_err(|_| anyhow!("invalid peer id length"))?;
+
+                    if their_info_hash != info_hash {
+                        return Err(anyhow!("info hash mismatch"));
+                    }
+
+                    let mut response = Vec::with_capacity(HANDSHAKE_LENGTH);
+                    response.push(PROTOCOL_STRING_LENGTH);
+                    response.extend_from_slice(PROTOCOL_STRING);
+
+                    let mut reserved = [0u8; 8];
+                    reserved[5] |= 0x10;
+                    response.extend_from_slice(&reserved);
+
+                    response.extend_from_slice(&info_hash);
+                    response.extend_from_slice(&our_peer_id);
+
+                    mse.encrypt(&mut response);
+                    pending.stream.write_all(&response)?;
+
+                    Ok(Some((info_hash, their_peer_id, mse)))
+                }
+                None => Ok(None),
+            }
+        }
+
+        fn select_mse_handshake(
+            registry: &HashMap<[u8; 20], InfoHashEntry>,
+            base: &MseHandshake,
+            peer_pubkey: &[u8],
+            encrypted_vc: &[u8],
+        ) -> Option<([u8; 20], [u8; 20], MseHandshake)> {
+            for (info_hash, entry) in registry.iter() {
+                let mut candidate = base.clone_without_ciphers();
+                candidate.compute_shared_secret(peer_pubkey, info_hash);
+                let mut vc = encrypted_vc.to_vec();
+                candidate.decrypt(&mut vc);
+                if vc == [0u8; MSE_VC_LENGTH] {
+                    return Some((*info_hash, entry.peer_id, candidate));
+                }
+            }
+            None
         }
 
         fn cleanup_timed_out(&mut self) {

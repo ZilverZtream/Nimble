@@ -7,19 +7,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 const WORKER_THREAD_COUNT: usize = 4;
 const ANNOUNCE_QUEUE_DEPTH: usize = 256;
+const HTTP_PENDING_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct AnnounceWorker {
     task_tx: SyncSender<AnnounceTask>,
     result_rx: Receiver<AnnounceResult>,
     http_result_rx: Receiver<HttpAnnounceEvent>,
     http_result_tx: Sender<HttpAnnounceEvent>,
-    pending_http: HashMap<u64, AnnounceTask>,
+    pending_http: HashMap<u64, PendingHttp>,
     pending_results: VecDeque<AnnounceResult>,
     request_id: AtomicU64,
     _workers: Vec<JoinHandle<()>>,
+}
+
+struct PendingHttp {
+    task: AnnounceTask,
+    submitted_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -117,7 +124,13 @@ impl AnnounceWorker {
 
         match announce_async(&task.url, &request, request_id, self.http_result_tx.clone()) {
             Ok(()) => {
-                self.pending_http.insert(request_id, task);
+                self.pending_http.insert(
+                    request_id,
+                    PendingHttp {
+                        task,
+                        submitted_at: Instant::now(),
+                    },
+                );
             }
             Err(e) => {
                 self.pending_results.push_back(AnnounceResult {
@@ -132,6 +145,8 @@ impl AnnounceWorker {
     }
 
     pub fn try_recv_result(&mut self) -> Option<AnnounceResult> {
+        self.expire_pending_http();
+
         if let Some(result) = self.pending_results.pop_front() {
             return Some(result);
         }
@@ -215,8 +230,31 @@ impl AnnounceWorker {
     fn handle_http_event(&mut self, event: HttpAnnounceEvent) -> Option<AnnounceResult> {
         match event {
             HttpAnnounceEvent::Completed { request_id, result } => {
-                let task = self.pending_http.remove(&request_id)?;
-                Some(Self::http_result_from_task(task, result))
+                let pending = self.pending_http.remove(&request_id)?;
+                Some(Self::http_result_from_task(pending.task, result))
+            }
+        }
+    }
+
+    fn expire_pending_http(&mut self) {
+        let now = Instant::now();
+        let mut expired = Vec::new();
+
+        for (request_id, pending) in self.pending_http.iter() {
+            if now.duration_since(pending.submitted_at) >= HTTP_PENDING_TIMEOUT {
+                expired.push(*request_id);
+            }
+        }
+
+        for request_id in expired {
+            if let Some(pending) = self.pending_http.remove(&request_id) {
+                self.pending_results.push_back(AnnounceResult {
+                    infohash_hex: pending.task.infohash_hex,
+                    success: false,
+                    peers: Vec::new(),
+                    interval: None,
+                    error: Some("HTTP tracker announce timed out".to_string()),
+                });
             }
         }
     }
@@ -270,5 +308,42 @@ impl AnnounceWorker {
                 error: Some(e.to_string()),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_http_times_out_without_callback() {
+        let mut worker = AnnounceWorker::new();
+        let task = AnnounceTask {
+            infohash_hex: "deadbeef".to_string(),
+            url: "http://tracker.invalid/announce".to_string(),
+            info_hash: [0; 20],
+            peer_id: [1; 20],
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left: 0,
+            event: TrackerEvent::Started,
+        };
+
+        worker.pending_http.insert(
+            42,
+            PendingHttp {
+                task,
+                submitted_at: Instant::now() - HTTP_PENDING_TIMEOUT - Duration::from_secs(1),
+            },
+        );
+
+        let result = worker.try_recv_result().expect("expected timeout result");
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("HTTP tracker announce timed out")
+        );
+        assert!(worker.pending_http.is_empty());
     }
 }

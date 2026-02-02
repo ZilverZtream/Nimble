@@ -16,7 +16,7 @@ const STALE_PIECE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const MAX_PENDING_PIECES: usize = 16;
 const MAX_PENDING_MEMORY: u64 = 512 * 1024 * 1024;
 
-// Issue #7 Fix: Maximum piece size to prevent DoS via OOM
+// Maximum piece size to prevent DoS via OOM.
 // Limit to 64MB per piece, which is far larger than any legitimate torrent
 // (typical max is 16MB). This prevents a malicious torrent from requesting
 // allocation of multi-GB pieces that would crash the client.
@@ -189,7 +189,7 @@ impl DiskStorage {
             );
         }
 
-        // Issue #7 Fix: Reject pieces that exceed maximum size to prevent DoS
+        // Reject pieces that exceed maximum size to prevent DoS.
         if piece_len > MAX_PIECE_SIZE {
             anyhow::bail!(
                 "piece {} size {} exceeds maximum {} (possible DoS attack)",
@@ -199,7 +199,7 @@ impl DiskStorage {
             );
         }
 
-        // Issue #6 Fix: Ensure piece_len fits in usize to prevent truncation on 32-bit systems
+        // Ensure piece_len fits in usize to prevent truncation on 32-bit systems.
         // On 32-bit systems, usize is 32-bit (max 4GB). If piece_len > usize::MAX, casting
         // to usize will truncate, leading to heap corruption when we allocate a smaller
         // buffer than expected.
@@ -254,7 +254,7 @@ impl DiskStorage {
             let _ = self.checkpoint_manager.clear();
             Ok(false)
         } else {
-            // Issue #10 Fix: Checkpoint contains UNVERIFIED data for crash recovery only.
+            // Checkpoint contains UNVERIFIED data for crash recovery only.
             // This data will be SHA-1 verified in submit_piece_for_verification() before
             // being written to the final file. If verification fails, the checkpoint
             // will be discarded and blocks will be re-requested.
@@ -463,7 +463,7 @@ impl DiskStorage {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        // Issue #11 Fix: Use explicit timeout to prevent indefinite blocking on shutdown
+        // Use explicit timeout to prevent indefinite blocking on shutdown.
         // Wait for pending disk operations to complete, but enforce hard timeout to
         // prevent hanging if disk is slow or unresponsive.
         const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);

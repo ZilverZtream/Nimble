@@ -14,7 +14,7 @@ pub fn global_pool() -> &'static BufferPool {
 
 /// A pool of reusable buffers to reduce allocations for piece data.
 ///
-/// Issue #10 Fix: Implements buffer pooling to eliminate excessive memory copying.
+/// Implements buffer pooling to eliminate excessive memory copying.
 /// Instead of allocating new Vec<u8> for every piece block, buffers are reused
 /// from a global pool, reducing GC pressure and improving throughput.
 #[derive(Clone)]

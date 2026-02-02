@@ -172,7 +172,7 @@ mod windows_impl {
         }
 
         fn set_timeouts(&self, recv_ms: u32, send_ms: u32) -> Result<()> {
-            // Issue #9 Fix: Proper pointer casting with explicit safety checks
+            // Proper pointer casting with explicit safety checks.
             // Windows API expects DWORD (u32) for timeout values, but we use i32 for safety.
             // Ensure the timeout values fit in i32 to avoid overflow.
             if recv_ms > i32::MAX as u32 {

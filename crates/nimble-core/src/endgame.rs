@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddrV4;
+use std::net::{SocketAddr, SocketAddrV4};
 
 const ENDGAME_THRESHOLD_PIECES: usize = 5;
 const MAX_DUPLICATE_REQUESTS: usize = 3;
@@ -18,7 +18,7 @@ impl BlockId {
 
 pub struct EndgameMode {
     active: bool,
-    pending_blocks: HashMap<BlockId, HashSet<SocketAddrV4>>,
+    pending_blocks: HashMap<BlockId, HashSet<SocketAddr>>,
     completed_blocks: HashSet<BlockId>,
 }
 
@@ -51,7 +51,7 @@ impl EndgameMode {
         self.completed_blocks.clear();
     }
 
-    pub fn record_request(&mut self, block: BlockId, peer: SocketAddrV4) -> bool {
+    pub fn record_request(&mut self, block: BlockId, peer: SocketAddr) -> bool {
         if !self.active {
             return true;
         }
@@ -70,7 +70,7 @@ impl EndgameMode {
         true
     }
 
-    pub fn record_completion(&mut self, block: BlockId) -> Vec<(SocketAddrV4, BlockId)> {
+    pub fn record_completion(&mut self, block: BlockId) -> Vec<(SocketAddr, BlockId)> {
         if !self.active {
             return Vec::new();
         }
@@ -90,7 +90,7 @@ impl EndgameMode {
         cancellations
     }
 
-    pub fn remove_peer(&mut self, peer: &SocketAddrV4) {
+    pub fn remove_peer(&mut self, peer: &SocketAddr) {
         for peers in self.pending_blocks.values_mut() {
             peers.remove(peer);
         }
@@ -135,8 +135,8 @@ impl Default for EndgameMode {
 mod tests {
     use super::*;
 
-    fn make_addr(port: u16) -> SocketAddrV4 {
-        SocketAddrV4::new([127, 0, 0, 1].into(), port)
+    fn make_addr(port: u16) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new([127, 0, 0, 1].into(), port))
     }
 
     #[test]

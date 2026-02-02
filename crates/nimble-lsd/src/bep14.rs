@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
-use std::net::{UdpSocket, Ipv4Addr, SocketAddrV4};
+use std::collections::HashMap;
+use std::net::{UdpSocket, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::{Duration, Instant};
 
-const LSD_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 192, 152, 143);
+const LSD_MULTICAST_ADDR_V4: Ipv4Addr = Ipv4Addr::new(239, 192, 152, 143);
+const LSD_MULTICAST_ADDR_V6: Ipv6Addr = Ipv6Addr::new(0xff15, 0, 0, 0, 0, 0, 0xefc0, 0x988f);
 const LSD_PORT: u16 = 6771;
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(120);
 const MIN_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
@@ -12,9 +13,10 @@ const MAX_MESSAGES_PER_TICK: usize = 100;
 const MAX_PEERS_PER_INFOHASH: usize = 200;
 
 pub struct LsdClient {
-    socket: Option<UdpSocket>,
+    socket_v4: Option<UdpSocket>,
+    socket_v6: Option<UdpSocket>,
     torrents: HashMap<[u8; 20], TorrentAnnounce>,
-    discovered_peers: HashMap<[u8; 20], HashMap<SocketAddrV4, Instant>>,
+    discovered_peers: HashMap<[u8; 20], HashMap<SocketAddr, Instant>>,
     listen_port: u16,
 }
 
@@ -26,7 +28,8 @@ struct TorrentAnnounce {
 impl LsdClient {
     pub fn new(listen_port: u16) -> Self {
         LsdClient {
-            socket: None,
+            socket_v4: None,
+            socket_v6: None,
             torrents: HashMap::new(),
             discovered_peers: HashMap::new(),
             listen_port,
@@ -34,25 +37,47 @@ impl LsdClient {
     }
 
     pub fn start(&mut self) -> Result<()> {
-        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, LSD_PORT))
-            .context("Failed to bind LSD socket")?;
+        if let Ok(socket_v4) = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, LSD_PORT)) {
+            socket_v4
+                .set_nonblocking(true)
+                .context("Failed to set non-blocking mode for IPv4")?;
 
-        socket
-            .set_nonblocking(true)
-            .context("Failed to set non-blocking mode")?;
+            socket_v4
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .context("Failed to set read timeout for IPv4")?;
 
-        socket
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .context("Failed to set read timeout")?;
+            if let Err(e) = Self::join_multicast_v4(&socket_v4) {
+                eprintln!("Failed to join IPv4 multicast group: {}", e);
+            } else {
+                self.socket_v4 = Some(socket_v4);
+            }
+        }
 
-        Self::join_multicast(&socket)?;
+        if let Ok(socket_v6) = UdpSocket::bind(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, LSD_PORT, 0, 0)) {
+            socket_v6
+                .set_nonblocking(true)
+                .context("Failed to set non-blocking mode for IPv6")?;
 
-        self.socket = Some(socket);
+            socket_v6
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .context("Failed to set read timeout for IPv6")?;
+
+            if let Err(e) = Self::join_multicast_v6(&socket_v6) {
+                eprintln!("Failed to join IPv6 multicast group: {}", e);
+            } else {
+                self.socket_v6 = Some(socket_v6);
+            }
+        }
+
+        if self.socket_v4.is_none() && self.socket_v6.is_none() {
+            anyhow::bail!("Failed to bind any LSD socket (IPv4 or IPv6)");
+        }
+
         Ok(())
     }
 
     #[cfg(target_os = "windows")]
-    fn join_multicast(socket: &UdpSocket) -> Result<()> {
+    fn join_multicast_v4(socket: &UdpSocket) -> Result<()> {
         use std::os::windows::io::AsRawSocket;
         use windows_sys::Win32::Networking::WinSock::{
             setsockopt, IPPROTO_IP, IP_ADD_MEMBERSHIP, SOCKET,
@@ -65,7 +90,7 @@ impl LsdClient {
         }
 
         let mreq = IpMreq {
-            imr_multiaddr: LSD_MULTICAST_ADDR.octets(),
+            imr_multiaddr: LSD_MULTICAST_ADDR_V4.octets(),
             imr_interface: [0, 0, 0, 0],
         };
 
@@ -81,17 +106,60 @@ impl LsdClient {
         };
 
         if result != 0 {
-            anyhow::bail!("Failed to join multicast group");
+            anyhow::bail!("Failed to join IPv4 multicast group");
         }
 
         Ok(())
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn join_multicast(socket: &UdpSocket) -> Result<()> {
+    fn join_multicast_v4(socket: &UdpSocket) -> Result<()> {
         socket
-            .join_multicast_v4(&LSD_MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED)
-            .context("Failed to join multicast group")
+            .join_multicast_v4(&LSD_MULTICAST_ADDR_V4, &Ipv4Addr::UNSPECIFIED)
+            .context("Failed to join IPv4 multicast group")
+    }
+
+    #[cfg(target_os = "windows")]
+    fn join_multicast_v6(socket: &UdpSocket) -> Result<()> {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            setsockopt, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, SOCKET,
+        };
+
+        #[repr(C)]
+        struct Ipv6Mreq {
+            ipv6mr_multiaddr: [u8; 16],
+            ipv6mr_interface: u32,
+        }
+
+        let mreq = Ipv6Mreq {
+            ipv6mr_multiaddr: LSD_MULTICAST_ADDR_V6.octets(),
+            ipv6mr_interface: 0,
+        };
+
+        let sock = socket.as_raw_socket() as SOCKET;
+        let result = unsafe {
+            setsockopt(
+                sock,
+                IPPROTO_IPV6 as i32,
+                IPV6_ADD_MEMBERSHIP as i32,
+                &mreq as *const Ipv6Mreq as *const u8,
+                std::mem::size_of::<Ipv6Mreq>() as i32,
+            )
+        };
+
+        if result != 0 {
+            anyhow::bail!("Failed to join IPv6 multicast group");
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn join_multicast_v6(socket: &UdpSocket) -> Result<()> {
+        socket
+            .join_multicast_v6(&LSD_MULTICAST_ADDR_V6, 0)
+            .context("Failed to join IPv6 multicast group")
     }
 
     pub fn add_torrent(&mut self, info_hash: [u8; 20]) {
@@ -123,10 +191,9 @@ impl LsdClient {
     }
 
     pub fn tick(&mut self) -> Result<()> {
-        let socket = match self.socket.as_ref() {
-            Some(s) => s,
-            None => return Ok(()),
-        };
+        if self.socket_v4.is_none() && self.socket_v6.is_none() {
+            return Ok(());
+        }
 
         self.process_incoming_messages()?;
         self.cleanup_expired_peers();
@@ -155,30 +222,63 @@ impl LsdClient {
     }
 
     fn send_announce(&mut self, info_hash: [u8; 20]) -> Result<()> {
-        let socket = self.socket.as_ref().context("No socket available")?;
-
         let announce = self.torrents.get_mut(&info_hash).context("Torrent not found")?;
 
-        let message = format!(
-            "BT-SEARCH * HTTP/1.1\r\n\
-             Host: {}:{}\r\n\
-             Port: {}\r\n\
-             Infohash: {}\r\n\
-             cookie: {}\r\n\
-             \r\n",
-            LSD_MULTICAST_ADDR,
-            LSD_PORT,
-            self.listen_port,
-            hex::encode(info_hash),
-            announce.cookie
-        );
+        let mut sent = false;
 
-        socket
-            .send_to(
+        if let Some(socket_v4) = self.socket_v4.as_ref() {
+            let message = format!(
+                "BT-SEARCH * HTTP/1.1\r\n\
+                 Host: {}:{}\r\n\
+                 Port: {}\r\n\
+                 Infohash: {}\r\n\
+                 cookie: {}\r\n\
+                 \r\n",
+                LSD_MULTICAST_ADDR_V4,
+                LSD_PORT,
+                self.listen_port,
+                hex::encode(info_hash),
+                announce.cookie
+            );
+
+            if let Err(e) = socket_v4.send_to(
                 message.as_bytes(),
-                SocketAddrV4::new(LSD_MULTICAST_ADDR, LSD_PORT),
-            )
-            .context("Failed to send LSD announce")?;
+                SocketAddrV4::new(LSD_MULTICAST_ADDR_V4, LSD_PORT),
+            ) {
+                eprintln!("Failed to send IPv4 LSD announce: {}", e);
+            } else {
+                sent = true;
+            }
+        }
+
+        if let Some(socket_v6) = self.socket_v6.as_ref() {
+            let message = format!(
+                "BT-SEARCH * HTTP/1.1\r\n\
+                 Host: [{}]:{}\r\n\
+                 Port: {}\r\n\
+                 Infohash: {}\r\n\
+                 cookie: {}\r\n\
+                 \r\n",
+                LSD_MULTICAST_ADDR_V6,
+                LSD_PORT,
+                self.listen_port,
+                hex::encode(info_hash),
+                announce.cookie
+            );
+
+            if let Err(e) = socket_v6.send_to(
+                message.as_bytes(),
+                SocketAddrV6::new(LSD_MULTICAST_ADDR_V6, LSD_PORT, 0, 0),
+            ) {
+                eprintln!("Failed to send IPv6 LSD announce: {}", e);
+            } else {
+                sent = true;
+            }
+        }
+
+        if !sent {
+            anyhow::bail!("Failed to send announce on any socket");
+        }
 
         announce.last_announce = Some(Instant::now());
 
@@ -186,37 +286,63 @@ impl LsdClient {
     }
 
     fn process_incoming_messages(&mut self) -> Result<()> {
-        if self.socket.is_none() {
-            return Ok(());
-        }
-
         let mut buf = vec![0u8; 2048];
         let mut messages_to_process = Vec::new();
 
-        loop {
-            if messages_to_process.len() >= MAX_MESSAGES_PER_TICK {
-                break;
-            }
+        if let Some(socket_v4) = self.socket_v4.as_ref() {
+            loop {
+                if messages_to_process.len() >= MAX_MESSAGES_PER_TICK {
+                    break;
+                }
 
-            let socket = self.socket.as_ref().unwrap();
-            match socket.recv_from(&mut buf) {
-                Ok((n, addr)) => {
-                    if n == 0 {
-                        continue;
+                match socket_v4.recv_from(&mut buf) {
+                    Ok((n, addr)) => {
+                        if n == 0 {
+                            continue;
+                        }
+
+                        let message = String::from_utf8_lossy(&buf[..n]).to_string();
+                        messages_to_process.push((message, addr));
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("LSD IPv4 receive error: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
 
-                    let message = String::from_utf8_lossy(&buf[..n]).to_string();
-                    messages_to_process.push((message, addr));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+        if let Some(socket_v6) = self.socket_v6.as_ref() {
+            loop {
+                if messages_to_process.len() >= MAX_MESSAGES_PER_TICK {
                     break;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("LSD receive error: {}", e);
-                    break;
+
+                match socket_v6.recv_from(&mut buf) {
+                    Ok((n, addr)) => {
+                        if n == 0 {
+                            continue;
+                        }
+
+                        let message = String::from_utf8_lossy(&buf[..n]).to_string();
+                        messages_to_process.push((message, addr));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("LSD IPv6 receive error: {}", e);
+                        break;
+                    }
                 }
             }
         }
@@ -230,7 +356,7 @@ impl LsdClient {
         Ok(())
     }
 
-    fn handle_message(&mut self, message: &str, addr: std::net::SocketAddr) -> Result<()> {
+    fn handle_message(&mut self, message: &str, addr: SocketAddr) -> Result<()> {
         if !message.starts_with("BT-SEARCH * HTTP/1.1") {
             return Ok(());
         }
@@ -278,24 +404,25 @@ impl LsdClient {
                     }
                 }
 
-                if let std::net::SocketAddr::V4(v4_addr) = addr {
-                    let peer_addr = SocketAddrV4::new(*v4_addr.ip(), port);
+                let peer_addr = match addr {
+                    SocketAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(*v4.ip(), port)),
+                    SocketAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(*v6.ip(), port, 0, 0)),
+                };
 
-                    if peer_addr.port() == 0 || peer_addr.port() == self.listen_port {
-                        return Ok(());
-                    }
+                if port == 0 || port == self.listen_port {
+                    return Ok(());
+                }
 
-                    if let Some(peers) = self.discovered_peers.get_mut(&info_hash) {
-                        if peers.len() >= MAX_PEERS_PER_INFOHASH && !peers.contains_key(&peer_addr) {
-                            if let Some(oldest_peer) = peers.iter()
-                                .min_by_key(|(_, &time)| time)
-                                .map(|(addr, _)| *addr)
-                            {
-                                peers.remove(&oldest_peer);
-                            }
+                if let Some(peers) = self.discovered_peers.get_mut(&info_hash) {
+                    if peers.len() >= MAX_PEERS_PER_INFOHASH && !peers.contains_key(&peer_addr) {
+                        if let Some(oldest_peer) = peers.iter()
+                            .min_by_key(|(_, &time)| time)
+                            .map(|(addr, _)| *addr)
+                        {
+                            peers.remove(&oldest_peer);
                         }
-                        peers.insert(peer_addr, Instant::now());
                     }
+                    peers.insert(peer_addr, Instant::now());
                 }
             }
         }
@@ -303,7 +430,7 @@ impl LsdClient {
         Ok(())
     }
 
-    pub fn get_discovered_peers(&mut self, info_hash: &[u8; 20]) -> Vec<SocketAddrV4> {
+    pub fn get_discovered_peers(&mut self, info_hash: &[u8; 20]) -> Vec<SocketAddr> {
         let now = Instant::now();
 
         if let Some(peers) = self.discovered_peers.get_mut(info_hash) {
@@ -343,7 +470,8 @@ mod tests {
     fn test_client_creation() {
         let client = LsdClient::new(6881);
         assert_eq!(client.listen_port, 6881);
-        assert!(client.socket.is_none());
+        assert!(client.socket_v4.is_none());
+        assert!(client.socket_v6.is_none());
     }
 
     #[test]
@@ -388,11 +516,12 @@ mod tests {
         assert_eq!(peers.len(), 0);
 
         if let Some(peer_set) = client.discovered_peers.get_mut(&info_hash) {
-            peer_set.insert(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 6882));
+            peer_set.insert(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 100), 6882)), Instant::now());
+            peer_set.insert(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), 6883, 0, 0)), Instant::now());
         }
 
         let peers = client.get_discovered_peers(&info_hash);
-        assert_eq!(peers.len(), 1);
+        assert_eq!(peers.len(), 2);
     }
 
     #[test]

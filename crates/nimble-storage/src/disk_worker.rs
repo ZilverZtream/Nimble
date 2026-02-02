@@ -163,7 +163,10 @@ impl DiskWorkerState {
         let global_end = global_start + length as u64;
 
         let segments = self.layout.map_range(global_start, global_end);
-        let mut data = vec![0u8; length as usize];
+        // Issue #10 Fix: Use buffer pool for disk reads to reduce allocations
+        let mut pooled_buf = crate::buffer_pool::global_pool().get();
+        pooled_buf.as_mut().resize(length as usize, 0);
+        let data_slice = pooled_buf.as_mut().as_mut_slice();
         let mut data_offset = 0;
 
         for segment in segments {
@@ -171,7 +174,7 @@ impl DiskWorkerState {
             file_handle.seek(SeekFrom::Start(segment.file_offset))?;
 
             let read_length = segment.length as usize;
-            file_handle.read_exact(&mut data[data_offset..data_offset + read_length])?;
+            file_handle.read_exact(&mut data_slice[data_offset..data_offset + read_length])?;
 
             data_offset += read_length;
         }
@@ -180,7 +183,7 @@ impl DiskWorkerState {
             anyhow::bail!("incomplete read: expected {} bytes, got {}", length, data_offset);
         }
 
-        Ok(data)
+        Ok(pooled_buf.take())
     }
 
     fn flush_all(&mut self) -> Result<()> {

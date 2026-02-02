@@ -333,6 +333,7 @@ dependencies = [
  "fastrand",
  "libc",
  "nimble-bencode",
+ "nimble-storage",
  "nimble-util",
  "num-bigint",
  "thiserror",

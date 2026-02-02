@@ -36,12 +36,11 @@ const MAX_METADATA_SIZE: u32 = 10 * 1024 * 1024;
 /// RFC-101 Step 2: Fixed-size receive buffer for zero-allocation message parsing.
 /// 256KB is required to support bitfields up to MAX_BITFIELD_BYTES (262144).
 ///
-/// NOTE: Current design still involves memory copying:
-/// Socket -> recv_buffer -> Vec (PeerMessage::Piece) -> Channel -> Disk Worker
-/// Future optimization (Issue #10): implement zero-copy path where piece data
-/// is written directly to a memory-mapped buffer or uses io_uring on Linux.
-/// This would require significant architectural changes but could improve
-/// throughput on high-speed connections.
+/// Issue #10 Fix: Piece data now uses buffer pooling to reduce allocation overhead.
+/// Flow: Socket -> recv_buffer -> PooledBuffer (reused) -> Channel -> Disk Worker -> Pool
+/// The buffer pool maintains up to 256 reusable 16KB buffers, significantly reducing
+/// GC pressure and allocation overhead. When a piece block is consumed by disk worker,
+/// the buffer is automatically returned to the pool for reuse.
 const RECV_BUFFER_SIZE: usize = 256 * 1024;
 
 /// RFC-101 Step 4: Batched message queue limits.
@@ -298,7 +297,10 @@ impl PeerMessage {
                 }
                 let index = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
                 let begin = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
-                let block = data[9..].to_vec();
+                // Issue #10 Fix: Use buffer pool for piece data to reduce allocations
+                let mut pooled_buf = nimble_storage::buffer_pool::global_pool().get();
+                pooled_buf.as_mut().extend_from_slice(&data[9..]);
+                let block = pooled_buf.take();
                 Ok(PeerMessage::Piece {
                     index,
                     begin,

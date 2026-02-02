@@ -1482,6 +1482,10 @@ impl UtpListener {
         })
     }
 
+    pub fn has_v6_socket(&self) -> bool {
+        self.socket_v6.is_some()
+    }
+
     pub fn connect(&mut self, addr: SocketAddr) -> Result<u16> {
         match addr {
             SocketAddr::V4(_) => {

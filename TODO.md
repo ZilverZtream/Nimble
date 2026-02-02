@@ -246,9 +246,9 @@ Leaving completed TODOs unchecked is considered a bug.
 - [x] H3.4 Retry & timeout logic
 
 ## H4. Tracker management
-- [ ] H4.1 Tier rotation
-- [ ] H4.2 Backoff strategy
-- [ ] H4.3 Multi-tracker aggregation
+- [x] H4.1 Tier rotation
+- [x] H4.2 Backoff strategy
+- [x] H4.3 Multi-tracker aggregation
 
 -------------------------------------------------------------------------------
 
@@ -359,16 +359,16 @@ Leaving completed TODOs unchecked is considered a bug.
 
 ## O1. Status window
 - [x] O1.1 Window creation
-- [ ] O1.2 Torrent list view
-- [ ] O1.3 Live stats updates
-- [ ] O1.4 Per-torrent context menu
+- [x] O1.2 Torrent list view
+- [x] O1.3 Live stats updates
+- [x] O1.4 Per-torrent context menu
 
 ## O2. Per-torrent actions
-- [ ] O2.1 Pause/resume torrent
-- [ ] O2.2 Remove torrent (keep data)
-- [ ] O2.3 Remove torrent + delete data
-- [ ] O2.4 Force recheck
-- [ ] O2.5 Open containing folder
+- [x] O2.1 Pause/resume torrent
+- [x] O2.2 Remove torrent (keep data)
+- [x] O2.3 Remove torrent + delete data
+- [x] O2.4 Force recheck
+- [x] O2.5 Open containing folder
 
 ## O3. File priorities UI
 - [ ] O3.1 File list view
@@ -381,6 +381,23 @@ Leaving completed TODOs unchecked is considered a bug.
 - [ ] O4.3 Feature toggles
 - [ ] O4.4 Limits configuration
 - [ ] O4.5 Disk/cache settings
+
+## O5. Queue management
+- [ ] O5.1 Add priority field to Session torrents
+- [ ] O5.2 Implement move up/down queue operations
+- [ ] O5.3 Queue-based auto-start logic
+- [ ] O5.4 Context menu: Move Up Queue
+- [ ] O5.5 Context menu: Move Down Queue
+- [ ] O5.6 Context menu: Move to Top
+- [ ] O5.7 Context menu: Move to Bottom
+
+## O6. Per-torrent bandwidth limits
+- [ ] O6.1 Add per-torrent bandwidth limit fields
+- [ ] O6.2 Implement SetBandwidthLimit command
+- [ ] O6.3 Integrate with existing bandwidth limiter
+- [ ] O6.4 Bandwidth submenu in context menu
+- [ ] O6.5 UI for setting download limit
+- [ ] O6.6 UI for setting upload limit
 
 -------------------------------------------------------------------------------
 

@@ -6,6 +6,7 @@ pub struct FileLayout {
     files: Vec<FileEntry>,
     piece_length: u64,
     total_length: u64,
+    root_dir: PathBuf,
 }
 
 #[derive(Clone)]
@@ -13,6 +14,12 @@ struct FileEntry {
     path: PathBuf,
     offset: u64,
     length: u64,
+}
+
+#[derive(Clone)]
+pub struct FileInfo {
+    pub path: PathBuf,
+    pub length: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -26,6 +33,7 @@ impl FileLayout {
     pub fn new(info: &TorrentInfo, download_dir: PathBuf) -> Self {
         let mut files = Vec::new();
         let mut offset = 0u64;
+        let root = download_dir.clone();
 
         match &info.mode {
             TorrentMode::SingleFile { name, length } => {
@@ -58,7 +66,19 @@ impl FileLayout {
             files,
             piece_length: info.piece_length,
             total_length: info.total_length,
+            root_dir: root,
         }
+    }
+
+    pub fn files(&self) -> Vec<FileInfo> {
+        self.files.iter().map(|f| FileInfo {
+            path: f.path.clone(),
+            length: f.length,
+        }).collect()
+    }
+
+    pub fn root_dir(&self) -> PathBuf {
+        self.root_dir.clone()
     }
 
     pub fn file_count(&self) -> usize {

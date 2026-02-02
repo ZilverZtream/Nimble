@@ -438,6 +438,202 @@ impl Session {
         }
     }
 
+    pub fn pause_torrent(&mut self, infohash: &str) -> Result<()> {
+        let torrent = self.torrents.get_mut(infohash)
+            .ok_or_else(|| anyhow::anyhow!("torrent not found"))?;
+        match torrent {
+            TorrentEntry::Active(state) => state.paused = true,
+            TorrentEntry::Magnet(state) => state.paused = true,
+        }
+        Ok(())
+    }
+
+    pub fn resume_torrent(&mut self, infohash: &str) -> Result<()> {
+        let torrent = self.torrents.get_mut(infohash)
+            .ok_or_else(|| anyhow::anyhow!("torrent not found"))?;
+        match torrent {
+            TorrentEntry::Active(state) => state.paused = false,
+            TorrentEntry::Magnet(state) => state.paused = false,
+        }
+        Ok(())
+    }
+
+    pub fn remove_torrent(&mut self, infohash: &str, delete_data: bool) -> Result<()> {
+        let torrent = self.torrents.remove(infohash)
+            .ok_or_else(|| anyhow::anyhow!("torrent not found"))?;
+
+        if let Some(listener) = self.peer_listener.as_mut() {
+            let info_hash_bytes = match &torrent {
+                TorrentEntry::Active(t) => t.info.infohash.as_bytes(),
+                TorrentEntry::Magnet(t) => &t.info_hash,
+            };
+            listener.unregister_infohash(info_hash_bytes);
+        }
+
+        if let Some(lsd) = self.lsd.as_mut() {
+            let info_hash_bytes = match &torrent {
+                TorrentEntry::Active(t) => t.info.infohash.as_bytes(),
+                TorrentEntry::Magnet(t) => &t.info_hash,
+            };
+            lsd.remove_torrent(info_hash_bytes);
+        }
+
+        if let TorrentEntry::Active(mut state) = torrent {
+            state.storage.close()?;
+            if delete_data {
+                state.storage.delete_files()?;
+            }
+        }
+
+        let torrent_file = self.download_dir.join(format!("{}.torrent", infohash));
+        if torrent_file.exists() {
+            let _ = fs::remove_file(torrent_file);
+        }
+
+        Ok(())
+    }
+
+    pub fn force_recheck(&mut self, infohash: &str) -> Result<()> {
+        let torrent = self.torrents.get_mut(infohash)
+            .ok_or_else(|| anyhow::anyhow!("torrent not found"))?;
+        if let TorrentEntry::Active(state) = torrent {
+            state.storage.force_recheck()?;
+            state.peer_manager.sync_completed_pieces(state.storage.bitfield());
+            state.stats.pieces_completed = state.storage.bitfield().count_ones() as u32;
+        } else {
+            anyhow::bail!("cannot recheck magnet link");
+        }
+        Ok(())
+    }
+
+    pub fn get_torrent_folder(&self, infohash: &str) -> Result<PathBuf> {
+        let torrent = self.torrents.get(infohash)
+            .ok_or_else(|| anyhow::anyhow!("torrent not found"))?;
+        match torrent {
+            TorrentEntry::Active(state) => Ok(state.storage.root_dir()),
+            TorrentEntry::Magnet(_) => Ok(self.download_dir.clone()),
+        }
+    }
+
+    pub fn get_torrent_list(&self) -> Vec<crate::types::TorrentInfo> {
+        use crate::types::{TorrentInfo, TorrentState};
+        use nimble_bencode::torrent::TorrentMode;
+
+        self.torrents.iter().map(|(infohash, entry)| {
+            match entry {
+                TorrentEntry::Active(state) => {
+                    let progress = if state.stats.pieces_total > 0 {
+                        (state.stats.pieces_completed as f32 / state.stats.pieces_total as f32) * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    let torrent_state = if state.paused {
+                        TorrentState::Paused
+                    } else if progress >= 100.0 {
+                        TorrentState::Seeding
+                    } else {
+                        TorrentState::Downloading
+                    };
+
+                    let name = match &state.info.mode {
+                        TorrentMode::SingleFile { name, .. } => name.clone(),
+                        TorrentMode::MultiFile { name, .. } => name.clone(),
+                    };
+
+                    let trackers = if !state.info.announce_list.is_empty() {
+                        state.info.announce_list.iter().flat_map(|tier| tier.iter().cloned()).collect()
+                    } else if let Some(announce) = &state.info.announce {
+                        vec![announce.clone()]
+                    } else {
+                        Vec::new()
+                    };
+
+                    TorrentInfo {
+                        infohash: infohash.clone(),
+                        name,
+                        state: torrent_state,
+                        pieces_completed: state.stats.pieces_completed,
+                        pieces_total: state.stats.pieces_total,
+                        downloaded: state.stats.downloaded,
+                        uploaded: state.stats.uploaded,
+                        connected_peers: state.stats.connected_peers,
+                        total_size: state.info.total_length,
+                        trackers,
+                        is_private: state.info.private,
+                    }
+                }
+                TorrentEntry::Magnet(state) => {
+                    TorrentInfo {
+                        infohash: infohash.clone(),
+                        name: format!("Magnet {}", &infohash[..8]),
+                        state: if state.paused {
+                            TorrentState::Paused
+                        } else {
+                            TorrentState::FetchingMetadata
+                        },
+                        pieces_completed: 0,
+                        pieces_total: 0,
+                        downloaded: state.stats.downloaded,
+                        uploaded: state.stats.uploaded,
+                        connected_peers: state.stats.connected_peers,
+                        total_size: 0,
+                        trackers: state.trackers.clone(),
+                        is_private: false,
+                    }
+                }
+            }
+        }).collect()
+    }
+
+    pub fn get_magnet_link(&self, infohash: &str) -> Result<String> {
+        let torrent = self.torrents.get(infohash)
+            .ok_or_else(|| anyhow::anyhow!("torrent not found"))?;
+
+        let mut magnet = format!("magnet:?xt=urn:btih:{}", infohash);
+
+        match torrent {
+            TorrentEntry::Active(state) => {
+                let name = match &state.info.mode {
+                    nimble_bencode::torrent::TorrentMode::SingleFile { name, .. } => name.clone(),
+                    nimble_bencode::torrent::TorrentMode::MultiFile { name, .. } => name.clone(),
+                };
+                magnet.push_str(&format!("&dn={}", Self::url_encode(&name)));
+
+                for tracker in &state.info.announce_list.iter().flat_map(|tier| tier.iter()).collect::<Vec<_>>() {
+                    magnet.push_str(&format!("&tr={}", Self::url_encode(tracker)));
+                }
+                if state.info.announce_list.is_empty() {
+                    if let Some(announce) = &state.info.announce {
+                        magnet.push_str(&format!("&tr={}", Self::url_encode(announce)));
+                    }
+                }
+            }
+            TorrentEntry::Magnet(state) => {
+                for tracker in &state.trackers {
+                    magnet.push_str(&format!("&tr={}", Self::url_encode(tracker)));
+                }
+            }
+        }
+
+        Ok(magnet)
+    }
+
+    fn url_encode(s: &str) -> String {
+        let mut encoded = String::new();
+        for byte in s.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    encoded.push(byte as char);
+                }
+                _ => {
+                    encoded.push_str(&format!("%{:02X}", byte));
+                }
+            }
+        }
+        encoded
+    }
+
     pub fn active_count(&self) -> u32 {
         self.torrents.len() as u32
     }

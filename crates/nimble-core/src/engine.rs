@@ -55,6 +55,119 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
                     let _ = evt_tx.send(Event::LogLine("Resumed all torrents".to_string()));
                 }
 
+                Ok(Command::PauseTorrent { infohash }) => match session.pause_torrent(&infohash) {
+                    Ok(_) => {
+                        let msg = format!("Paused torrent: {}", &infohash[..8]);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to pause torrent {}: {}", &infohash[..8], e);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                },
+
+                Ok(Command::ResumeTorrent { infohash }) => match session.resume_torrent(&infohash) {
+                    Ok(_) => {
+                        let msg = format!("Resumed torrent: {}", &infohash[..8]);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to resume torrent {}: {}", &infohash[..8], e);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                },
+
+                Ok(Command::RemoveTorrent { infohash }) => match session.remove_torrent(&infohash, false) {
+                    Ok(_) => {
+                        let msg = format!("Removed torrent: {}", &infohash[..8]);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to remove torrent {}: {}", &infohash[..8], e);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                },
+
+                Ok(Command::RemoveTorrentWithData { infohash }) => match session.remove_torrent(&infohash, true) {
+                    Ok(_) => {
+                        let msg = format!("Removed torrent and data: {}", &infohash[..8]);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to remove torrent with data {}: {}", &infohash[..8], e);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                },
+
+                Ok(Command::ForceRecheck { infohash }) => match session.force_recheck(&infohash) {
+                    Ok(_) => {
+                        let msg = format!("Force recheck started: {}", &infohash[..8]);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to force recheck {}: {}", &infohash[..8], e);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                },
+
+                Ok(Command::OpenFolder { infohash }) => match session.get_torrent_folder(&infohash) {
+                    Ok(path) => {
+                        #[cfg(target_os = "windows")]
+                        {
+                            use std::os::windows::ffi::OsStrExt;
+                            let path_wide: Vec<u16> = std::ffi::OsStr::new(&path)
+                                .encode_wide()
+                                .chain(std::iter::once(0))
+                                .collect();
+                            unsafe {
+                                use windows_sys::Win32::UI::Shell::ShellExecuteW;
+                                use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
+                                let result = ShellExecuteW(
+                                    0,
+                                    "open\0".encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>().as_ptr(),
+                                    path_wide.as_ptr(),
+                                    std::ptr::null(),
+                                    std::ptr::null(),
+                                    SW_SHOW,
+                                );
+                                if result <= 32 {
+                                    let msg = format!("Failed to open folder for {}", &infohash[..8]);
+                                    let _ = evt_tx.send(Event::LogLine(msg));
+                                } else {
+                                    let msg = format!("Opened folder for {}", &infohash[..8]);
+                                    let _ = evt_tx.send(Event::LogLine(msg));
+                                }
+                            }
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            let msg = format!("Open folder not supported on this platform");
+                            let _ = evt_tx.send(Event::LogLine(msg));
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to get folder for {}: {}", &infohash[..8], e);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                },
+
+                Ok(Command::CopyMagnetLink { infohash }) => match session.get_magnet_link(&infohash) {
+                    Ok(magnet) => {
+                        let _ = evt_tx.send(Event::MagnetLink(magnet));
+                        let msg = format!("Copied magnet link for {}", &infohash[..8]);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to get magnet link for {}: {}", &infohash[..8], e);
+                        let _ = evt_tx.send(Event::LogLine(msg));
+                    }
+                },
+
+                Ok(Command::GetTorrentList) => {
+                    let torrent_list = session.get_torrent_list();
+                    let _ = evt_tx.send(Event::TorrentList(torrent_list));
+                }
+
                 Ok(Command::AddTorrentFile { path }) => match session.add_torrent_file(&path) {
                     Ok(infohash) => {
                         let msg = format!("Added torrent: {} ({})", path, infohash);

@@ -272,6 +272,12 @@ fn event_listener_thread(events: EventReceiver) {
                             }
                             PostMessageW(hwnd, WM_ENGINE_EVENT, 0, 0);
                         }
+                        Event::TorrentList(torrents) => {
+                            ui_status::update_torrents_from_event(torrents);
+                        }
+                        Event::MagnetLink(magnet) => {
+                            copy_to_clipboard(&magnet);
+                        }
                         Event::Started => {
                             log::info("Engine started event received");
                         }
@@ -580,7 +586,13 @@ unsafe fn handle_open_downloads(_hwnd: HWND) {
 
 #[cfg(windows)]
 unsafe fn handle_status_window(hwnd: HWND) {
-    if let Err(err) = ui_status::open_status_window(hwnd) {
+    let engine_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const EngineHandle;
+    if engine_ptr.is_null() {
+        log::info("Engine handle not found");
+        return;
+    }
+    let engine = (*engine_ptr).clone();
+    if let Err(err) = ui_status::open_status_window(hwnd, engine) {
         log::info(&format!("Status window failed: {err:?}"));
     }
 }
@@ -683,6 +695,42 @@ unsafe fn handle_quit(hwnd: HWND) {
         let _ = engine.tx.send(Command::Shutdown);
     }
     PostQuitMessage(0);
+}
+
+#[cfg(windows)]
+unsafe fn copy_to_clipboard(text: &str) {
+    use windows_sys::Win32::System::DataExchange::{OpenClipboard, CloseClipboard, EmptyClipboard, SetClipboardData};
+    use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use std::ptr::copy_nonoverlapping;
+
+    const CF_UNICODETEXT: u32 = 13;
+
+    if OpenClipboard(0) == 0 {
+        return;
+    }
+
+    EmptyClipboard();
+
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let size = wide.len() * 2;
+
+    let hglob = GlobalAlloc(GMEM_MOVEABLE, size);
+    if hglob == 0 {
+        CloseClipboard();
+        return;
+    }
+
+    let locked = GlobalLock(hglob);
+    if locked.is_null() {
+        CloseClipboard();
+        return;
+    }
+
+    copy_nonoverlapping(wide.as_ptr(), locked as *mut u16, wide.len());
+    GlobalUnlock(hglob);
+
+    SetClipboardData(CF_UNICODETEXT, hglob as isize);
+    CloseClipboard();
 }
 
 #[cfg(windows)]

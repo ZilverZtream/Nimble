@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 const UTP_VERSION: u8 = 1;
@@ -28,6 +30,7 @@ const MAX_SACK_SIZE: usize = 32;
 const MAX_INFLIGHT_PACKETS: usize = 1024;
 const MAX_REORDER_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_SEQUENCE_GAP: u16 = 16384;
+const PACKET_POOL_BUFFER_SIZE: usize = 2048;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,10 +162,89 @@ impl UtpHeader {
 #[derive(Debug, Clone)]
 struct InFlightPacket {
     seq_nr: u16,
-    data: Vec<u8>,
+    data: PacketBuffer,
     sent_at: Instant,
     retransmits: u32,
     need_resend: bool,
+}
+
+struct PacketPoolInner {
+    buffers: Vec<Box<[u8; PACKET_POOL_BUFFER_SIZE]>>,
+}
+
+#[derive(Clone)]
+struct PacketPool {
+    inner: Rc<RefCell<PacketPoolInner>>,
+}
+
+impl PacketPool {
+    fn new() -> Self {
+        PacketPool {
+            inner: Rc::new(RefCell::new(PacketPoolInner { buffers: Vec::new() })),
+        }
+    }
+
+    fn checkout(&self) -> PacketBuffer {
+        let buffer = self.inner
+            .borrow_mut()
+            .buffers
+            .pop()
+            .unwrap_or_else(|| Box::new([0u8; PACKET_POOL_BUFFER_SIZE]));
+
+        PacketBuffer {
+            pool: self.clone(),
+            buffer: Some(buffer),
+            len: 0,
+        }
+    }
+
+    fn checkin(&self, buffer: Box<[u8; PACKET_POOL_BUFFER_SIZE]>) {
+        self.inner.borrow_mut().buffers.push(buffer);
+    }
+}
+
+struct PacketBuffer {
+    pool: PacketPool,
+    buffer: Option<Box<[u8; PACKET_POOL_BUFFER_SIZE]>>,
+    len: usize,
+}
+
+impl PacketBuffer {
+    fn as_slice(&self) -> &[u8] {
+        let buffer = self.buffer.as_ref().expect("packet buffer missing");
+        &buffer[..self.len]
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.buffer.as_mut().expect("packet buffer missing")
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn set_len(&mut self, len: usize) {
+        self.len = len;
+    }
+
+    fn checkin(mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.pool.checkin(buffer);
+        }
+    }
+}
+
+impl Drop for PacketBuffer {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.pool.checkin(buffer);
+        }
+    }
+}
+
+enum OutgoingPacket {
+    Owned(PacketBuffer),
+    Inflight(u16),
 }
 
 struct DelayHistory {
@@ -204,6 +286,7 @@ pub struct CongestionControl {
     bytes_acked: u32,
     delay_history: DelayHistory,
     slow_start: bool,
+    in_fast_recovery: bool,
     rtt_us: u32,
     rtt_var_us: u32,
     rto_ms: u64,
@@ -217,6 +300,7 @@ impl CongestionControl {
             bytes_acked: 0,
             delay_history: DelayHistory::new(),
             slow_start: true,
+            in_fast_recovery: false,
             rtt_us: 0,
             rtt_var_us: 0,
             rto_ms: RETRANSMIT_TIMEOUT_MIN_MS,
@@ -225,6 +309,14 @@ impl CongestionControl {
 
     fn on_ack(&mut self, bytes_acked: u32, delay_us: u32, inflight: u32) {
         self.delay_history.add_sample(delay_us);
+
+        if self.in_fast_recovery {
+            self.cwnd = self.ssthresh;
+            self.slow_start = false;
+            self.in_fast_recovery = false;
+            self.bytes_acked = self.bytes_acked.saturating_add(bytes_acked);
+            return;
+        }
 
         if self.slow_start {
             self.cwnd = self.cwnd.saturating_add(bytes_acked);
@@ -235,7 +327,8 @@ impl CongestionControl {
             let our_delay = self.delay_history.current_delay() as i64;
             let off_target = TARGET_DELAY_US - our_delay;
             let delay_factor = off_target as f64 / TARGET_DELAY_US as f64;
-            let window_factor = bytes_acked as f64 / self.cwnd.max(1) as f64;
+            let acked_limited = bytes_acked.min(self.cwnd);
+            let window_factor = acked_limited as f64 / self.cwnd.max(1) as f64;
             let scaled_gain = (MAX_CWND_INCREASE_BYTES_PER_RTT as f64 * delay_factor * window_factor) as i32;
             let new_cwnd = (self.cwnd as i64 + scaled_gain as i64).max(MIN_CWND as i64) as u32;
             self.cwnd = new_cwnd.min(MAX_CWND);
@@ -246,8 +339,9 @@ impl CongestionControl {
 
     fn on_loss(&mut self) {
         self.ssthresh = (self.cwnd / 2).max(MIN_CWND);
-        self.cwnd = MIN_CWND;
+        self.cwnd = self.ssthresh.saturating_add(3 * MAX_PACKET_SIZE as u32);
         self.slow_start = false;
+        self.in_fast_recovery = true;
     }
 
     fn on_timeout(&mut self) {
@@ -313,10 +407,11 @@ pub struct UtpSocket {
     fin_sent: bool,
     fin_received: bool,
     fin_seq_nr: Option<u16>,
-    outgoing_packets: Vec<(Vec<u8>, SocketAddr)>,
+    outgoing_packets: Vec<OutgoingPacket>,
     reorder_buffer: HashMap<u16, Vec<u8>>,
     reorder_buffer_bytes: usize,
     sack_ranges: Vec<(u16, u16)>,
+    packet_pool: PacketPool,
 }
 
 impl UtpSocket {
@@ -351,6 +446,7 @@ impl UtpSocket {
             reorder_buffer: HashMap::new(),
             reorder_buffer_bytes: 0,
             sack_ranges: Vec::new(),
+            packet_pool: PacketPool::new(),
         }
     }
 
@@ -385,28 +481,31 @@ impl UtpSocket {
             reorder_buffer: HashMap::new(),
             reorder_buffer_bytes: 0,
             sack_ranges: Vec::new(),
+            packet_pool: PacketPool::new(),
         }
     }
 
-    pub fn initiate_connect(&mut self) -> Vec<u8> {
+    pub fn initiate_connect(&mut self) {
         self.state = ConnectionState::SynSent;
         let packet = self.build_packet(PacketType::Syn, &[]);
+        let seq = self.seq_nr.wrapping_sub(1);
         self.inflight.insert(
-            self.seq_nr.wrapping_sub(1),
+            seq,
             InFlightPacket {
-                seq_nr: self.seq_nr.wrapping_sub(1),
-                data: packet.clone(),
+                seq_nr: seq,
+                data: packet,
                 sent_at: Instant::now(),
                 retransmits: 0,
                 need_resend: false,
             },
         );
-        packet
+        self.outgoing_packets.push(OutgoingPacket::Inflight(seq));
     }
 
-    pub fn accept(&mut self) -> Vec<u8> {
+    pub fn accept(&mut self) {
         self.state = ConnectionState::Connected;
-        self.build_packet(PacketType::State, &[])
+        let packet = self.build_packet(PacketType::State, &[]);
+        self.outgoing_packets.push(OutgoingPacket::Owned(packet));
     }
 
     pub fn send(&mut self, data: &[u8]) -> Result<usize> {
@@ -441,7 +540,7 @@ impl UtpSocket {
 
     pub fn reset(&mut self) {
         let packet = self.build_packet(PacketType::Reset, &[]);
-        self.outgoing_packets.push((packet, self.addr));
+        self.outgoing_packets.push(OutgoingPacket::Owned(packet));
         self.state = ConnectionState::Reset;
     }
 
@@ -591,7 +690,8 @@ impl UtpSocket {
 
         for seq in acked_seqs {
             if let Some(pkt) = self.inflight.remove(&seq) {
-                self.inflight_bytes = self.inflight_bytes.saturating_sub(pkt.data.len() as u32);
+                self.inflight_bytes = self.inflight_bytes.saturating_sub(pkt.data.len as u32);
+                pkt.data.checkin();
             }
         }
 
@@ -604,16 +704,14 @@ impl UtpSocket {
             self.duplicate_acks = 0;
         } else if !self.inflight.is_empty() {
             self.duplicate_acks += 1;
-            if self.duplicate_acks >= DUPLICATE_ACK_THRESHOLD {
-                if let Some(oldest_seq) = self.inflight.keys().copied()
-                    .min_by(|a, b| wrapping_cmp(*a, *b))
-                {
-                    if let Some(pkt) = self.inflight.get_mut(&oldest_seq) {
-                        pkt.need_resend = true;
-                    }
+            if self.duplicate_acks == DUPLICATE_ACK_THRESHOLD {
+                if let Some(oldest_seq) = self.oldest_inflight_seq() {
+                    let now = Instant::now();
+                    self.queue_retransmit(oldest_seq, now);
                 }
                 self.congestion.on_loss();
-                self.duplicate_acks = 0;
+            } else if self.duplicate_acks > DUPLICATE_ACK_THRESHOLD {
+                self.congestion.cwnd = self.congestion.cwnd.saturating_add(MAX_PACKET_SIZE as u32);
             }
         }
 
@@ -668,10 +766,10 @@ impl UtpSocket {
 
     fn send_ack(&mut self) {
         let packet = self.build_packet(PacketType::State, &[]);
-        self.outgoing_packets.push((packet, self.addr));
+        self.outgoing_packets.push(OutgoingPacket::Owned(packet));
     }
 
-    pub fn tick(&mut self) -> Vec<(Vec<u8>, SocketAddr)> {
+    pub fn tick(&mut self) {
         self.outgoing_packets.clear();
 
         let now = Instant::now();
@@ -680,7 +778,7 @@ impl UtpSocket {
             if self.state != ConnectionState::Idle {
                 self.state = ConnectionState::Destroy;
             }
-            return std::mem::take(&mut self.outgoing_packets);
+            return;
         }
 
         self.check_retransmits(now);
@@ -689,17 +787,18 @@ impl UtpSocket {
 
         if self.fin_sent && self.state == ConnectionState::FinSent && !self.inflight.contains_key(&self.seq_nr) {
             let packet = self.build_packet(PacketType::Fin, &[]);
+            let seq = self.seq_nr.wrapping_sub(1);
             self.inflight.insert(
-                self.seq_nr.wrapping_sub(1),
+                seq,
                 InFlightPacket {
-                    seq_nr: self.seq_nr.wrapping_sub(1),
-                    data: packet.clone(),
+                    seq_nr: seq,
+                    data: packet,
                     sent_at: now,
                     retransmits: 0,
                     need_resend: false,
                 },
             );
-            self.outgoing_packets.push((packet, self.addr));
+            self.outgoing_packets.push(OutgoingPacket::Inflight(seq));
         }
 
         if self.last_send_time.elapsed() > Duration::from_millis(KEEPALIVE_INTERVAL_MS)
@@ -708,8 +807,6 @@ impl UtpSocket {
             self.send_ack();
             self.last_send_time = now;
         }
-
-        std::mem::take(&mut self.outgoing_packets)
     }
 
     fn check_retransmits(&mut self, now: Instant) {
@@ -731,12 +828,7 @@ impl UtpSocket {
         }
 
         for seq in to_resend {
-            if let Some(pkt) = self.inflight.get_mut(&seq) {
-                pkt.sent_at = now;
-                pkt.retransmits += 1;
-                pkt.need_resend = false;
-                self.outgoing_packets.push((pkt.data.clone(), self.addr));
-            }
+            self.queue_retransmit(seq, now);
         }
     }
 
@@ -763,14 +855,14 @@ impl UtpSocket {
                 seq,
                 InFlightPacket {
                     seq_nr: seq,
-                    data: packet.clone(),
+                    data: packet,
                     sent_at: Instant::now(),
                     retransmits: 0,
                     need_resend: false,
                 },
             );
-            self.inflight_bytes += packet.len() as u32;
-            self.outgoing_packets.push((packet, self.addr));
+            self.inflight_bytes += (UTP_HEADER_SIZE + payload.len()) as u32;
+            self.outgoing_packets.push(OutgoingPacket::Inflight(seq));
         }
     }
 
@@ -778,7 +870,7 @@ impl UtpSocket {
         self.congestion.cwnd().min(self.peer_wnd_size)
     }
 
-    fn build_packet(&mut self, ptype: PacketType, payload: &[u8]) -> Vec<u8> {
+    fn build_packet(&mut self, ptype: PacketType, payload: &[u8]) -> PacketBuffer {
         let now = Instant::now();
         let timestamp = micros_since(&now);
 
@@ -793,9 +885,11 @@ impl UtpSocket {
         header.wnd_size = self.our_wnd_size.saturating_sub(self.recv_buffer.len() as u32);
 
         let total_len = UTP_HEADER_SIZE + payload.len();
-        let mut packet = vec![0u8; total_len];
-        header.serialize(&mut packet[..UTP_HEADER_SIZE]);
-        packet[UTP_HEADER_SIZE..].copy_from_slice(payload);
+        let mut packet = self.packet_pool.checkout();
+        packet.set_len(total_len);
+        let buf = packet.as_mut_slice();
+        header.serialize(&mut buf[..UTP_HEADER_SIZE]);
+        buf[UTP_HEADER_SIZE..total_len].copy_from_slice(payload);
 
         if ptype == PacketType::Data || ptype == PacketType::Syn || ptype == PacketType::Fin {
             self.seq_nr = self.seq_nr.wrapping_add(1);
@@ -803,6 +897,39 @@ impl UtpSocket {
 
         self.last_send_time = now;
         packet
+    }
+
+    fn oldest_inflight_seq(&self) -> Option<u16> {
+        self.inflight.keys().copied().min_by(|a, b| wrapping_cmp(*a, *b))
+    }
+
+    fn queue_retransmit(&mut self, seq: u16, now: Instant) {
+        if let Some(pkt) = self.inflight.get_mut(&seq) {
+            pkt.sent_at = now;
+            pkt.retransmits += 1;
+            pkt.need_resend = false;
+            self.outgoing_packets.push(OutgoingPacket::Inflight(seq));
+        }
+    }
+
+    fn flush_outgoing<F>(&mut self, mut send_fn: F) -> Result<()>
+    where
+        F: FnMut(&[u8], SocketAddr) -> Result<usize>,
+    {
+        let outgoing = std::mem::take(&mut self.outgoing_packets);
+        for packet in outgoing {
+            match packet {
+                OutgoingPacket::Owned(buffer) => {
+                    let _ = send_fn(buffer.as_slice(), self.addr)?;
+                }
+                OutgoingPacket::Inflight(seq) => {
+                    if let Some(pkt) = self.inflight.get(&seq) {
+                        let _ = send_fn(pkt.data.as_slice(), self.addr)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -851,12 +978,12 @@ impl UtpMultiplexer {
         }
     }
 
-    pub fn connect(&mut self, addr: SocketAddr) -> Result<(u16, Vec<u8>)> {
+    pub fn connect(&mut self, addr: SocketAddr) -> Result<u16> {
         let mut socket = UtpSocket::new_outgoing(addr);
-        let syn_packet = socket.initiate_connect();
+        socket.initiate_connect();
         let conn_id = socket.conn_id_recv();
         self.sockets.insert((addr, conn_id), socket);
-        Ok((conn_id, syn_packet))
+        Ok(conn_id)
     }
 
     pub fn accept(&mut self) -> Option<(SocketAddr, u16)> {
@@ -870,16 +997,18 @@ impl UtpMultiplexer {
         }
     }
 
-    pub fn process_incoming(&mut self, data: &[u8], from: SocketAddr) -> Result<Vec<(Vec<u8>, SocketAddr)>> {
+    pub fn process_incoming<F>(&mut self, data: &[u8], from: SocketAddr, mut send_fn: F) -> Result<()>
+    where
+        F: FnMut(&[u8], SocketAddr) -> Result<usize>,
+    {
         let (header, _) = UtpHeader::parse(data)?;
-        let mut outgoing = Vec::new();
 
         if header.packet_type == PacketType::Syn {
             let mut socket = UtpSocket::new_incoming(from, header.connection_id, header.seq_nr, header.timestamp_us);
-            let ack = socket.accept();
-            outgoing.push((ack, from));
+            socket.accept();
+            socket.flush_outgoing(&mut send_fn)?;
             self.pending_incoming.push_back(socket);
-            return Ok(outgoing);
+            return Ok(());
         }
 
         let key_recv = (from, header.connection_id);
@@ -896,10 +1025,11 @@ impl UtpMultiplexer {
         if let Some(key) = key {
             if let Some(socket) = self.sockets.get_mut(&key) {
                 socket.process_packet(data)?;
+                socket.flush_outgoing(&mut send_fn)?;
             }
         }
 
-        Ok(outgoing)
+        Ok(())
     }
 
     pub fn get_socket(&mut self, addr: SocketAddr, conn_id: u16) -> Option<&mut UtpSocket> {
@@ -910,13 +1040,15 @@ impl UtpMultiplexer {
         self.sockets.remove(&(addr, conn_id))
     }
 
-    pub fn tick(&mut self) -> Vec<(Vec<u8>, SocketAddr)> {
-        let mut outgoing = Vec::new();
+    pub fn tick<F>(&mut self, mut send_fn: F) -> Result<()>
+    where
+        F: FnMut(&[u8], SocketAddr) -> Result<usize>,
+    {
         let mut to_remove = Vec::new();
 
         for (key, socket) in &mut self.sockets {
-            let packets = socket.tick();
-            outgoing.extend(packets);
+            socket.tick();
+            socket.flush_outgoing(&mut send_fn)?;
             if socket.is_closed() {
                 to_remove.push(*key);
             }
@@ -926,7 +1058,17 @@ impl UtpMultiplexer {
             self.sockets.remove(&key);
         }
 
-        outgoing
+        Ok(())
+    }
+
+    pub fn flush_socket<F>(&mut self, addr: SocketAddr, conn_id: u16, mut send_fn: F) -> Result<()>
+    where
+        F: FnMut(&[u8], SocketAddr) -> Result<usize>,
+    {
+        if let Some(socket) = self.sockets.get_mut(&(addr, conn_id)) {
+            socket.flush_outgoing(&mut send_fn)?;
+        }
+        Ok(())
     }
 
     pub fn socket_count(&self) -> usize {
@@ -1334,21 +1476,25 @@ impl UtpListener {
         })
     }
 
-    pub fn connect(&mut self, addr: SocketAddr) -> Result<(u16, Vec<u8>)> {
+    pub fn connect(&mut self, addr: SocketAddr) -> Result<u16> {
         match addr {
             SocketAddr::V4(_) => {
-                let (conn_id, packet) = self.multiplexer_v4.connect(addr)?;
+                let conn_id = self.multiplexer_v4.connect(addr)?;
                 if let Some(socket) = &self.socket_v4 {
-                    socket.send_to(&packet, addr)?;
+                    self.multiplexer_v4.flush_socket(addr, conn_id, |data, dest| {
+                        socket.send_to(data, dest)
+                    })?;
                 }
-                Ok((conn_id, packet))
+                Ok(conn_id)
             }
             SocketAddr::V6(_) => {
-                let (conn_id, packet) = self.multiplexer_v6.connect(addr)?;
+                let conn_id = self.multiplexer_v6.connect(addr)?;
                 if let Some(socket) = &self.socket_v6 {
-                    socket.send_to(&packet, addr)?;
+                    self.multiplexer_v6.flush_socket(addr, conn_id, |data, dest| {
+                        socket.send_to(data, dest)
+                    })?;
                 }
-                Ok((conn_id, packet))
+                Ok(conn_id)
             }
         }
     }
@@ -1360,19 +1506,17 @@ impl UtpListener {
     pub fn poll(&mut self) -> Result<()> {
         if let Some(socket) = &self.socket_v4 {
             while let Some((len, from)) = socket.recv_from(&mut self.recv_buf)? {
-                let packets = self.multiplexer_v4.process_incoming(&self.recv_buf[..len], from)?;
-                for (packet, addr) in packets {
-                    socket.send_to(&packet, addr)?;
-                }
+                self.multiplexer_v4.process_incoming(&self.recv_buf[..len], from, |data, addr| {
+                    socket.send_to(data, addr)
+                })?;
             }
         }
 
         if let Some(socket) = &self.socket_v6 {
             while let Some((len, from)) = socket.recv_from(&mut self.recv_buf)? {
-                let packets = self.multiplexer_v6.process_incoming(&self.recv_buf[..len], from)?;
-                for (packet, addr) in packets {
-                    socket.send_to(&packet, addr)?;
-                }
+                self.multiplexer_v6.process_incoming(&self.recv_buf[..len], from, |data, addr| {
+                    socket.send_to(data, addr)
+                })?;
             }
         }
 
@@ -1380,18 +1524,12 @@ impl UtpListener {
     }
 
     pub fn tick(&mut self) -> Result<()> {
-        let v4_packets = self.multiplexer_v4.tick();
         if let Some(socket) = &self.socket_v4 {
-            for (packet, addr) in v4_packets {
-                socket.send_to(&packet, addr)?;
-            }
+            self.multiplexer_v4.tick(|data, addr| socket.send_to(data, addr))?;
         }
 
-        let v6_packets = self.multiplexer_v6.tick();
         if let Some(socket) = &self.socket_v6 {
-            for (packet, addr) in v6_packets {
-                socket.send_to(&packet, addr)?;
-            }
+            self.multiplexer_v6.tick(|data, addr| socket.send_to(data, addr))?;
         }
 
         Ok(())
@@ -1496,10 +1634,11 @@ mod tests {
     fn test_socket_initiate_connect() {
         let addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 6881));
         let mut socket = UtpSocket::new_outgoing(addr);
-        let syn_packet = socket.initiate_connect();
+        socket.initiate_connect();
         assert_eq!(socket.state(), ConnectionState::SynSent);
-        assert!(syn_packet.len() >= UTP_HEADER_SIZE);
-        let (header, _) = UtpHeader::parse(&syn_packet).unwrap();
+        let packet = socket.inflight.values().next().expect("missing syn packet");
+        assert!(packet.data.len() >= UTP_HEADER_SIZE);
+        let (header, _) = UtpHeader::parse(packet.data.as_slice()).unwrap();
         assert_eq!(header.packet_type, PacketType::Syn);
     }
 
@@ -1508,8 +1647,14 @@ mod tests {
         let bound = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::new(0, 0, 0, 0), 6881));
         let mut mux = UtpMultiplexer::new(bound);
         let target = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 6882));
-        let (conn_id, packet) = mux.connect(target).unwrap();
+        let conn_id = mux.connect(target).unwrap();
         assert!(conn_id != 0);
+        let mut captured = None;
+        mux.flush_socket(target, conn_id, |data, _| {
+            captured = Some(data.to_vec());
+            Ok(data.len())
+        }).unwrap();
+        let packet = captured.expect("missing syn packet");
         assert!(packet.len() >= UTP_HEADER_SIZE);
         assert_eq!(mux.socket_count(), 1);
     }

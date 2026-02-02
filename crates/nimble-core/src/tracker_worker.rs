@@ -1,9 +1,11 @@
-use nimble_net::tracker_http::{announce, AnnounceRequest as HttpAnnounceRequest, TrackerEvent};
+use nimble_net::tracker_http::{announce_async, AnnounceRequest as HttpAnnounceRequest, HttpAnnounceEvent, TrackerEvent};
 use nimble_net::tracker_udp::{UdpTracker, UdpAnnounceRequest, UdpTrackerEvent};
 use std::net::{SocketAddrV4, ToSocketAddrs};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::collections::{HashMap, VecDeque};
 
 const WORKER_THREAD_COUNT: usize = 4;
 const ANNOUNCE_QUEUE_DEPTH: usize = 256;
@@ -11,6 +13,11 @@ const ANNOUNCE_QUEUE_DEPTH: usize = 256;
 pub struct AnnounceWorker {
     task_tx: SyncSender<AnnounceTask>,
     result_rx: Receiver<AnnounceResult>,
+    http_result_rx: Receiver<HttpAnnounceEvent>,
+    http_result_tx: Sender<HttpAnnounceEvent>,
+    pending_http: HashMap<u64, AnnounceTask>,
+    pending_results: VecDeque<AnnounceResult>,
+    request_id: AtomicU64,
     _workers: Vec<JoinHandle<()>>,
 }
 
@@ -39,7 +46,8 @@ pub struct AnnounceResult {
 impl AnnounceWorker {
     pub fn new() -> Self {
         let (task_tx, task_rx) = sync_channel::<AnnounceTask>(ANNOUNCE_QUEUE_DEPTH);
-        let (result_tx, result_rx) = sync_channel::<AnnounceResult>(ANNOUNCE_QUEUE_DEPTH);
+        let (result_tx, result_rx) = channel::<AnnounceResult>();
+        let (http_result_tx, http_result_rx) = channel::<HttpAnnounceEvent>();
 
         let task_rx = Arc::new(Mutex::new(task_rx));
         let mut workers = Vec::with_capacity(WORKER_THREAD_COUNT);
@@ -79,19 +87,22 @@ impl AnnounceWorker {
         AnnounceWorker {
             task_tx,
             result_rx,
+            http_result_rx,
+            http_result_tx,
+            pending_http: HashMap::new(),
+            pending_results: VecDeque::new(),
+            request_id: AtomicU64::new(1),
             _workers: workers,
         }
     }
 
-    pub fn submit_announce(&self, task: AnnounceTask) {
-        let _ = self.task_tx.try_send(task);
-    }
+    pub fn submit_announce(&mut self, task: AnnounceTask) {
+        if task.url.starts_with("udp://") {
+            let _ = self.task_tx.try_send(task);
+            return;
+        }
 
-    pub fn try_recv_result(&self) -> Option<AnnounceResult> {
-        self.result_rx.try_recv().ok()
-    }
-
-    fn announce_http(task: &AnnounceTask) -> AnnounceResult {
+        let request_id = self.request_id.fetch_add(1, Ordering::Relaxed);
         let request = HttpAnnounceRequest {
             info_hash: &task.info_hash,
             peer_id: &task.peer_id,
@@ -103,34 +114,36 @@ impl AnnounceWorker {
             event: task.event,
         };
 
-        match announce(&task.url, &request) {
-            Ok(response) => {
-                if let Some(failure) = response.failure_reason {
-                    AnnounceResult {
-                        infohash_hex: task.infohash_hex.clone(),
-                        success: false,
-                        peers: Vec::new(),
-                        interval: None,
-                        error: Some(format!("Tracker failure: {}", failure)),
-                    }
-                } else {
-                    AnnounceResult {
-                        infohash_hex: task.infohash_hex.clone(),
-                        success: true,
-                        peers: response.peers,
-                        interval: Some(response.interval),
-                        error: None,
-                    }
-                }
+        match announce_async(&task.url, &request, request_id, self.http_result_tx.clone()) {
+            Ok(()) => {
+                self.pending_http.insert(request_id, task);
             }
-            Err(e) => AnnounceResult {
-                infohash_hex: task.infohash_hex.clone(),
-                success: false,
-                peers: Vec::new(),
-                interval: None,
-                error: Some(e.to_string()),
-            },
+            Err(e) => {
+                self.pending_results.push_back(AnnounceResult {
+                    infohash_hex: task.infohash_hex,
+                    success: false,
+                    peers: Vec::new(),
+                    interval: None,
+                    error: Some(e.to_string()),
+                });
+            }
         }
+    }
+
+    pub fn try_recv_result(&mut self) -> Option<AnnounceResult> {
+        if let Some(result) = self.pending_results.pop_front() {
+            return Some(result);
+        }
+
+        if let Ok(result) = self.result_rx.try_recv() {
+            return Some(result);
+        }
+
+        if let Ok(event) = self.http_result_rx.try_recv() {
+            return self.handle_http_event(event);
+        }
+
+        None
     }
 
     fn announce_udp(task: &AnnounceTask) -> AnnounceResult {
@@ -213,5 +226,45 @@ impl AnnounceWorker {
                 None
             }
         })
+    }
+
+    fn handle_http_event(&mut self, event: HttpAnnounceEvent) -> Option<AnnounceResult> {
+        match event {
+            HttpAnnounceEvent::Completed { request_id, result } => {
+                let task = self.pending_http.remove(&request_id)?;
+                Some(Self::http_result_from_task(task, result))
+            }
+        }
+    }
+
+    fn http_result_from_task(task: AnnounceTask, result: Result<nimble_net::tracker_http::AnnounceResponse>) -> AnnounceResult {
+        match result {
+            Ok(response) => {
+                if let Some(failure) = response.failure_reason {
+                    AnnounceResult {
+                        infohash_hex: task.infohash_hex,
+                        success: false,
+                        peers: Vec::new(),
+                        interval: None,
+                        error: Some(format!("Tracker failure: {}", failure)),
+                    }
+                } else {
+                    AnnounceResult {
+                        infohash_hex: task.infohash_hex,
+                        success: true,
+                        peers: response.peers,
+                        interval: Some(response.interval),
+                        error: None,
+                    }
+                }
+            }
+            Err(e) => AnnounceResult {
+                infohash_hex: task.infohash_hex,
+                success: false,
+                peers: Vec::new(),
+                interval: None,
+                error: Some(e.to_string()),
+            },
+        }
     }
 }

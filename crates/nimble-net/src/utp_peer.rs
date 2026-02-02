@@ -123,7 +123,7 @@ impl UtpPeerConnection {
     }
 
     pub fn connect(&mut self) -> Result<()> {
-        let (conn_id, _packet) = self.utp_listener.connect(self.addr)?;
+        let conn_id = self.utp_listener.connect(self.addr)?;
         self.conn_id = conn_id;
         self.state = PeerState::Handshaking;
         Ok(())

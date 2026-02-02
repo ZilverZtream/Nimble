@@ -3,6 +3,8 @@ use nimble_bencode::decode::Value;
 use nimble_bencode::decode::decode;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
+use crate::peer_ip::is_valid_peer_ip_v4;
+
 const COMPACT_PEER_LEN: usize = 6;
 const MAX_PEX_PEERS: usize = 200;
 const MAX_PEX_BYTES: usize = COMPACT_PEER_LEN * MAX_PEX_PEERS;
@@ -11,37 +13,6 @@ const MAX_PEX_BYTES: usize = COMPACT_PEER_LEN * MAX_PEX_PEERS;
 pub struct PexMessage {
     pub added: Vec<SocketAddrV4>,
     pub dropped: Vec<SocketAddrV4>,
-}
-
-fn is_valid_peer_ip(ip: &Ipv4Addr) -> bool {
-    let octets = ip.octets();
-
-    if octets[0] == 0 {
-        return false;
-    }
-    if octets[0] == 10 {
-        return false;
-    }
-    if octets[0] == 127 {
-        return false;
-    }
-    if octets[0] == 172 && (octets[1] >= 16 && octets[1] <= 31) {
-        return false;
-    }
-    if octets[0] == 192 && octets[1] == 168 {
-        return false;
-    }
-    if octets[0] == 169 && octets[1] == 254 {
-        return false;
-    }
-    if octets[0] >= 224 {
-        return false;
-    }
-    if ip.is_broadcast() {
-        return false;
-    }
-
-    true
 }
 
 pub fn parse_pex(payload: &[u8]) -> Result<PexMessage> {
@@ -83,7 +54,7 @@ fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddrV4>> {
         if port == 0 {
             continue;
         }
-        if !is_valid_peer_ip(&ip) {
+        if !is_valid_peer_ip_v4(&ip) {
             continue;
         }
         peers.push(SocketAddrV4::new(ip, port));

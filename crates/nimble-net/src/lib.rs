@@ -2,6 +2,7 @@ pub mod encryption;
 pub mod extension;
 pub mod handshake;
 pub mod listener;
+pub(crate) mod peer_ip;
 pub mod peer;
 pub mod sockets;
 pub mod tracker_http;

@@ -16,6 +16,8 @@ use windows_sys::Win32::Foundation::GetLastError;
 #[cfg(windows)]
 use windows_sys::Win32::Networking::WinHttp::*;
 
+use crate::peer_ip::{is_valid_peer_ip_v4, is_valid_peer_ip_v6};
+
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1MB cap for tracker responses
 const MAX_PEERS_FROM_TRACKER: usize = 200; // Cap peers to prevent excessive memory/CPU usage
 
@@ -615,6 +617,9 @@ fn parse_compact_peers(data: &[u8]) -> Result<Vec<SocketAddrV4>> {
     for chunk in data.chunks_exact(6).take(MAX_PEERS_FROM_TRACKER) {
         let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+        if !is_valid_peer_ip_v4(&ip) {
+            continue;
+        }
         peers.push(SocketAddrV4::new(ip, port));
     }
 
@@ -638,6 +643,9 @@ fn parse_compact_peers6(data: &[u8]) -> Result<Vec<SocketAddrV6>> {
             chunk[12], chunk[13], chunk[14], chunk[15],
         ]);
         let port = u16::from_be_bytes([chunk[16], chunk[17]]);
+        if !is_valid_peer_ip_v6(&ip) {
+            continue;
+        }
         peers.push(SocketAddrV6::new(ip, port, 0, 0));
     }
 
@@ -658,6 +666,9 @@ fn parse_dict_peers(peers_list: &[nimble_bencode::decode::Value]) -> Result<Vec<
             ) {
                 if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
                     if port_int > 0 && port_int <= u16::MAX as i64 {
+                        if !is_valid_peer_ip_v4(&ip) {
+                            continue;
+                        }
                         peers.push(SocketAddrV4::new(ip, port_int as u16));
                     }
                 }
@@ -671,6 +682,8 @@ fn parse_dict_peers(peers_list: &[nimble_bencode::decode::Value]) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nimble_bencode::decode::Value;
+    use std::collections::BTreeMap;
 
     #[test]
     fn test_parse_url_http() {
@@ -747,23 +760,60 @@ mod tests {
     #[test]
     fn test_parse_compact_peers() {
         let data = vec![
-            127, 0, 0, 1, 0x1A, 0xE1, // 127.0.0.1:6881
-            192, 168, 1, 100, 0x1A, 0xE2, // 192.168.1.100:6882
+            10, 0, 0, 1, 0x1A, 0xE1, // 10.0.0.1:6881
+            8, 8, 8, 8, 0x1A, 0xE2, // 8.8.8.8:6882
         ];
 
         let peers = parse_compact_peers(&data).unwrap();
 
-        assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].ip(), &Ipv4Addr::new(127, 0, 0, 1));
-        assert_eq!(peers[0].port(), 6881);
-        assert_eq!(peers[1].ip(), &Ipv4Addr::new(192, 168, 1, 100));
-        assert_eq!(peers[1].port(), 6882);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].ip(), &Ipv4Addr::new(8, 8, 8, 8));
+        assert_eq!(peers[0].port(), 6882);
     }
 
     #[test]
     fn test_parse_compact_peers_invalid_length() {
         let data = vec![127, 0, 0, 1, 0x1A];
         assert!(parse_compact_peers(&data).is_err());
+    }
+
+    #[test]
+    fn test_parse_dict_peers_filters_private_ips() {
+        let mut private_peer = BTreeMap::new();
+        private_peer.insert(b"ip".as_ref(), Value::ByteString(b"192.168.1.10"));
+        private_peer.insert(b"port".as_ref(), Value::Integer(6881));
+
+        let mut public_peer = BTreeMap::new();
+        public_peer.insert(b"ip".as_ref(), Value::ByteString(b"1.1.1.1"));
+        public_peer.insert(b"port".as_ref(), Value::Integer(6882));
+
+        let peers_list = vec![Value::Dict(private_peer), Value::Dict(public_peer)];
+
+        let peers = parse_dict_peers(&peers_list).unwrap();
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].ip(), &Ipv4Addr::new(1, 1, 1, 1));
+        assert_eq!(peers[0].port(), 6882);
+    }
+
+    #[test]
+    fn test_parse_compact_peers6_filters_private_ips() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1).octets());
+        data.extend_from_slice(&6881u16.to_be_bytes());
+        data.extend_from_slice(
+            &Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888).octets(),
+        );
+        data.extend_from_slice(&6882u16.to_be_bytes());
+
+        let peers = parse_compact_peers6(&data).unwrap();
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].ip(),
+            &Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)
+        );
+        assert_eq!(peers[0].port(), 6882);
     }
 
     #[test]
@@ -780,13 +830,14 @@ mod tests {
 
     #[test]
     fn test_parse_announce_response_success() {
-        let response = b"d8:completei10e10:incompletei5e8:intervali1800e5:peers12:\x7f\x00\x00\x01\x1a\xe1\xc0\xa8\x01\x64\x1a\xe2e";
+        let response = b"d8:completei10e10:incompletei5e8:intervali1800e5:peers12:\x0a\x00\x00\x01\x1a\xe1\x01\x01\x01\x01\x1a\xe2e";
         let parsed = parse_announce_response(response).unwrap();
 
         assert!(parsed.failure_reason.is_none());
         assert_eq!(parsed.interval, 1800);
         assert_eq!(parsed.complete, Some(10));
         assert_eq!(parsed.incomplete, Some(5));
-        assert_eq!(parsed.peers.len(), 2);
+        assert_eq!(parsed.peers.len(), 1);
+        assert_eq!(parsed.peers[0].ip(), &Ipv4Addr::new(1, 1, 1, 1));
     }
 }

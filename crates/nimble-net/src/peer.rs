@@ -3,19 +3,18 @@ use nimble_util::bitfield::Bitfield;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::{Duration, Instant};
 
-use crate::encryption::{MseHandshake, MseStage};
+use crate::encryption::{MseHandshake, MseStage, MSE_KEY_LENGTH};
 use crate::extension::{
-    create_nimble_handshake, has_extension_bit, set_extension_bit, ExtendedMessage,
-    ExtensionHandshake, ExtensionState, EXTENSION_UT_METADATA, EXTENSION_UT_PEX,
+    create_nimble_handshake, has_extension_bit, ExtendedMessage, ExtensionHandshake,
+    ExtensionState, EXTENSION_UT_METADATA, EXTENSION_UT_PEX,
 };
+use crate::handshake::{BitTorrentHandshake, HandshakeProtocol, HandshakeStep};
 use crate::sockets::TcpSocket;
 use crate::ut_metadata::{
     verify_metadata_infohash, UtMetadataMessage, UtMetadataMessageType, UtMetadataState,
 };
 use crate::ut_pex::parse_pex;
 
-const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
-const HANDSHAKE_LENGTH: usize = 68;
 const MAX_MESSAGE_LENGTH: u32 = 32768 + 9;
 const MAX_BITFIELD_BYTES: u32 = 262144;
 const MAX_EXTENDED_MESSAGE_LENGTH: u32 = 1024 * 1024;
@@ -327,6 +326,20 @@ pub enum PeerState {
     Disconnected,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum HandshakePhase {
+    Mse(MseHandshakeState),
+    BitTorrent,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MseHandshakeState {
+    SendPublicKey { offset: usize },
+    ReceivePublicKey { received: usize },
+    SendVc { offset: usize, vc: [u8; 8] },
+    ReceiveVc { received: usize },
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PendingRequest {
     pub index: u32,
@@ -384,6 +397,8 @@ pub struct PeerConnection {
     last_pex_received: Option<Instant>,
     mse_handshake: Option<MseHandshake>,
     encryption_enabled: bool,
+    handshake: Option<Box<dyn HandshakeProtocol>>,
+    handshake_phase: Option<HandshakePhase>,
     /// RFC-101 Step 4: Outbound message queue for batching Have messages.
     /// Messages are serialized and queued, then flushed together to reduce syscalls.
     outbound_queue: Vec<u8>,
@@ -460,6 +475,8 @@ impl PeerConnection {
             last_pex_received: None,
             mse_handshake,
             encryption_enabled: false,
+            handshake: None,
+            handshake_phase: None,
             // RFC-101 Step 4: Initialize empty outbound queue
             outbound_queue: Vec::with_capacity(MAX_QUEUE_BYTES),
             queue_first_message_time: None,
@@ -520,6 +537,8 @@ impl PeerConnection {
             last_pex_received: None,
             mse_handshake,
             encryption_enabled,
+            handshake: None,
+            handshake_phase: None,
             // RFC-101 Step 4: Initialize empty outbound queue
             outbound_queue: Vec::with_capacity(MAX_QUEUE_BYTES),
             queue_first_message_time: None,
@@ -585,6 +604,8 @@ impl PeerConnection {
             last_pex_received: None,
             mse_handshake,
             encryption_enabled,
+            handshake: None,
+            handshake_phase: None,
             // RFC-101 Step 4: Initialize empty outbound queue
             outbound_queue: Vec::with_capacity(MAX_QUEUE_BYTES),
             queue_first_message_time: None,
@@ -599,105 +620,248 @@ impl PeerConnection {
     pub fn connect(&mut self) -> Result<()> {
         self.socket.connect(self.addr.clone())?;
         self.state = PeerState::Handshaking;
-        self.do_handshake()
+        self.recv_cursor = 0;
+        self.recv_state = RecvState::ReadingLength;
+        self.encryption_enabled = false;
+        self.handshake = None;
+        self.handshake_phase = None;
+
+        self.socket.set_nonblocking(true)?;
+        self.start_handshake();
+        self.tick_handshake()?;
+        Ok(())
     }
 
-    fn do_handshake(&mut self) -> Result<()> {
+    fn start_handshake(&mut self) {
         if self.mse_handshake.is_some() {
-            self.do_mse_handshake()?;
-            self.encryption_enabled = true;
+            self.handshake_phase = Some(HandshakePhase::Mse(MseHandshakeState::SendPublicKey {
+                offset: 0,
+            }));
+            return;
         }
 
-        let mut reserved = [0u8; 8];
-        set_extension_bit(&mut reserved);
-
-        let mut handshake = Vec::with_capacity(HANDSHAKE_LENGTH);
-        handshake.push(19);
-        handshake.extend_from_slice(PROTOCOL_STRING);
-        handshake.extend_from_slice(&reserved);
-        handshake.extend_from_slice(&self.info_hash);
-        handshake.extend_from_slice(&self.our_peer_id);
-
-        if self.encryption_enabled {
-            if let Some(ref mut mse) = self.mse_handshake {
-                mse.encrypt(&mut handshake);
-            }
-        }
-
-        self.socket.send_all(&handshake)?;
-
-        let mut response = [0u8; HANDSHAKE_LENGTH];
-        self.socket.recv_exact(&mut response)?;
-
-        if self.encryption_enabled {
-            if let Some(ref mut mse) = self.mse_handshake {
-                mse.decrypt(&mut response);
-            }
-        }
-
-        if response[0] != 19 {
-            anyhow::bail!("invalid protocol string length: {}", response[0]);
-        }
-
-        if &response[1..20] != PROTOCOL_STRING {
-            anyhow::bail!("invalid protocol string");
-        }
-
-        let their_reserved: [u8; 8] = response[20..28].try_into().unwrap();
-        let their_info_hash: [u8; 20] = response[28..48].try_into().unwrap();
-        if their_info_hash != self.info_hash {
-            anyhow::bail!("info hash mismatch");
-        }
-
-        let their_peer_id: [u8; 20] = response[48..68].try_into().unwrap();
-        self.their_peer_id = Some(their_peer_id);
-        self.state = PeerState::Connected;
-        self.last_message_received = Instant::now();
-
-        self.extensions_enabled = has_extension_bit(&their_reserved);
-
-        if self.extensions_enabled {
-            self.init_extension_state();
-            self.send_extension_handshake()?;
-        }
-
-        Ok(())
+        self.begin_bittorrent_handshake();
     }
 
-    fn do_mse_handshake(&mut self) -> Result<()> {
-        let mse = self.mse_handshake.as_mut()
-            .ok_or_else(|| anyhow::anyhow!("MSE handshake not initialized"))?;
+    fn begin_bittorrent_handshake(&mut self) {
+        self.handshake = Some(Box::new(BitTorrentHandshake::new(
+            self.info_hash,
+            self.our_peer_id,
+        )));
+        self.handshake_phase = Some(HandshakePhase::BitTorrent);
+        self.recv_cursor = 0;
+    }
 
-        let our_pubkey = mse.get_public_key().to_vec();
-
-        self.socket.send_all(&our_pubkey)?;
-
-        let mut their_pubkey = vec![0u8; 96];
-        self.socket.recv_exact(&mut their_pubkey)?;
-
-        let mse = self.mse_handshake.as_mut().unwrap();
-        let info_hash = self.info_hash;
-        mse.compute_shared_secret(&their_pubkey, &info_hash)
-            .map_err(|e| anyhow::anyhow!("MSE handshake failed: {}", e))?;
-
-        let mut vc = [0u8; 8];
-        mse.encrypt(&mut vc);
-
-        self.socket.send_all(&vc)?;
-
-        let mut their_vc = [0u8; 8];
-        self.socket.recv_exact(&mut their_vc)?;
-
-        let mse = self.mse_handshake.as_mut().unwrap();
-        mse.decrypt(&mut their_vc);
-
-        if their_vc != [0u8; 8] {
-            anyhow::bail!("invalid MSE verification constant");
+    fn read_handshake_bytes(&mut self, target: usize, decrypt: bool) -> Result<bool> {
+        if self.recv_cursor >= target {
+            return Ok(true);
         }
 
-        mse.set_stage(MseStage::Established);
+        let remaining = target - self.recv_cursor;
+        let available = RECV_BUFFER_SIZE - self.recv_cursor;
+        let read_len = remaining.min(available);
+        let start = self.recv_cursor;
+        match self.socket.recv(&mut self.recv_buffer[start..start + read_len]) {
+            Ok(0) => {
+                anyhow::bail!("connection closed");
+            }
+            Ok(n) => {
+                if decrypt {
+                    if let Some(ref mut mse) = self.mse_handshake {
+                        mse.decrypt(&mut self.recv_buffer[start..start + n]);
+                    }
+                }
+                self.recv_cursor += n;
+                Ok(self.recv_cursor >= target)
+            }
+            Err(e) => {
+                if is_timeout_error(&e) {
+                    return Ok(false);
+                }
+                Err(e)
+            }
+        }
+    }
 
-        Ok(())
+    pub fn tick_handshake(&mut self) -> Result<()> {
+        if self.state != PeerState::Handshaking {
+            anyhow::bail!("not handshaking");
+        }
+
+        loop {
+            let phase = match self.handshake_phase.take() {
+                Some(phase) => phase,
+                None => return Ok(()),
+            };
+
+            match phase {
+                HandshakePhase::Mse(mut state) => {
+                    let completed = self.tick_mse_handshake(&mut state)?;
+                    if completed {
+                        self.encryption_enabled = true;
+                        self.begin_bittorrent_handshake();
+                        continue;
+                    }
+                    self.handshake_phase = Some(HandshakePhase::Mse(state));
+                    return Ok(());
+                }
+                HandshakePhase::BitTorrent => {
+                    self.handshake_phase = Some(HandshakePhase::BitTorrent);
+                    return self.tick_bittorrent_handshake();
+                }
+            }
+        }
+    }
+
+    fn tick_mse_handshake(&mut self, state: &mut MseHandshakeState) -> Result<bool> {
+        match state {
+            MseHandshakeState::SendPublicKey { offset } => {
+                let mut key_buf = [0u8; MSE_KEY_LENGTH];
+                {
+                    let mse = self
+                        .mse_handshake
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("MSE handshake not initialized"))?;
+                    key_buf.copy_from_slice(mse.get_public_key());
+                }
+                if *offset < key_buf.len() {
+                    let sent = self.socket.send(&key_buf[*offset..])?;
+                    if sent == 0 {
+                        anyhow::bail!("connection closed");
+                    }
+                    *offset += sent;
+                }
+                if *offset >= key_buf.len() {
+                    *state = MseHandshakeState::ReceivePublicKey { received: 0 };
+                    self.recv_cursor = 0;
+                }
+                Ok(false)
+            }
+            MseHandshakeState::ReceivePublicKey { received } => {
+                if *received < MSE_KEY_LENGTH {
+                    let target = MSE_KEY_LENGTH;
+                    if !self.read_handshake_bytes(target, false)? {
+                        return Ok(false);
+                    }
+                    *received = self.recv_cursor;
+                }
+                if *received < MSE_KEY_LENGTH {
+                    return Ok(false);
+                }
+
+                let info_hash = self.info_hash;
+                {
+                    let mse = self
+                        .mse_handshake
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("MSE handshake not initialized"))?;
+                    mse.compute_shared_secret(&self.recv_buffer[..MSE_KEY_LENGTH], &info_hash)
+                        .map_err(|e| anyhow::anyhow!("MSE handshake failed: {}", e))?;
+
+                    let mut vc = [0u8; 8];
+                    mse.encrypt(&mut vc);
+                    *state = MseHandshakeState::SendVc { offset: 0, vc };
+                }
+                self.recv_cursor = 0;
+                Ok(false)
+            }
+            MseHandshakeState::SendVc { offset, vc } => {
+                if *offset < vc.len() {
+                    let sent = self.socket.send(&vc[*offset..])?;
+                    if sent == 0 {
+                        anyhow::bail!("connection closed");
+                    }
+                    *offset += sent;
+                }
+                if *offset >= vc.len() {
+                    *state = MseHandshakeState::ReceiveVc { received: 0 };
+                    self.recv_cursor = 0;
+                }
+                Ok(false)
+            }
+            MseHandshakeState::ReceiveVc { received } => {
+                if *received < 8 {
+                    if !self.read_handshake_bytes(8, false)? {
+                        return Ok(false);
+                    }
+                    *received = self.recv_cursor;
+                }
+                if *received < 8 {
+                    return Ok(false);
+                }
+
+                let mut their_vc = [0u8; 8];
+                their_vc.copy_from_slice(&self.recv_buffer[..8]);
+                let mse = self
+                    .mse_handshake
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("MSE handshake not initialized"))?;
+                mse.decrypt(&mut their_vc);
+
+                if their_vc != [0u8; 8] {
+                    anyhow::bail!("invalid MSE verification constant");
+                }
+
+                mse.set_stage(MseStage::Established);
+                Ok(true)
+            }
+        }
+    }
+
+    fn tick_bittorrent_handshake(&mut self) -> Result<()> {
+        loop {
+            let step = {
+                let handshake = self
+                    .handshake
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("handshake not initialized"))?;
+                handshake.step(&self.recv_buffer[..self.recv_cursor])?
+            };
+
+            match step {
+                HandshakeStep::Write { mut data } => {
+                    if self.encryption_enabled {
+                        if let Some(ref mut mse) = self.mse_handshake {
+                            mse.encrypt(&mut data);
+                        }
+                    }
+                    self.socket.send_all(&data)?;
+                    return Ok(());
+                }
+                HandshakeStep::Read { min_bytes } => {
+                    let decrypted = self.encryption_enabled;
+                    if !self.read_handshake_bytes(min_bytes, decrypted)? {
+                        return Ok(());
+                    }
+                }
+                HandshakeStep::Complete {
+                    peer_id,
+                    reserved_bytes,
+                    ..
+                } => {
+                    self.their_peer_id = Some(peer_id);
+                    self.state = PeerState::Connected;
+                    self.last_message_received = Instant::now();
+                    self.extensions_enabled = has_extension_bit(&reserved_bytes);
+                    self.handshake = None;
+                    self.handshake_phase = None;
+                    self.recv_cursor = 0;
+                    self.recv_state = RecvState::ReadingLength;
+                    self.socket.set_nonblocking(false)?;
+
+                    if self.extensions_enabled {
+                        self.init_extension_state();
+                        self.send_extension_handshake()?;
+                    }
+
+                    if self.am_interested {
+                        self.send_message(&PeerMessage::Interested)?;
+                    }
+
+                    return Ok(());
+                }
+            }
+        }
     }
 
     fn init_extension_state(&mut self) {
@@ -1137,6 +1301,9 @@ impl PeerConnection {
     pub fn set_interested(&mut self, interested: bool) -> Result<()> {
         if interested != self.am_interested {
             self.am_interested = interested;
+            if self.state != PeerState::Connected {
+                return Ok(());
+            }
             if interested {
                 self.send_message(&PeerMessage::Interested)?;
             } else {

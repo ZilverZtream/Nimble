@@ -1,5 +1,6 @@
 pub mod encryption;
 pub mod extension;
+pub mod handshake;
 pub mod listener;
 pub mod peer;
 pub mod sockets;

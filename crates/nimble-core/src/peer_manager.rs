@@ -577,7 +577,12 @@ impl PeerManager {
     pub fn get_socket_handles(&self) -> Vec<(SocketAddrV4, nimble_net::sockets::RawSocket)> {
         self.peers
             .iter()
-            .filter(|(_, peer)| peer.connection.state() == PeerState::Connected)
+            .filter(|(_, peer)| {
+                matches!(
+                    peer.connection.state(),
+                    PeerState::Connected | PeerState::Handshaking
+                )
+            })
             .map(|(&addr, peer)| (addr, peer.connection.raw_socket()))
             .collect()
     }
@@ -589,11 +594,16 @@ impl PeerManager {
         let peer = self.peers.get_mut(addr)
             .ok_or_else(|| anyhow::anyhow!("peer not found"))?;
 
-        if peer.connection.state() != PeerState::Connected {
-            anyhow::bail!("peer not connected");
+        match peer.connection.state() {
+            PeerState::Connected => {
+                Self::handle_peer_messages(peer, &mut self.piece_picker, &mut self.endgame, *addr)
+            }
+            PeerState::Handshaking => {
+                peer.connection.tick_handshake()?;
+                Ok(Vec::new())
+            }
+            _ => anyhow::bail!("peer not connected"),
         }
-
-        Self::handle_peer_messages(peer, &mut self.piece_picker, &mut self.endgame, *addr)
     }
 
     /// Request blocks for a specific peer that has been identified as unchoked.

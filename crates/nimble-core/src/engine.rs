@@ -33,6 +33,7 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
             settings.enable_upnp,
             settings.enable_nat_pmp,
             settings.enable_lsd,
+            settings.enable_ipv6,
             settings.enable_utp,
             settings.max_active_torrents,
         );

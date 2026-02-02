@@ -107,9 +107,20 @@ impl Session {
         enable_upnp: bool,
         enable_nat_pmp: bool,
         enable_lsd: bool,
+        enable_ipv6: bool,
         enable_utp: bool,
         max_active_torrents: u32,
     ) -> Self {
+        let ipv6_available = {
+            #[cfg(feature = "ipv6")]
+            {
+                enable_ipv6 && UdpSocket::bind(("::1", 0)).is_ok()
+            }
+            #[cfg(not(feature = "ipv6"))]
+            {
+                false
+            }
+        };
         let (dht, dht_socket_v4, dht_socket_v6) = if enable_dht {
             let socket_v4 = UdpSocket::bind(("0.0.0.0", listen_port))
                 .ok()
@@ -118,20 +129,26 @@ impl Session {
                     Some(s)
                 });
             #[cfg(feature = "ipv6")]
-            let socket_v6 = UdpSocket::bind(("::", listen_port))
-                .ok()
-                .and_then(|s| {
-                    let _ = s.set_only_v6(true);
-                    s.set_nonblocking(true).ok()?;
-                    Some(s)
-                });
+            let socket_v6 = if ipv6_available {
+                UdpSocket::bind(("::", listen_port))
+                    .ok()
+                    .and_then(|s| {
+                        let _ = s.set_only_v6(true);
+                        s.set_nonblocking(true).ok()?;
+                        Some(s)
+                    })
+            } else {
+                None
+            };
             #[cfg(not(feature = "ipv6"))]
             let socket_v6 = None;
             #[cfg(feature = "ipv6")]
             if socket_v6.is_some() {
                 eprintln!("DHT: IPv6 socket bound on port {}", listen_port);
-            } else {
+            } else if enable_ipv6 {
                 eprintln!("DHT: IPv6 socket bind failed on port {}", listen_port);
+            } else {
+                eprintln!("DHT: IPv6 socket disabled");
             }
             (Some(DhtNode::new()), socket_v4, socket_v6)
         } else {
@@ -203,9 +220,17 @@ impl Session {
         };
 
         let utp_listener = if enable_utp {
-            match UtpListener::new(listen_port, false) {
+            let enable_utp_v6 = ipv6_available && enable_ipv6;
+            match UtpListener::new(listen_port, enable_utp_v6) {
                 Ok(listener) => {
                     eprintln!("\u{00b5}TP: Listener started on port {}", listen_port);
+                    if enable_utp_v6 {
+                        if listener.has_v6_socket() {
+                            eprintln!("\u{00b5}TP: IPv6 listener started on port {}", listen_port);
+                        } else {
+                            eprintln!("\u{00b5}TP: IPv6 listener unavailable on port {}", listen_port);
+                        }
+                    }
                     Some(listener)
                 }
                 Err(e) => {
@@ -1595,6 +1620,7 @@ mod tests {
             false,
             false,
             false,
+            true,
             false,
             0,
         );
@@ -1603,5 +1629,31 @@ mod tests {
             panic!("expected IPv6 DHT socket to be bound");
         };
         assert!(socket.local_addr().expect("local addr").is_ipv6());
+    }
+
+    #[cfg(feature = "ipv6")]
+    #[test]
+    fn utp_binds_ipv6_socket_when_enabled() {
+        if UdpSocket::bind(("::1", 0)).is_err() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = Session::new(
+            temp.path().to_path_buf(),
+            0,
+            false,
+            false,
+            false,
+            false,
+            true,
+            true,
+            0,
+        );
+
+        let Some(listener) = session.utp_listener.as_ref() else {
+            panic!("expected uTP listener to be bound");
+        };
+        assert!(listener.has_v6_socket());
     }
 }

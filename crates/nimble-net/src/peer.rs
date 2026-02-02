@@ -26,7 +26,6 @@ const MAX_PENDING_REQUESTS: usize = 16;
 const MAX_PEER_REQUESTS: usize = 500;
 const EXTENDED_MESSAGE_ID: u8 = 20;
 const PEX_MIN_INTERVAL: Duration = Duration::from_secs(30);
-const TEMP_RECV_BUFFER_SIZE: usize = 8192;
 
 /// RFC-101 Step 2: Fixed-size receive buffer for zero-allocation message parsing.
 /// 64KB is sufficient for bitfields of huge torrents (500K+ pieces).
@@ -382,7 +381,6 @@ pub struct PeerConnection {
     /// Current position in recv_buffer (amount of valid data).
     recv_cursor: usize,
     recv_state: RecvState,
-    temp_recv_buf: [u8; TEMP_RECV_BUFFER_SIZE],
     extensions_enabled: bool,
     extension_state: Option<ExtensionState>,
     listen_port: u16,
@@ -460,7 +458,6 @@ impl PeerConnection {
             recv_buffer: Box::new([0u8; RECV_BUFFER_SIZE]),
             recv_cursor: 0,
             recv_state: RecvState::ReadingLength,
-            temp_recv_buf: [0u8; TEMP_RECV_BUFFER_SIZE],
             extensions_enabled: false,
             extension_state: None,
             listen_port,
@@ -522,7 +519,6 @@ impl PeerConnection {
             recv_buffer: Box::new([0u8; RECV_BUFFER_SIZE]),
             recv_cursor: 0,
             recv_state: RecvState::ReadingLength,
-            temp_recv_buf: [0u8; TEMP_RECV_BUFFER_SIZE],
             extensions_enabled: true,
             extension_state: None,
             listen_port,
@@ -589,7 +585,6 @@ impl PeerConnection {
             recv_buffer: Box::new([0u8; RECV_BUFFER_SIZE]),
             recv_cursor: 0,
             recv_state: RecvState::ReadingLength,
-            temp_recv_buf: [0u8; TEMP_RECV_BUFFER_SIZE],
             extensions_enabled: true,
             extension_state: None,
             listen_port,
@@ -927,26 +922,18 @@ impl PeerConnection {
                 RecvState::ReadingLength => {
                     let needed = 4 - self.recv_cursor;
                     if needed > 0 {
-                        let read_len = needed.min(TEMP_RECV_BUFFER_SIZE);
-                        match self.socket.recv(&mut self.temp_recv_buf[..read_len]) {
+                        let read_len = needed.min(RECV_BUFFER_SIZE - self.recv_cursor);
+                        match self.socket.recv(&mut self.recv_buffer[self.recv_cursor..self.recv_cursor + read_len]) {
                             Ok(0) => {
                                 anyhow::bail!("connection closed");
                             }
                             Ok(n) => {
-                                // RFC-101 Step 2: Decrypt in temp buffer, copy to fixed buffer
                                 if self.encryption_enabled {
                                     if let Some(ref mut mse) = self.mse_handshake {
-                                        mse.decrypt(&mut self.temp_recv_buf[..n]);
+                                        mse.decrypt(&mut self.recv_buffer[self.recv_cursor..self.recv_cursor + n]);
                                     }
                                 }
-                                // Copy to fixed recv_buffer without allocation
-                                let end = self.recv_cursor + n;
-                                if end <= RECV_BUFFER_SIZE {
-                                    self.recv_buffer[self.recv_cursor..end].copy_from_slice(&self.temp_recv_buf[..n]);
-                                    self.recv_cursor = end;
-                                } else {
-                                    anyhow::bail!("recv buffer overflow");
-                                }
+                                self.recv_cursor += n;
                             }
                             Err(e) => {
                                 if is_timeout_error(&e) {
@@ -986,17 +973,16 @@ impl PeerConnection {
                 RecvState::ReadingMessageType { msg_len } => {
                     if self.recv_cursor == 0 {
                         let read_len = 1;
-                        match self.socket.recv(&mut self.temp_recv_buf[..read_len]) {
+                        match self.socket.recv(&mut self.recv_buffer[..read_len]) {
                             Ok(0) => {
                                 anyhow::bail!("connection closed");
                             }
                             Ok(n) => {
                                 if self.encryption_enabled {
                                     if let Some(ref mut mse) = self.mse_handshake {
-                                        mse.decrypt(&mut self.temp_recv_buf[..n]);
+                                        mse.decrypt(&mut self.recv_buffer[..n]);
                                     }
                                 }
-                                self.recv_buffer[0..n].copy_from_slice(&self.temp_recv_buf[..n]);
                                 self.recv_cursor = n;
                             }
                             Err(e) => {
@@ -1018,24 +1004,18 @@ impl PeerConnection {
                 RecvState::ReadingMessage { msg_len, validated: _ } => {
                     let needed = msg_len as usize - self.recv_cursor;
                     if needed > 0 {
-                        let read_len = needed.min(TEMP_RECV_BUFFER_SIZE);
-                        match self.socket.recv(&mut self.temp_recv_buf[..read_len]) {
+                        let read_len = needed.min(RECV_BUFFER_SIZE - self.recv_cursor);
+                        match self.socket.recv(&mut self.recv_buffer[self.recv_cursor..self.recv_cursor + read_len]) {
                             Ok(0) => {
                                 anyhow::bail!("connection closed");
                             }
                             Ok(n) => {
                                 if self.encryption_enabled {
                                     if let Some(ref mut mse) = self.mse_handshake {
-                                        mse.decrypt(&mut self.temp_recv_buf[..n]);
+                                        mse.decrypt(&mut self.recv_buffer[self.recv_cursor..self.recv_cursor + n]);
                                     }
                                 }
-                                let end = self.recv_cursor + n;
-                                if end <= RECV_BUFFER_SIZE {
-                                    self.recv_buffer[self.recv_cursor..end].copy_from_slice(&self.temp_recv_buf[..n]);
-                                    self.recv_cursor = end;
-                                } else {
-                                    anyhow::bail!("recv buffer overflow");
-                                }
+                                self.recv_cursor += n;
                             }
                             Err(e) => {
                                 if is_timeout_error(&e) {

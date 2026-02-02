@@ -195,7 +195,7 @@ impl UpnpClient {
         if let Some(control_url) = Self::parse_control_url(&xml) {
             let base_url = Self::get_base_url(url);
             let full_control_url = if control_url.starts_with("http") {
-                control_url.to_string()
+                control_url
             } else if control_url.starts_with('/') {
                 format!("{}{}", base_url, control_url)
             } else {
@@ -214,23 +214,48 @@ impl UpnpClient {
         Ok(())
     }
 
-    fn parse_control_url(xml: &str) -> Option<&str> {
+    fn parse_control_url(xml: &str) -> Option<String> {
+        use quick_xml::events::Event;
+        use quick_xml::Reader;
+
+        let mut reader = Reader::from_str(xml);
+        reader.trim_text(true);
+
         let mut in_wan_service = false;
+        let mut in_control_url = false;
 
-        for line in xml.lines() {
-            let line = line.trim();
-
-            if line.contains("WANIPConnection") || line.contains("WANPPPConnection") {
-                in_wan_service = true;
-            }
-
-            if in_wan_service && line.contains("<controlURL>") {
-                if let Some(start) = line.find("<controlURL>") {
-                    if let Some(end) = line.find("</controlURL>") {
-                        let url = &line[start + 12..end];
-                        return Some(url);
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                    let name = e.local_name();
+                    if let Ok(tag_name) = std::str::from_utf8(name.as_ref()) {
+                        if tag_name == "controlURL" && in_wan_service {
+                            in_control_url = true;
+                        }
                     }
                 }
+                Ok(Event::Text(ref e)) => {
+                    if let Ok(text) = e.unescape() {
+                        let text_str = text.as_ref();
+                        if text_str.contains("WANIPConnection") || text_str.contains("WANPPPConnection") {
+                            in_wan_service = true;
+                        }
+                        if in_control_url {
+                            return Some(text_str.to_string());
+                        }
+                    }
+                }
+                Ok(Event::End(ref e)) => {
+                    let name = e.local_name();
+                    if let Ok(tag_name) = std::str::from_utf8(name.as_ref()) {
+                        if tag_name == "controlURL" {
+                            in_control_url = false;
+                        }
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(_) => break,
+                _ => {}
             }
         }
 
@@ -489,7 +514,14 @@ mod tests {
             </service>
         "#;
         let control_url = UpnpClient::parse_control_url(xml);
-        assert_eq!(control_url, Some("/ctl/IPConn"));
+        assert_eq!(control_url, Some("/ctl/IPConn".to_string()));
+    }
+
+    #[test]
+    fn test_parse_control_url_minified() {
+        let xml = r#"<service><serviceType>urn:schemas-upnp-org:service:WANPPPConnection:1</serviceType><controlURL>/upnp/control/wan</controlURL></service>"#;
+        let control_url = UpnpClient::parse_control_url(xml);
+        assert_eq!(control_url, Some("/upnp/control/wan".to_string()));
     }
 
     #[test]

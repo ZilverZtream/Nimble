@@ -4,6 +4,7 @@ use nimble_core::types::{EngineStats, Event};
 use nimble_core::{EngineHandle, EventReceiver};
 use nimble_util::log;
 use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::Mutex;
 
 #[cfg(windows)]
 use windows_sys::Win32::{
@@ -51,18 +52,23 @@ struct TrayIcons {
 static mut ICONS: Option<TrayIcons> = None;
 
 #[cfg(windows)]
-static mut CURRENT_STATE: TrayState = TrayState::Idle;
+struct TrayData {
+    state: TrayState,
+    stats: EngineStats,
+    is_paused: bool,
+}
 
 #[cfg(windows)]
-static mut CURRENT_STATS: EngineStats = EngineStats {
-    active_torrents: 0,
-    dl_rate_bps: 0,
-    ul_rate_bps: 0,
-    dht_nodes: 0,
-};
-
-#[cfg(windows)]
-static mut IS_PAUSED: bool = false;
+static TRAY_DATA: Mutex<TrayData> = Mutex::new(TrayData {
+    state: TrayState::Idle,
+    stats: EngineStats {
+        active_torrents: 0,
+        dl_rate_bps: 0,
+        ul_rate_bps: 0,
+        dht_nodes: 0,
+    },
+    is_paused: false,
+});
 
 #[cfg(windows)]
 unsafe fn create_tray_icons() -> TrayIcons {
@@ -259,16 +265,19 @@ fn event_listener_thread(events: EventReceiver) {
                 unsafe {
                     match event {
                         Event::Stats(stats) => {
-                            CURRENT_STATS = stats.clone();
-                            let new_state = if IS_PAUSED {
-                                TrayState::Paused
-                            } else if stats.active_torrents > 0 {
-                                TrayState::Active
-                            } else {
-                                TrayState::Idle
-                            };
-                            if new_state != CURRENT_STATE {
-                                CURRENT_STATE = new_state;
+                            {
+                                let mut data = TRAY_DATA.lock().unwrap();
+                                data.stats = stats.clone();
+                                let new_state = if data.is_paused {
+                                    TrayState::Paused
+                                } else if stats.active_torrents > 0 {
+                                    TrayState::Active
+                                } else {
+                                    TrayState::Idle
+                                };
+                                if new_state != data.state {
+                                    data.state = new_state;
+                                }
                             }
                             PostMessageW(hwnd, WM_ENGINE_EVENT, 0, 0);
                         }
@@ -374,9 +383,14 @@ unsafe fn update_tray_icon_and_tooltip(hwnd: HWND) {
     nid.hWnd = hwnd;
     nid.uID = TRAY_UID;
     nid.uFlags = NIF_ICON | NIF_TIP;
-    nid.hIcon = get_icon_for_state(CURRENT_STATE);
 
-    let tooltip = format_tooltip(&CURRENT_STATS, CURRENT_STATE);
+    let (state, stats) = {
+        let data = TRAY_DATA.lock().unwrap();
+        (data.state, data.stats.clone())
+    };
+
+    nid.hIcon = get_icon_for_state(state);
+    let tooltip = format_tooltip(&stats, state);
     let tip_wide = widestr(&tooltip);
     copy_tooltip(&mut nid.szTip, &tip_wide);
 
@@ -601,8 +615,11 @@ unsafe fn handle_status_window(hwnd: HWND) {
 unsafe fn handle_pause_all(hwnd: HWND) {
     use nimble_core::types::Command;
 
-    IS_PAUSED = true;
-    CURRENT_STATE = TrayState::Paused;
+    {
+        let mut data = TRAY_DATA.lock().unwrap();
+        data.is_paused = true;
+        data.state = TrayState::Paused;
+    }
     update_tray_icon_and_tooltip(hwnd);
 
     if let Some(engine) = get_engine(hwnd) {
@@ -614,13 +631,16 @@ unsafe fn handle_pause_all(hwnd: HWND) {
 unsafe fn handle_resume_all(hwnd: HWND) {
     use nimble_core::types::Command;
 
-    IS_PAUSED = false;
-    let new_state = if CURRENT_STATS.active_torrents > 0 {
-        TrayState::Active
-    } else {
-        TrayState::Idle
-    };
-    CURRENT_STATE = new_state;
+    {
+        let mut data = TRAY_DATA.lock().unwrap();
+        data.is_paused = false;
+        let new_state = if data.stats.active_torrents > 0 {
+            TrayState::Active
+        } else {
+            TrayState::Idle
+        };
+        data.state = new_state;
+    }
     update_tray_icon_and_tooltip(hwnd);
 
     if let Some(engine) = get_engine(hwnd) {

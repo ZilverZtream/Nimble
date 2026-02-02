@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use nimble_util::hash::percent_encode;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::mpsc::Sender;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(not(windows))]
 use std::io::Read;
 #[cfg(not(windows))]
@@ -49,7 +49,7 @@ pub struct TrackerContext {
     h_request: *mut std::ffi::c_void,
     h_connect: *mut std::ffi::c_void,
     h_session: *mut std::ffi::c_void,
-    completed: bool,
+    completed: AtomicBool,
 }
 
 impl TrackerEvent {
@@ -205,7 +205,7 @@ unsafe fn http_get_async_inner(
         h_request,
         h_connect,
         h_session,
-        completed: false,
+        completed: AtomicBool::new(false),
     });
 
     let context_ptr = Box::into_raw(context);
@@ -255,7 +255,6 @@ unsafe fn http_get_async_inner(
         WinHttpCloseHandle(h_request);
         WinHttpCloseHandle(h_connect);
         WinHttpCloseHandle(h_session);
-        drop(Box::from_raw(context_ptr));
         return Err(anyhow!("WinHttpSetTimeouts failed"));
     }
 
@@ -273,7 +272,6 @@ unsafe fn http_get_async_inner(
         WinHttpCloseHandle(h_request);
         WinHttpCloseHandle(h_connect);
         WinHttpCloseHandle(h_session);
-        drop(Box::from_raw(context_ptr));
         return Err(anyhow!("WinHttpSendRequest failed"));
     }
 
@@ -400,10 +398,9 @@ unsafe extern "system" fn status_callback(
 #[cfg(windows)]
 unsafe fn complete_request(context_ptr: *mut TrackerContext, result: Result<AnnounceResponse>) {
     let context = &mut *context_ptr;
-    if context.completed {
+    if context.completed.swap(true, Ordering::SeqCst) {
         return;
     }
-    context.completed = true;
     let _ = context.sender.send(HttpAnnounceEvent::Completed {
         request_id: context.request_id,
         result,

@@ -500,7 +500,7 @@ impl PeerConnection {
     #[cfg(target_os = "windows")]
     pub fn from_accepted(
         socket: windows_sys::Win32::Networking::WinSock::SOCKET,
-        addr: SocketAddrV4,
+        addr: SocketAddr,
         info_hash: [u8; 20],
         our_peer_id: [u8; 20],
         their_peer_id: [u8; 20],
@@ -509,13 +509,13 @@ impl PeerConnection {
         mse_handshake: Option<MseHandshake>,
     ) -> Result<Self> {
         use crate::sockets::TcpSocket;
-        let socket = TcpSocket::from_raw_socket(socket, SocketAddr::V4(addr))?;
+        let socket = TcpSocket::from_raw_socket(socket, addr)?;
         let now = Instant::now();
 
         let encryption_enabled = mse_handshake.is_some();
         let mut conn = PeerConnection {
             socket,
-            addr: SocketAddr::V4(addr),
+            addr,
             state: PeerState::Connected,
             info_hash,
             our_peer_id,
@@ -568,7 +568,7 @@ impl PeerConnection {
     #[cfg(not(target_os = "windows"))]
     pub fn from_accepted(
         stream: std::net::TcpStream,
-        addr: SocketAddrV4,
+        addr: SocketAddr,
         info_hash: [u8; 20],
         our_peer_id: [u8; 20],
         their_peer_id: [u8; 20],
@@ -577,13 +577,13 @@ impl PeerConnection {
         mse_handshake: Option<MseHandshake>,
     ) -> Result<Self> {
         use crate::sockets::TcpSocket;
-        let socket = TcpSocket::from_raw_socket(stream, SocketAddr::V4(addr))?;
+        let socket = TcpSocket::from_raw_socket(stream, addr)?;
         let now = Instant::now();
 
         let encryption_enabled = mse_handshake.is_some();
         let mut conn = PeerConnection {
             socket,
-            addr: SocketAddr::V4(addr),
+            addr,
             state: PeerState::Connected,
             info_hash,
             our_peer_id,

@@ -29,12 +29,17 @@ pub struct MagnetLink {
 }
 
 const MAX_TRACKERS: usize = 200;
+const MAX_MAGNET_URI_SIZE: usize = 8192;
 
 fn is_supported_tracker_scheme(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://") || url.starts_with("udp://")
 }
 
 pub fn parse_magnet(uri: &str) -> Result<MagnetLink> {
+    if uri.len() > MAX_MAGNET_URI_SIZE {
+        return Err(MagnetError::InvalidUri);
+    }
+
     let query = uri
         .strip_prefix("magnet:?")
         .ok_or(MagnetError::InvalidUri)?;

@@ -27,12 +27,19 @@ impl Bitfield {
     }
 
     pub fn count_ones(&self) -> usize {
-        let mut count = 0;
-        for i in 0..self.bits {
-            if self.get(i) {
-                count += 1;
-            }
+        let mut count: usize = 0;
+        let full_bytes = self.bits / 8;
+
+        for i in 0..full_bytes {
+            count += self.bytes[i].count_ones() as usize;
         }
+
+        let remaining_bits = self.bits % 8;
+        if remaining_bits > 0 && full_bytes < self.bytes.len() {
+            let mask = 0xFF << (8 - remaining_bits);
+            count += (self.bytes[full_bytes] & mask).count_ones() as usize;
+        }
+
         count
     }
 

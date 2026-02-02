@@ -5,6 +5,7 @@ const EXTENDED_MESSAGE_ID: u8 = 20;
 const EXTENDED_HANDSHAKE_ID: u8 = 0;
 
 const MAX_HANDSHAKE_SIZE: usize = 4096;
+const MAX_EXTENSION_PAYLOAD_SIZE: usize = 32 * 1024;
 const MAX_CLIENT_NAME_LEN: usize = 128;
 const MAX_EXTENSION_NAME_LEN: usize = 32;
 const MAX_EXTENSIONS: usize = 16;
@@ -225,6 +226,9 @@ impl ExtendedMessage {
             let hs = ExtensionHandshake::parse(payload)?;
             Ok(ExtendedMessage::Handshake(hs))
         } else {
+            if payload.len() > MAX_EXTENSION_PAYLOAD_SIZE {
+                anyhow::bail!("extension payload too large: {} bytes", payload.len());
+            }
             Ok(ExtendedMessage::Extension {
                 id: ext_type,
                 payload: payload.to_vec(),

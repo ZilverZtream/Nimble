@@ -110,7 +110,7 @@ impl MseHandshake {
         &self.public_key
     }
 
-    pub fn compute_shared_secret(&mut self, peer_public_key: &[u8], info_hash: &[u8; 20]) {
+    pub fn compute_shared_secret(&mut self, peer_public_key: &[u8], info_hash: &[u8; 20]) -> Result<(), &'static str> {
         let prime = BigUint::parse_bytes(DH_PRIME_HEX.as_bytes(), 16)
             .expect("invalid DH prime");
 
@@ -121,7 +121,7 @@ impl MseHandshake {
         let p_minus_one = &prime - &one;
 
         if peer_pub == zero || peer_pub == one || peer_pub == p_minus_one || peer_pub >= prime {
-            panic!("invalid DH public key: weak or out-of-range key rejected");
+            return Err("invalid DH public key: weak or out-of-range key rejected");
         }
 
         let shared = peer_pub.modpow(&self.private_key, &prime);
@@ -147,6 +147,8 @@ impl MseHandshake {
         self.shared_secret = Some(shared_bytes);
         self.send_cipher = Some(send_cipher);
         self.recv_cipher = Some(recv_cipher);
+
+        Ok(())
     }
 
     pub fn encrypt(&mut self, data: &mut [u8]) {
@@ -335,8 +337,8 @@ mod tests {
         let initiator_pubkey = initiator.get_public_key().to_vec();
         let responder_pubkey = responder.get_public_key().to_vec();
 
-        initiator.compute_shared_secret(&responder_pubkey, &info_hash);
-        responder.compute_shared_secret(&initiator_pubkey, &info_hash);
+        initiator.compute_shared_secret(&responder_pubkey, &info_hash).unwrap();
+        responder.compute_shared_secret(&initiator_pubkey, &info_hash).unwrap();
 
         assert_eq!(initiator.shared_secret, responder.shared_secret);
     }
@@ -351,8 +353,8 @@ mod tests {
         let initiator_pubkey = initiator.get_public_key().to_vec();
         let responder_pubkey = responder.get_public_key().to_vec();
 
-        initiator.compute_shared_secret(&responder_pubkey, &info_hash);
-        responder.compute_shared_secret(&initiator_pubkey, &info_hash);
+        initiator.compute_shared_secret(&responder_pubkey, &info_hash).unwrap();
+        responder.compute_shared_secret(&initiator_pubkey, &info_hash).unwrap();
 
         let mut data = b"Test message".to_vec();
         let original = data.clone();
@@ -378,8 +380,8 @@ mod tests {
         let mut derived = responder.clone_without_ciphers();
         let mut derived_clone = responder_clone.clone_without_ciphers();
 
-        derived.compute_shared_secret(&peer_pubkey, &info_hash);
-        derived_clone.compute_shared_secret(&peer_pubkey, &info_hash);
+        derived.compute_shared_secret(&peer_pubkey, &info_hash).unwrap();
+        derived_clone.compute_shared_secret(&peer_pubkey, &info_hash).unwrap();
 
         assert_eq!(derived.shared_secret, derived_clone.shared_secret);
     }

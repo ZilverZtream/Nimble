@@ -586,16 +586,18 @@ impl RateLimiter {
     fn cleanup(&mut self, now_ms: u64) {
         self.entries
             .retain(|_, entry| now_ms.saturating_sub(entry.last_seen_ms) <= RATE_LIMIT_STALE_MS);
-        if self.entries.len() <= RATE_LIMIT_MAX_CLIENTS {
-            return;
-        }
-        if let Some((oldest_ip, _)) = self
-            .entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_seen_ms)
-            .map(|(ip, entry)| (*ip, entry.last_seen_ms))
-        {
-            self.entries.remove(&oldest_ip);
+
+        while self.entries.len() > RATE_LIMIT_MAX_CLIENTS {
+            if let Some((oldest_ip, _)) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_seen_ms)
+                .map(|(ip, entry)| (*ip, entry.last_seen_ms))
+            {
+                self.entries.remove(&oldest_ip);
+            } else {
+                break;
+            }
         }
     }
 }

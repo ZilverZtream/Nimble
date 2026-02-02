@@ -287,103 +287,112 @@ unsafe extern "system" fn status_callback(
     lpv_status_information: *mut std::ffi::c_void,
     dw_status_information_length: u32,
 ) {
-    if dw_context == 0 {
-        return;
-    }
-
-    let context_ptr = dw_context as *mut TrackerContext;
-    let context = &mut *context_ptr;
-
-    match dw_internet_status {
-        WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE => {
-            let _ = WinHttpReceiveResponse(h_internet, std::ptr::null_mut());
+    let panic_result = std::panic::catch_unwind(|| {
+        if dw_context == 0 {
+            return;
         }
-        WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE => {
-            let mut status_code: u32 = 0;
-            let mut status_code_size = std::mem::size_of::<u32>() as u32;
-            let query_result = WinHttpQueryHeaders(
-                h_internet,
-                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                std::ptr::null(),
-                &mut status_code as *mut u32 as *mut _,
-                &mut status_code_size,
-                std::ptr::null_mut(),
-            );
 
-            if query_result == 0 {
-                complete_request(context_ptr, Err(anyhow!("WinHttpQueryHeaders failed")));
-                return;
+        let context_ptr = dw_context as *mut TrackerContext;
+        let context = &mut *context_ptr;
+
+        match dw_internet_status {
+            WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE => {
+                let _ = WinHttpReceiveResponse(h_internet, std::ptr::null_mut());
             }
-
-            if status_code != 200 {
-                complete_request(context_ptr, Err(anyhow!("HTTP status {}", status_code)));
-                return;
-            }
-
-            let _ = WinHttpQueryDataAvailable(h_internet, std::ptr::null_mut());
-        }
-        WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE => {
-            if lpv_status_information.is_null() {
-                complete_request(context_ptr, Err(anyhow!("WinHTTP data available missing size")));
-                return;
-            }
-
-            let bytes_available = *(lpv_status_information as *const u32) as usize;
-            if bytes_available == 0 {
-                let result = parse_announce_response(&context.response);
-                complete_request(context_ptr, result);
-                return;
-            }
-
-            if context.response.len() + bytes_available > MAX_RESPONSE_SIZE {
-                complete_request(context_ptr, Err(anyhow!("response exceeded max size")));
-                return;
-            }
-
-            let to_read = bytes_available.min(READ_BUFFER_SIZE);
-            let _ = WinHttpReadData(
-                h_internet,
-                context.read_buffer.as_mut_ptr() as *mut _,
-                to_read as u32,
-                std::ptr::null_mut(),
-            );
-        }
-        WINHTTP_CALLBACK_STATUS_READ_COMPLETE => {
-            if dw_status_information_length == 0 {
-                let result = parse_announce_response(&context.response);
-                complete_request(context_ptr, result);
-                return;
-            }
-
-            let bytes_read = dw_status_information_length as usize;
-            context
-                .response
-                .extend_from_slice(&context.read_buffer[..bytes_read]);
-
-            if context.response.len() > MAX_RESPONSE_SIZE {
-                complete_request(context_ptr, Err(anyhow!("response exceeded max size")));
-                return;
-            }
-
-            let _ = WinHttpQueryDataAvailable(h_internet, std::ptr::null_mut());
-        }
-        WINHTTP_CALLBACK_STATUS_REQUEST_ERROR => {
-            if !lpv_status_information.is_null()
-                && dw_status_information_length as usize >= std::mem::size_of::<WINHTTP_ASYNC_RESULT>()
-            {
-                let async_result = &*(lpv_status_information as *const WINHTTP_ASYNC_RESULT);
-                complete_request(
-                    context_ptr,
-                    Err(anyhow!("WinHTTP async error: {}", async_result.dwError)),
+            WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE => {
+                let mut status_code: u32 = 0;
+                let mut status_code_size = std::mem::size_of::<u32>() as u32;
+                let query_result = WinHttpQueryHeaders(
+                    h_internet,
+                    WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                    std::ptr::null(),
+                    &mut status_code as *mut u32 as *mut _,
+                    &mut status_code_size,
+                    std::ptr::null_mut(),
                 );
-            } else {
-                complete_request(context_ptr, Err(anyhow!("WinHTTP async error")));
+
+                if query_result == 0 {
+                    complete_request(context_ptr, Err(anyhow!("WinHttpQueryHeaders failed")));
+                    return;
+                }
+
+                if status_code != 200 {
+                    complete_request(context_ptr, Err(anyhow!("HTTP status {}", status_code)));
+                    return;
+                }
+
+                let _ = WinHttpQueryDataAvailable(h_internet, std::ptr::null_mut());
             }
+            WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE => {
+                if lpv_status_information.is_null() {
+                    complete_request(context_ptr, Err(anyhow!("WinHTTP data available missing size")));
+                    return;
+                }
+
+                let bytes_available = *(lpv_status_information as *const u32) as usize;
+                if bytes_available == 0 {
+                    let result = parse_announce_response(&context.response);
+                    complete_request(context_ptr, result);
+                    return;
+                }
+
+                if context.response.len() + bytes_available > MAX_RESPONSE_SIZE {
+                    complete_request(context_ptr, Err(anyhow!("response exceeded max size")));
+                    return;
+                }
+
+                let to_read = bytes_available.min(READ_BUFFER_SIZE);
+                let _ = WinHttpReadData(
+                    h_internet,
+                    context.read_buffer.as_mut_ptr() as *mut _,
+                    to_read as u32,
+                    std::ptr::null_mut(),
+                );
+            }
+            WINHTTP_CALLBACK_STATUS_READ_COMPLETE => {
+                if dw_status_information_length == 0 {
+                    let result = parse_announce_response(&context.response);
+                    complete_request(context_ptr, result);
+                    return;
+                }
+
+                let bytes_read = dw_status_information_length as usize;
+                context
+                    .response
+                    .extend_from_slice(&context.read_buffer[..bytes_read]);
+
+                if context.response.len() > MAX_RESPONSE_SIZE {
+                    complete_request(context_ptr, Err(anyhow!("response exceeded max size")));
+                    return;
+                }
+
+                let _ = WinHttpQueryDataAvailable(h_internet, std::ptr::null_mut());
+            }
+            WINHTTP_CALLBACK_STATUS_REQUEST_ERROR => {
+                if !lpv_status_information.is_null()
+                    && dw_status_information_length as usize >= std::mem::size_of::<WINHTTP_ASYNC_RESULT>()
+                {
+                    let async_result = &*(lpv_status_information as *const WINHTTP_ASYNC_RESULT);
+                    complete_request(
+                        context_ptr,
+                        Err(anyhow!("WinHTTP async error: {}", async_result.dwError)),
+                    );
+                } else {
+                    complete_request(context_ptr, Err(anyhow!("WinHTTP async error")));
+                }
+            }
+            WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING => {
+                drop(Box::from_raw(context_ptr));
+            }
+            _ => {}
         }
-        WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING => {
-            drop(Box::from_raw(context_ptr));
+    });
+
+    if panic_result.is_err() {
+        if dw_context != 0 && dw_internet_status != WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING {
+            let context_ptr = dw_context as *mut TrackerContext;
+            complete_request(context_ptr, Err(anyhow!("tracker response parsing panicked")));
         }
-        _ => {}
     }
 }
 

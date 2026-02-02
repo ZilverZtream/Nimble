@@ -636,4 +636,63 @@ mod tests {
         let expected_hash = nimble_util::hash::sha1(info);
         assert_eq!(*parsed.infohash.as_bytes(), expected_hash);
     }
+
+    #[test]
+    fn test_parse_info_dict_accepts_large_pieces_field() {
+        let piece_count = 419_431usize;
+        let pieces_len = piece_count * 20;
+        let piece_length = 4u64;
+        let total_length = piece_length * piece_count as u64;
+
+        let mut info = Vec::new();
+        info.extend_from_slice(b"d6:lengthi");
+        info.extend_from_slice(total_length.to_string().as_bytes());
+        info.extend_from_slice(b"e4:name8:test.txt12:piece lengthi");
+        info.extend_from_slice(piece_length.to_string().as_bytes());
+        info.extend_from_slice(b"e6:pieces");
+        info.extend_from_slice(pieces_len.to_string().as_bytes());
+        info.push(b':');
+        info.extend(std::iter::repeat(0u8).take(pieces_len));
+        info.push(b'e');
+
+        let parsed = parse_info_dict(&info).unwrap();
+        assert_eq!(parsed.piece_length, piece_length);
+        assert_eq!(parsed.pieces.len(), piece_count);
+        assert_eq!(parsed.total_length, total_length);
+    }
+
+    #[test]
+    fn test_parse_torrent_accepts_large_pieces_field() {
+        let piece_count = 419_431usize;
+        let pieces_len = piece_count * 20;
+        let piece_length = 4u64;
+        let total_length = piece_length * piece_count as u64;
+        let announce = b"http://tracker";
+
+        let mut info = Vec::new();
+        info.extend_from_slice(b"d6:lengthi");
+        info.extend_from_slice(total_length.to_string().as_bytes());
+        info.extend_from_slice(b"e4:name8:test.txt12:piece lengthi");
+        info.extend_from_slice(piece_length.to_string().as_bytes());
+        info.extend_from_slice(b"e6:pieces");
+        info.extend_from_slice(pieces_len.to_string().as_bytes());
+        info.push(b':');
+        info.extend(std::iter::repeat(0u8).take(pieces_len));
+        info.push(b'e');
+
+        let mut torrent = Vec::new();
+        torrent.extend_from_slice(b"d8:announce");
+        torrent.extend_from_slice(announce.len().to_string().as_bytes());
+        torrent.push(b':');
+        torrent.extend_from_slice(announce);
+        torrent.extend_from_slice(b"4:info");
+        torrent.extend_from_slice(&info);
+        torrent.push(b'e');
+
+        let parsed = parse_torrent(&torrent).unwrap();
+        assert_eq!(parsed.announce, Some(String::from_utf8_lossy(announce).to_string()));
+        assert_eq!(parsed.piece_length, piece_length);
+        assert_eq!(parsed.pieces.len(), piece_count);
+        assert_eq!(parsed.total_length, total_length);
+    }
 }

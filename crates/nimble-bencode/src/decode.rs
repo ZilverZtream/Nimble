@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-const MAX_INPUT_SIZE: usize = 16 * 1024 * 1024;
+const MAX_INPUT_SIZE: usize = 128 * 1024 * 1024;
 const MAX_NESTING_DEPTH: usize = 32;
-const MAX_STRING_LENGTH: usize = 8 * 1024 * 1024;
+const MAX_STRING_LENGTH: usize = 64 * 1024 * 1024;
 const MAX_DICT_KEY_LENGTH: usize = 256;
 const MAX_INTEGER_DIGITS: usize = 20;
 

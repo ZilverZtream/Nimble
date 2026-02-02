@@ -122,6 +122,15 @@ impl UtpPeerConnection {
         Self::new(SocketAddr::V4(addr), info_hash, our_peer_id, piece_count, 6881)
     }
 
+    pub fn new_v6(
+        addr: SocketAddrV6,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        piece_count: usize,
+    ) -> Result<Self> {
+        Self::new(SocketAddr::V6(addr), info_hash, our_peer_id, piece_count, 6881)
+    }
+
     pub fn connect(&mut self) -> Result<()> {
         let conn_id = self.utp_listener.connect(self.addr)?;
         self.conn_id = conn_id;

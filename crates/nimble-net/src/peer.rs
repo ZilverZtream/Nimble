@@ -632,6 +632,13 @@ impl PeerConnection {
         Ok(())
     }
 
+    pub fn poll(&mut self) -> Result<()> {
+        if self.state == PeerState::Handshaking {
+            self.tick_handshake()?;
+        }
+        Ok(())
+    }
+
     fn start_handshake(&mut self) {
         if self.mse_handshake.is_some() {
             self.handshake_phase = Some(HandshakePhase::Mse(MseHandshakeState::SendPublicKey {
@@ -1602,6 +1609,324 @@ fn bitfield_to_bytes(bf: &Bitfield) -> Vec<u8> {
         }
     }
     bytes
+}
+
+pub enum AnyPeerConnection {
+    Tcp(PeerConnection),
+    Utp(crate::utp_peer::UtpPeerConnection),
+}
+
+impl AnyPeerConnection {
+    pub fn new_tcp(
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        piece_count: usize,
+    ) -> Self {
+        AnyPeerConnection::Tcp(PeerConnection::new(addr, info_hash, our_peer_id, piece_count))
+    }
+
+    pub fn new_tcp_v4(
+        addr: SocketAddrV4,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        piece_count: usize,
+    ) -> Self {
+        AnyPeerConnection::Tcp(PeerConnection::new_v4(addr, info_hash, our_peer_id, piece_count))
+    }
+
+    pub fn new_utp(
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        piece_count: usize,
+        listen_port: u16,
+    ) -> Result<Self> {
+        Ok(AnyPeerConnection::Utp(crate::utp_peer::UtpPeerConnection::new(
+            addr,
+            info_hash,
+            our_peer_id,
+            piece_count,
+            listen_port,
+        )?))
+    }
+
+    pub fn new_utp_v4(
+        addr: SocketAddrV4,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        piece_count: usize,
+    ) -> Result<Self> {
+        Ok(AnyPeerConnection::Utp(crate::utp_peer::UtpPeerConnection::new_v4(
+            addr,
+            info_hash,
+            our_peer_id,
+            piece_count,
+        )?))
+    }
+
+    pub fn connect(&mut self) -> Result<()> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.connect(),
+            AnyPeerConnection::Utp(conn) => conn.connect(),
+        }
+    }
+
+    pub fn poll(&mut self) -> Result<()> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.poll(),
+            AnyPeerConnection::Utp(conn) => conn.poll(),
+        }
+    }
+
+    pub fn state(&self) -> PeerState {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.state(),
+            AnyPeerConnection::Utp(conn) => conn.state(),
+        }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.addr(),
+            AnyPeerConnection::Utp(conn) => conn.addr(),
+        }
+    }
+
+    pub fn addr_v4(&self) -> Option<SocketAddrV4> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.addr_v4(),
+            AnyPeerConnection::Utp(conn) => conn.addr_v4(),
+        }
+    }
+
+    pub fn downloaded(&self) -> u64 {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.downloaded(),
+            AnyPeerConnection::Utp(conn) => conn.downloaded(),
+        }
+    }
+
+    pub fn uploaded(&self) -> u64 {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.uploaded(),
+            AnyPeerConnection::Utp(conn) => conn.uploaded(),
+        }
+    }
+
+    pub fn is_choking(&self) -> bool {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.is_choking(),
+            AnyPeerConnection::Utp(conn) => conn.is_choking(),
+        }
+    }
+
+    pub fn is_interested(&self) -> bool {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.is_interested(),
+            AnyPeerConnection::Utp(conn) => conn.is_interested(),
+        }
+    }
+
+    pub fn peer_is_interested(&self) -> bool {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.peer_is_interested(),
+            AnyPeerConnection::Utp(conn) => conn.peer_is_interested(),
+        }
+    }
+
+    pub fn am_choking(&self) -> bool {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.am_choking(),
+            AnyPeerConnection::Utp(conn) => conn.am_choking(),
+        }
+    }
+
+    pub fn has_piece(&self, index: u32) -> bool {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.has_piece(index),
+            AnyPeerConnection::Utp(conn) => conn.has_piece(index),
+        }
+    }
+
+    pub fn pending_request_count(&self) -> usize {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.pending_request_count(),
+            AnyPeerConnection::Utp(conn) => conn.pending_request_count(),
+        }
+    }
+
+    pub fn peer_id(&self) -> Option<&[u8; 20]> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.peer_id(),
+            AnyPeerConnection::Utp(conn) => conn.peer_id(),
+        }
+    }
+
+    pub fn set_interested(&mut self, interested: bool) -> Result<()> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.set_interested(interested),
+            AnyPeerConnection::Utp(conn) => conn.set_interested(interested),
+        }
+    }
+
+    pub fn set_choking(&mut self, choking: bool) -> Result<()> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.set_choking(choking),
+            AnyPeerConnection::Utp(conn) => conn.set_choking(choking),
+        }
+    }
+
+    pub fn request_block(&mut self, index: u32, begin: u32, length: u32) -> Result<()> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.request_block(index, begin, length),
+            AnyPeerConnection::Utp(conn) => conn.request_block(index, begin, length),
+        }
+    }
+
+    pub fn cancel_request(&mut self, index: u32, begin: u32, length: u32) -> Result<()> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.cancel_request(index, begin, length),
+            AnyPeerConnection::Utp(conn) => conn.cancel_request(index, begin, length),
+        }
+    }
+
+    pub fn complete_request(&mut self, index: u32, begin: u32) {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.complete_request(index, begin),
+            AnyPeerConnection::Utp(conn) => conn.complete_request(index, begin),
+        }
+    }
+
+    pub fn send_keepalive(&mut self) -> Result<()> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.send_keepalive(),
+            AnyPeerConnection::Utp(conn) => conn.send_keepalive(),
+        }
+    }
+
+    pub fn send_have(&mut self, piece_index: u32) -> Result<()> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.send_have(piece_index),
+            AnyPeerConnection::Utp(conn) => conn.send_have(piece_index),
+        }
+    }
+
+    pub fn send_bitfield(&mut self, bitfield: &Bitfield) -> Result<()> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.send_bitfield(bitfield),
+            AnyPeerConnection::Utp(conn) => conn.send_bitfield(bitfield),
+        }
+    }
+
+    pub fn send_piece(&mut self, index: u32, begin: u32, block: Vec<u8>) -> Result<()> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.send_piece(index, begin, block),
+            AnyPeerConnection::Utp(conn) => {
+                let msg = PeerMessage::Piece { index, begin, block };
+                conn.send_message(&msg)
+            }
+        }
+    }
+
+    pub fn extensions_enabled(&self) -> bool {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.extensions_enabled(),
+            AnyPeerConnection::Utp(conn) => conn.extensions_enabled(),
+        }
+    }
+
+    pub fn extension_state(&self) -> Option<&ExtensionState> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.extension_state(),
+            AnyPeerConnection::Utp(conn) => conn.extension_state(),
+        }
+    }
+
+    pub fn peer_supports_extension(&self, name: &str) -> bool {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.peer_supports_extension(name),
+            AnyPeerConnection::Utp(conn) => conn.peer_supports_extension(name),
+        }
+    }
+
+    pub fn peer_metadata_size(&self) -> Option<u32> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.peer_metadata_size(),
+            AnyPeerConnection::Utp(conn) => conn.peer_metadata_size(),
+        }
+    }
+
+    pub fn send_extended_message(&mut self, ext_id: u8, payload: &[u8]) -> Result<()> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.send_extended_message(ext_id, payload),
+            AnyPeerConnection::Utp(conn) => conn.send_extended_message(ext_id, payload),
+        }
+    }
+
+    pub fn take_pex_updates(&mut self) -> Option<PexUpdate> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.take_pex_updates(),
+            AnyPeerConnection::Utp(conn) => conn.take_pex_updates(),
+        }
+    }
+
+    pub fn take_metadata(&mut self) -> Option<Vec<u8>> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.take_metadata(),
+            AnyPeerConnection::Utp(conn) => conn.take_metadata(),
+        }
+    }
+
+    pub fn take_peer_requests(&mut self) -> Vec<crate::peer::PendingRequest> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.take_peer_requests(),
+            AnyPeerConnection::Utp(_) => Vec::new(),
+        }
+    }
+
+    pub fn is_tcp(&self) -> bool {
+        matches!(self, AnyPeerConnection::Tcp(_))
+    }
+
+    pub fn is_utp(&self) -> bool {
+        matches!(self, AnyPeerConnection::Utp(_))
+    }
+
+    pub fn disconnect(&mut self) {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.disconnect(),
+            AnyPeerConnection::Utp(conn) => conn.disconnect(),
+        }
+    }
+
+    pub fn bitfield(&self) -> Option<&Bitfield> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.bitfield(),
+            AnyPeerConnection::Utp(_) => None,
+        }
+    }
+
+    pub fn recv_message(&mut self) -> Result<Option<PeerMessage>> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.recv_message(),
+            AnyPeerConnection::Utp(conn) => conn.recv_message(),
+        }
+    }
+
+    pub fn raw_socket(&self) -> crate::sockets::RawSocket {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.raw_socket(),
+            AnyPeerConnection::Utp(_) => 0,
+        }
+    }
+
+    pub fn tick_handshake(&mut self) -> Result<()> {
+        match self {
+            AnyPeerConnection::Tcp(conn) => conn.tick_handshake(),
+            AnyPeerConnection::Utp(_) => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]

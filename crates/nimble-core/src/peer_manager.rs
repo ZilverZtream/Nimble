@@ -1,5 +1,5 @@
 use anyhow::Result;
-use nimble_net::peer::{PeerConnection, PeerMessage, PeerState};
+use nimble_net::peer::{AnyPeerConnection, PeerConnection, PeerMessage, PeerState};
 use nimble_storage::disk::DiskStorage;
 use nimble_util::bitfield::Bitfield;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -38,7 +38,7 @@ pub struct PeerManager {
 }
 
 struct ManagedPeer {
-    connection: PeerConnection,
+    connection: AnyPeerConnection,
     pending_blocks: Vec<BlockRequest>,
 }
 
@@ -119,7 +119,7 @@ impl PeerManager {
         }
     }
 
-    pub fn accept_incoming(&mut self, connection: PeerConnection, addr: SocketAddrV4) -> Result<()> {
+    pub fn accept_incoming(&mut self, connection: AnyPeerConnection, addr: SocketAddrV4) -> Result<()> {
         if self.peers.len() >= MAX_PEERS_PER_TORRENT {
             anyhow::bail!("peer limit reached");
         }
@@ -137,6 +137,10 @@ impl PeerManager {
         );
 
         Ok(())
+    }
+
+    pub fn accept_incoming_tcp(&mut self, connection: PeerConnection, addr: SocketAddrV4) -> Result<()> {
+        self.accept_incoming(AnyPeerConnection::Tcp(connection), addr)
     }
 
     pub fn tick(&mut self, mut storage: Option<&mut DiskStorage>) -> Result<PeerManagerStats> {
@@ -332,7 +336,7 @@ impl PeerManager {
             attempts += 1;
 
             let mut conn =
-                PeerConnection::new_v4(addr, self.info_hash, self.peer_id, self.piece_count);
+                AnyPeerConnection::new_tcp_v4(addr, self.info_hash, self.peer_id, self.piece_count);
 
             match conn.connect() {
                 Ok(()) => {
@@ -749,7 +753,7 @@ impl PiecePicker {
         }
     }
 
-    pub fn pick_piece(&self, peer: &PeerConnection) -> Option<usize> {
+    pub fn pick_piece(&self, peer: &AnyPeerConnection) -> Option<usize> {
         for (_rarity, pieces) in self.rarity_buckets.iter() {
             for &piece in pieces {
                 if self.completed.get(piece) {

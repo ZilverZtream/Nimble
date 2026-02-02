@@ -9,11 +9,12 @@ const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(120);
 const MIN_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
 const PEER_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_MESSAGES_PER_TICK: usize = 100;
+const MAX_PEERS_PER_INFOHASH: usize = 200;
 
 pub struct LsdClient {
     socket: Option<UdpSocket>,
     torrents: HashMap<[u8; 20], TorrentAnnounce>,
-    discovered_peers: HashMap<[u8; 20], HashSet<SocketAddrV4>>,
+    discovered_peers: HashMap<[u8; 20], HashMap<SocketAddrV4, Instant>>,
     listen_port: u16,
 }
 
@@ -102,7 +103,7 @@ impl LsdClient {
                     cookie: Self::generate_cookie(),
                 },
             );
-            self.discovered_peers.insert(info_hash, HashSet::new());
+            self.discovered_peers.insert(info_hash, HashMap::new());
         }
     }
 
@@ -128,6 +129,7 @@ impl LsdClient {
         };
 
         self.process_incoming_messages()?;
+        self.cleanup_expired_peers();
 
         let now = Instant::now();
 
@@ -284,7 +286,15 @@ impl LsdClient {
                     }
 
                     if let Some(peers) = self.discovered_peers.get_mut(&info_hash) {
-                        peers.insert(peer_addr);
+                        if peers.len() >= MAX_PEERS_PER_INFOHASH && !peers.contains_key(&peer_addr) {
+                            if let Some(oldest_peer) = peers.iter()
+                                .min_by_key(|(_, &time)| time)
+                                .map(|(addr, _)| *addr)
+                            {
+                                peers.remove(&oldest_peer);
+                            }
+                        }
+                        peers.insert(peer_addr, Instant::now());
                     }
                 }
             }
@@ -294,10 +304,22 @@ impl LsdClient {
     }
 
     pub fn get_discovered_peers(&mut self, info_hash: &[u8; 20]) -> Vec<SocketAddrV4> {
-        self.discovered_peers
-            .get(info_hash)
-            .map(|peers| peers.iter().copied().collect())
-            .unwrap_or_default()
+        let now = Instant::now();
+
+        if let Some(peers) = self.discovered_peers.get_mut(info_hash) {
+            peers.retain(|_, &mut discovered_at| now.duration_since(discovered_at) < PEER_TIMEOUT);
+            peers.keys().copied().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn cleanup_expired_peers(&mut self) {
+        let now = Instant::now();
+
+        for peers in self.discovered_peers.values_mut() {
+            peers.retain(|_, &mut discovered_at| now.duration_since(discovered_at) < PEER_TIMEOUT);
+        }
     }
 
     pub fn clear_discovered_peers(&mut self, info_hash: &[u8; 20]) {

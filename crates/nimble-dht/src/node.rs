@@ -20,6 +20,7 @@ use crate::tokens::TokenIssuer;
 const MAX_RESPONSE_NODES: usize = 16;
 const MAX_PEERS_PER_INFOHASH: usize = 32;
 const MAX_INFOHASHES: usize = 128;
+const PEER_TTL_MS: u64 = 1_800_000;
 const RATE_LIMIT_WINDOW_MS: u64 = 1_000;
 const RATE_LIMIT_MAX_QUERIES: u32 = 32;
 const RATE_LIMIT_MAX_CLIENTS: usize = 1_024;
@@ -30,6 +31,12 @@ const REFRESH_BATCH_SIZE: usize = 8;
 const QUERY_TIMEOUT_MS: u64 = 5_000;
 const MAX_PENDING_QUERIES: usize = 256;
 const MAX_NODE_IDS_PER_IP: usize = 3;
+
+#[derive(Debug, Clone, Copy)]
+struct StoredPeer {
+    addr: SocketAddrV4,
+    stored_at_ms: u64,
+}
 
 fn validate_node_id_for_ip(node_id: &[u8; 20], ip: &Ipv4Addr) -> bool {
     let ip_bytes = ip.octets();
@@ -65,7 +72,7 @@ pub struct DhtNode {
     #[cfg(feature = "ipv6")]
     routing6: RoutingTable6,
     tokens: TokenIssuer,
-    peers: HashMap<[u8; 20], Vec<SocketAddrV4>>,
+    peers: HashMap<[u8; 20], Vec<StoredPeer>>,
     rate_limiter: RateLimiter,
     pending_outbound: Vec<(SocketAddrV4, Vec<u8>)>,
     #[cfg(feature = "ipv6")]
@@ -143,6 +150,13 @@ impl DhtNode {
         v4 + v6
     }
 
+    fn elapsed_ms(&self) -> u64 {
+        Instant::now()
+            .checked_duration_since(self.clock_start)
+            .unwrap_or(Duration::from_millis(0))
+            .as_millis() as u64
+    }
+
     pub fn tick(&mut self) -> Vec<String> {
         let now = Instant::now();
         self.tick_at(now)
@@ -162,6 +176,7 @@ impl DhtNode {
             .as_millis() as u64;
 
         self.cleanup_stale_queries(now_ms);
+        self.prune_expired_peers();
 
         if !self.bootstrap_done {
             if self.routing.is_empty() {
@@ -514,25 +529,38 @@ impl DhtNode {
     }
 
     fn store_peer(&mut self, info_hash: [u8; 20], peer: SocketAddrV4) {
+        let now_ms = self.elapsed_ms();
+
         if self.peers.len() >= MAX_INFOHASHES && !self.peers.contains_key(&info_hash) {
             if let Some(key) = self.peers.keys().next().copied() {
                 self.peers.remove(&key);
             }
         }
         let entry = self.peers.entry(info_hash).or_insert_with(Vec::new);
-        if entry.iter().any(|existing| *existing == peer) {
+        if let Some(existing) = entry.iter_mut().find(|p| p.addr == peer) {
+            existing.stored_at_ms = now_ms;
             return;
         }
         if entry.len() >= MAX_PEERS_PER_INFOHASH {
             entry.remove(0);
         }
-        entry.push(peer);
+        entry.push(StoredPeer {
+            addr: peer,
+            stored_at_ms: now_ms,
+        });
+    }
+
+    fn prune_expired_peers(&mut self) {
+        let now_ms = self.elapsed_ms();
+        for peers in self.peers.values_mut() {
+            peers.retain(|p| now_ms.saturating_sub(p.stored_at_ms) < PEER_TTL_MS);
+        }
     }
 }
 
-fn limit_peers(peers: &[SocketAddrV4]) -> Vec<SocketAddrV4> {
+fn limit_peers(peers: &[StoredPeer]) -> Vec<SocketAddrV4> {
     let mut out = Vec::with_capacity(peers.len().min(MAX_PEERS_PER_INFOHASH));
-    out.extend(peers.iter().take(MAX_PEERS_PER_INFOHASH).copied());
+    out.extend(peers.iter().take(MAX_PEERS_PER_INFOHASH).map(|p| p.addr));
     out
 }
 

@@ -3,7 +3,7 @@ use nimble_bencode::torrent::{parse_info_dict, parse_torrent, InfoHash, TorrentI
 use nimble_dht::node::DhtNode;
 use nimble_lsd::bep14::LsdClient;
 use nimble_nat::nat_pmp::{NatPmpClient, Protocol as NatProtocol};
-use nimble_nat::upnp::UpnpClient;
+use nimble_nat::upnp::{UpnpClient, Protocol as UpnpProtocol};
 use nimble_net::listener::PeerListener;
 use nimble_net::peer::PeerConnection;
 use nimble_net::sockets::{poll_readable_sockets, RawSocket};
@@ -128,6 +128,9 @@ impl Session {
                     if let Ok(port) = client.add_port_mapping(listen_port, listen_port, NatProtocol::Tcp, None) {
                         eprintln!("NAT-PMP: Mapped TCP port {} -> {}", listen_port, port);
                     }
+                    if let Ok(port) = client.add_port_mapping(listen_port, listen_port, NatProtocol::Udp, None) {
+                        eprintln!("NAT-PMP: Mapped UDP port {} -> {}", listen_port, port);
+                    }
                     Some(client)
                 }
                 Err(e) => {
@@ -144,6 +147,12 @@ impl Session {
             match client.discover() {
                 Ok(_) => {
                     eprintln!("UPnP: Gateway discovered");
+                    if let Ok(()) = client.add_port_mapping(listen_port, listen_port, UpnpProtocol::Tcp, "Nimble TCP") {
+                        eprintln!("UPnP: Mapped TCP port {}", listen_port);
+                    }
+                    if let Ok(()) = client.add_port_mapping(listen_port, listen_port, UpnpProtocol::Udp, "Nimble UDP") {
+                        eprintln!("UPnP: Mapped UDP port {}", listen_port);
+                    }
                     Some(client)
                 }
                 Err(e) => {

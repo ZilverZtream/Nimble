@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use nimble_util::hash::percent_encode;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::mpsc::Sender;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(windows))]
@@ -81,6 +81,7 @@ pub struct AnnounceResponse {
     pub complete: Option<u32>,
     pub incomplete: Option<u32>,
     pub peers: Vec<SocketAddrV4>,
+    pub peers6: Vec<SocketAddrV6>,
     pub failure_reason: Option<String>,
 }
 
@@ -526,6 +527,7 @@ fn parse_announce_response(data: &[u8]) -> Result<AnnounceResponse> {
             complete: None,
             incomplete: None,
             peers: Vec::new(),
+            peers6: Vec::new(),
             failure_reason: Some(failure_str.to_string()),
         });
     }
@@ -552,6 +554,18 @@ fn parse_announce_response(data: &[u8]) -> Result<AnnounceResponse> {
     let peers = if let Some(peers_val) = dict.get(b"peers".as_ref()) {
         if let Some(peers_bytes) = peers_val.as_bytes() {
             parse_compact_peers(peers_bytes)?
+        } else if let Some(peers_list) = peers_val.as_list() {
+            parse_dict_peers(peers_list)?
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let peers6 = if let Some(peers6_val) = dict.get(b"peers6".as_ref()) {
+        if let Some(peers6_bytes) = peers6_val.as_bytes() {
+            parse_compact_peers6(peers6_bytes)?
         } else {
             Vec::new()
         }
@@ -564,6 +578,7 @@ fn parse_announce_response(data: &[u8]) -> Result<AnnounceResponse> {
         complete,
         incomplete,
         peers,
+        peers6,
         failure_reason: None,
     })
 }
@@ -581,6 +596,53 @@ fn parse_compact_peers(data: &[u8]) -> Result<Vec<SocketAddrV4>> {
         let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
         peers.push(SocketAddrV4::new(ip, port));
+    }
+
+    Ok(peers)
+}
+
+fn parse_compact_peers6(data: &[u8]) -> Result<Vec<SocketAddrV6>> {
+    if data.len() % 18 != 0 {
+        return Err(anyhow!("compact peers6 length must be multiple of 18"));
+    }
+
+    let peer_count = data.len() / 18;
+    let capped_count = peer_count.min(MAX_PEERS_FROM_TRACKER);
+    let mut peers = Vec::with_capacity(capped_count);
+
+    for chunk in data.chunks_exact(18).take(MAX_PEERS_FROM_TRACKER) {
+        let ip = Ipv6Addr::from([
+            chunk[0], chunk[1], chunk[2], chunk[3],
+            chunk[4], chunk[5], chunk[6], chunk[7],
+            chunk[8], chunk[9], chunk[10], chunk[11],
+            chunk[12], chunk[13], chunk[14], chunk[15],
+        ]);
+        let port = u16::from_be_bytes([chunk[16], chunk[17]]);
+        peers.push(SocketAddrV6::new(ip, port, 0, 0));
+    }
+
+    Ok(peers)
+}
+
+fn parse_dict_peers(peers_list: &[nimble_bencode::decode::Value]) -> Result<Vec<SocketAddrV4>> {
+    let mut peers = Vec::with_capacity(peers_list.len().min(MAX_PEERS_FROM_TRACKER));
+
+    for peer_val in peers_list.iter().take(MAX_PEERS_FROM_TRACKER) {
+        if let Some(peer_dict) = peer_val.as_dict() {
+            let ip_val = peer_dict.get(b"ip".as_ref());
+            let port_val = peer_dict.get(b"port".as_ref());
+
+            if let (Some(ip_str), Some(port_int)) = (
+                ip_val.and_then(|v| v.as_str()),
+                port_val.and_then(|v| v.as_integer()),
+            ) {
+                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                    if port_int > 0 && port_int <= u16::MAX as i64 {
+                        peers.push(SocketAddrV4::new(ip, port_int as u16));
+                    }
+                }
+            }
+        }
     }
 
     Ok(peers)

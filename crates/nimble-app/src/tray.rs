@@ -266,17 +266,24 @@ fn event_listener_thread(events: EventReceiver) {
                     match event {
                         Event::Stats(stats) => {
                             {
-                                let mut data = TRAY_DATA.lock().unwrap();
-                                data.stats = stats.clone();
-                                let new_state = if data.is_paused {
-                                    TrayState::Paused
-                                } else if stats.active_torrents > 0 {
-                                    TrayState::Active
-                                } else {
-                                    TrayState::Idle
-                                };
-                                if new_state != data.state {
-                                    data.state = new_state;
+                                match TRAY_DATA.lock() {
+                                    Ok(mut data) => {
+                                        data.stats = stats.clone();
+                                        let new_state = if data.is_paused {
+                                            TrayState::Paused
+                                        } else if stats.active_torrents > 0 {
+                                            TrayState::Active
+                                        } else {
+                                            TrayState::Idle
+                                        };
+                                        if new_state != data.state {
+                                            data.state = new_state;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::info(&format!("Tray mutex poisoned (stats): {}", e));
+                                        continue;
+                                    }
                                 }
                             }
                             PostMessageW(hwnd, WM_ENGINE_EVENT, 0, 0);
@@ -385,8 +392,10 @@ unsafe fn update_tray_icon_and_tooltip(hwnd: HWND) {
     nid.uFlags = NIF_ICON | NIF_TIP;
 
     let (state, stats) = {
-        let data = TRAY_DATA.lock().unwrap();
-        (data.state, data.stats.clone())
+        match TRAY_DATA.lock() {
+            Ok(data) => (data.state, data.stats.clone()),
+            Err(_) => return,
+        }
     };
 
     nid.hIcon = get_icon_for_state(state);
@@ -616,9 +625,10 @@ unsafe fn handle_pause_all(hwnd: HWND) {
     use nimble_core::types::Command;
 
     {
-        let mut data = TRAY_DATA.lock().unwrap();
-        data.is_paused = true;
-        data.state = TrayState::Paused;
+        if let Ok(mut data) = TRAY_DATA.lock() {
+            data.is_paused = true;
+            data.state = TrayState::Paused;
+        }
     }
     update_tray_icon_and_tooltip(hwnd);
 
@@ -632,14 +642,15 @@ unsafe fn handle_resume_all(hwnd: HWND) {
     use nimble_core::types::Command;
 
     {
-        let mut data = TRAY_DATA.lock().unwrap();
-        data.is_paused = false;
-        let new_state = if data.stats.active_torrents > 0 {
-            TrayState::Active
-        } else {
-            TrayState::Idle
-        };
-        data.state = new_state;
+        if let Ok(mut data) = TRAY_DATA.lock() {
+            data.is_paused = false;
+            let new_state = if data.stats.active_torrents > 0 {
+                TrayState::Active
+            } else {
+                TrayState::Idle
+            };
+            data.state = new_state;
+        }
     }
     update_tray_icon_and_tooltip(hwnd);
 

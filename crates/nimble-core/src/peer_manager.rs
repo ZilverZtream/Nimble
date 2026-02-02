@@ -429,7 +429,7 @@ impl PeerManager {
             let conn_result = if use_utp {
                 AnyPeerConnection::new_utp_v4(v4_addr, self.info_hash, self.peer_id, self.piece_count)
             } else {
-                Ok(AnyPeerConnection::new_tcp_v4(v4_addr, self.info_hash, self.peer_id, self.piece_count))
+                AnyPeerConnection::new_tcp_v4(v4_addr, self.info_hash, self.peer_id, self.piece_count)
             };
 
             let mut conn = match conn_result {

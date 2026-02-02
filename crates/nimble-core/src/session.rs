@@ -817,7 +817,7 @@ impl Session {
                             };
 
                             if should_query {
-                                dht.announce_peer(*t.info.infohash.as_bytes());
+                                dht.announce_peer(*t.info.infohash.as_bytes(), t.info.private);
                                 t.last_dht_query = Some(now);
                                 if tracker_failing {
                                     log_lines.push(format!(
@@ -841,7 +841,7 @@ impl Session {
                             };
 
                             if should_query {
-                                dht.announce_peer(t.info_hash);
+                                dht.announce_peer(t.info_hash, false);
                                 t.last_dht_query = Some(now);
                                 if tracker_failing {
                                     log_lines.push(format!(

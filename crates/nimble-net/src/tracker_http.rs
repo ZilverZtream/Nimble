@@ -90,9 +90,14 @@ pub fn announce(base_url: &str, request: &AnnounceRequest) -> Result<AnnounceRes
     let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = std::sync::mpsc::channel();
     announce_async(base_url, request, request_id, tx)?;
-    match rx.recv() {
+    match rx.recv_timeout(std::time::Duration::from_secs(90)) {
         Ok(HttpAnnounceEvent::Completed { result, .. }) => result,
-        Err(_) => Err(anyhow!("tracker announce channel closed")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(anyhow!("tracker announce timed out after 90 seconds"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(anyhow!("tracker announce channel closed"))
+        }
     }
 }
 

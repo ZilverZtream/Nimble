@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::net::{SocketAddr, UdpSocket, Ipv4Addr, IpAddr};
 use std::time::{Duration, Instant};
+use std::thread;
 
 const SSDP_MULTICAST_ADDR: &str = "239.255.255.250:1900";
 const SSDP_SEARCH_TARGET: &str = "urn:schemas-upnp-org:device:InternetGatewayDevice:1";
@@ -58,6 +59,21 @@ impl UpnpClient {
             mappings: Vec::new(),
             last_renewal: Instant::now(),
         }
+    }
+
+    pub fn discover_async<F>(callback: F)
+    where
+        F: FnOnce(Result<UpnpClient>) + Send + 'static,
+    {
+        thread::spawn(move || {
+            let mut client = UpnpClient::new();
+            let result = client.discover();
+            match result {
+                Ok(true) => callback(Ok(client)),
+                Ok(false) => callback(Err(anyhow::anyhow!("No UPnP gateway found"))),
+                Err(e) => callback(Err(e)),
+            }
+        });
     }
 
     pub fn discover(&mut self) -> Result<bool> {

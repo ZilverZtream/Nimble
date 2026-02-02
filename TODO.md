@@ -28,7 +28,7 @@ Leaving completed TODOs unchecked is considered a bug.
 # A. Repository & Build Foundations
 
 ## A1. Build configuration
-- [ ] A1.1 Enforce release profile (LTO, strip, panic=abort)
+- [x] A1.1 Enforce release profile (LTO, strip, panic=abort)
 - [ ] A1.2 Verify MSVC toolchain usage
 - [ ] A1.3 Verify single-EXE output (no bundled DLLs)
 - [ ] A1.4 CI builds debug and release on Windows
@@ -63,15 +63,15 @@ Leaving completed TODOs unchecked is considered a bug.
 - [x] B2.4 Status Window menu item
 - [x] B2.5 Pause All menu item
 - [x] B2.6 Resume All menu item
-- [ ] B2.7 Settings menu item
+- [x] B2.7 Settings menu item
 - [x] B2.8 Quit menu item
 
 ## B3. Tray icon state
-- [ ] B3.1 Idle icon
-- [ ] B3.2 Active icon
-- [ ] B3.3 Paused icon
-- [ ] B3.4 Error icon
-- [ ] B3.5 Tooltip with live stats
+- [x] B3.1 Idle icon
+- [x] B3.2 Active icon
+- [x] B3.3 Paused icon
+- [x] B3.4 Error icon
+- [x] B3.5 Tooltip with live stats
 
 -------------------------------------------------------------------------------
 
@@ -92,7 +92,7 @@ Leaving completed TODOs unchecked is considered a bug.
 
 ## C3. Session manager
 - [x] C3.1 Torrent registry
-- [ ] C3.2 Max active torrents enforcement
+- [x] C3.2 Max active torrents enforcement
 - [x] C3.3 Torrent lifecycle states
 - [ ] C3.4 Graceful stop/start transitions
 
@@ -152,12 +152,12 @@ Leaving completed TODOs unchecked is considered a bug.
 - [x] E3.5 Configurable cache size
 
 ## E4. Resume system
-- [ ] E4.1 Resume file format v1
-- [ ] E4.2 Bitfield persistence
-- [ ] E4.3 Partial piece persistence
-- [ ] E4.4 Safe write/replace strategy
-- [ ] E4.5 Resume load on startup
-- [ ] E4.6 Resume format migration allowed (no backward compatibility)
+- [x] E4.1 Resume file format v1
+- [x] E4.2 Bitfield persistence
+- [x] E4.3 Partial piece persistence
+- [x] E4.4 Safe write/replace strategy
+- [x] E4.5 Resume load on startup
+- [x] E4.6 Resume format migration allowed (no backward compatibility)
 
 -------------------------------------------------------------------------------
 

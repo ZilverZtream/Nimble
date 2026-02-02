@@ -1003,6 +1003,10 @@ impl UtpMultiplexer {
     where
         F: FnMut(&[u8], SocketAddr) -> Result<usize>,
     {
+        if data.len() > MAX_PACKET_SIZE {
+            anyhow::bail!("packet too large: {} bytes (max {})", data.len(), MAX_PACKET_SIZE);
+        }
+
         let (header, _) = UtpHeader::parse(data)?;
 
         if header.packet_type == PacketType::Syn {

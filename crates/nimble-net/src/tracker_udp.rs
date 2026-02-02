@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -91,7 +91,7 @@ impl UdpTracker {
     }
 
     fn do_connect(&mut self) -> Result<()> {
-        let transaction_id = generate_transaction_id();
+        let transaction_id = generate_transaction_id()?;
 
         let mut retries = 0;
         loop {
@@ -169,7 +169,7 @@ impl UdpTracker {
             .ok_or_else(|| anyhow!("not connected"))?
             .connection_id;
 
-        let transaction_id = generate_transaction_id();
+        let transaction_id = generate_transaction_id()?;
 
         let mut retries = 0;
         loop {
@@ -247,10 +247,10 @@ impl UdpTracker {
     }
 }
 
-fn generate_transaction_id() -> u32 {
+fn generate_transaction_id() -> Result<u32> {
     let bytes = nimble_util::ids::generate_random_bytes::<4>()
-        .expect("failed to generate transaction ID");
-    u32::from_be_bytes(bytes)
+        .map_err(|e| anyhow!("failed to generate transaction ID: {}", e))?;
+    Ok(u32::from_be_bytes(bytes))
 }
 
 fn calculate_timeout(retry: u32) -> Duration {
@@ -306,7 +306,15 @@ fn parse_announce_response(data: &[u8]) -> Result<UdpAnnounceResponse> {
     let peers_data = &data[20..];
     let mut peers = Vec::new();
 
-    if peers_data.len() % 18 == 0 && peers_data.len() > 0 {
+    if peers_data.len() % 6 == 0 && peers_data.len() % 18 != 0 {
+        for chunk in peers_data.chunks_exact(6) {
+            let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+            let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+            if port > 0 {
+                peers.push(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+            }
+        }
+    } else if peers_data.len() % 18 == 0 && peers_data.len() > 0 {
         for chunk in peers_data.chunks_exact(18) {
             let ip = Ipv6Addr::new(
                 u16::from_be_bytes([chunk[0], chunk[1]]),
@@ -321,14 +329,6 @@ fn parse_announce_response(data: &[u8]) -> Result<UdpAnnounceResponse> {
             let port = u16::from_be_bytes([chunk[16], chunk[17]]);
             if port > 0 {
                 peers.push(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)));
-            }
-        }
-    } else if peers_data.len() % 6 == 0 {
-        for chunk in peers_data.chunks_exact(6) {
-            let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-            let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-            if port > 0 {
-                peers.push(SocketAddr::V4(SocketAddrV4::new(ip, port)));
             }
         }
     } else {
@@ -635,9 +635,9 @@ mod tests {
 
     #[test]
     fn test_generate_transaction_id() {
-        let id1 = generate_transaction_id();
+        let id1 = generate_transaction_id().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1));
-        let id2 = generate_transaction_id();
+        let id2 = generate_transaction_id().unwrap();
         assert_ne!(id1, id2);
     }
 }

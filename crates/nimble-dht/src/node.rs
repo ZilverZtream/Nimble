@@ -34,11 +34,39 @@ const MAX_NODE_IDS_PER_IP: usize = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct StoredPeer {
-    addr: SocketAddrV4,
+    addr: std::net::SocketAddr,
     stored_at_ms: u64,
 }
 
-fn validate_node_id_for_ip(node_id: &[u8; 20], ip: &Ipv4Addr) -> bool {
+fn validate_node_id_for_ipv4v4(node_id: &[u8; 20], ip: &Ipv4Addr) -> bool {
+    let ip_bytes = ip.octets();
+    let rand = node_id[19];
+
+    let mut v = [0u8; 4];
+    v[0] = (ip_bytes[0] & 0x03) | ((rand & 0x07) << 5);
+    v[1] = (ip_bytes[1] & 0x0f) | ((rand >> 3) & 0x70);
+    v[2] = (ip_bytes[2] & 0x3f) | ((rand >> 5) & 0xc0);
+    v[3] = ip_bytes[3];
+
+    let expected_0 = ((v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | v[3] as u32)
+        .wrapping_mul(0x9E3779B1);
+    let expected_0 = ((expected_0 >> 24) & 0xFF) as u8;
+
+    let expected_1 = ((v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | v[3] as u32)
+        .wrapping_mul(0x9E3779B1)
+        .wrapping_add(0x12345678);
+    let expected_1 = ((expected_1 >> 24) & 0xFF) as u8;
+
+    let expected_2 = ((v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | v[3] as u32)
+        .wrapping_mul(0x9E3779B1)
+        .wrapping_add(0x23456789);
+    let expected_2 = ((expected_2 >> 24) & 0xFF) as u8;
+
+    node_id[0] == expected_0 && node_id[1] == expected_1 && node_id[2] == expected_2
+}
+
+#[cfg(feature = "ipv6")]
+fn validate_node_id_for_ipv4v6(node_id: &[u8; 20], ip: &std::net::Ipv6Addr) -> bool {
     let ip_bytes = ip.octets();
     let rand = node_id[19];
 
@@ -84,13 +112,15 @@ pub struct DhtNode {
     last_bootstrap_ms: Option<u64>,
     next_refresh_ms: u64,
     clock_start: Instant,
-    node_ids_per_ip: HashMap<Ipv4Addr, HashSet<[u8; 20]>>,
+    node_ids_per_ip_v4: HashMap<Ipv4Addr, HashSet<[u8; 20]>>,
+    #[cfg(feature = "ipv6")]
+    node_ids_per_ip_v6: HashMap<std::net::Ipv6Addr, HashSet<[u8; 20]>>,
 }
 
 pub struct PacketOutcome {
     pub message: Message,
     pub response: Option<Message>,
-    pub discovered_peers: Vec<(SocketAddrV4, [u8; 20])>,
+    pub discovered_peers: Vec<(std::net::SocketAddr, [u8; 20])>,
 }
 
 type TransactionId = [u8; 2];
@@ -98,7 +128,7 @@ type TransactionId = [u8; 2];
 struct PendingQuery {
     query_type: QueryType,
     sent_at_ms: u64,
-    addr: SocketAddrV4,
+    addr: std::net::SocketAddr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +165,9 @@ impl DhtNode {
             last_bootstrap_ms: None,
             next_refresh_ms: REFRESH_INTERVAL_MS,
             clock_start,
-            node_ids_per_ip: HashMap::new(),
+            node_ids_per_ip_v4: HashMap::new(),
+            #[cfg(feature = "ipv6")]
+            node_ids_per_ip_v6: HashMap::new(),
         }
     }
 
@@ -282,11 +314,11 @@ impl DhtNode {
                             }
                             if let QueryType::GetPeers(info_hash) = pending.query_type {
                                 for peer_addr in values {
-                                    discovered_peers.push((*peer_addr, info_hash));
+                                    discovered_peers.push((std::net::SocketAddr::V4(*peer_addr), info_hash));
                                 }
                                 #[cfg(feature = "ipv6")]
-                                for _peer_addr in values6 {
-
+                                for peer_addr in values6 {
+                                    discovered_peers.push((std::net::SocketAddr::V6(*peer_addr), info_hash));
                                 }
                             }
                         }
@@ -319,12 +351,12 @@ impl DhtNode {
     pub fn observe_node(&mut self, id: [u8; 20], addr: SocketAddrV4) -> bool {
         use crate::routing::InsertResult;
 
-        if !validate_node_id_for_ip(&id, addr.ip()) {
+        if !validate_node_id_for_ipv4v4(&id, addr.ip()) {
             return false;
         }
 
         let ip = *addr.ip();
-        let node_ids = self.node_ids_per_ip.entry(ip).or_insert_with(HashSet::new);
+        let node_ids = self.node_ids_per_ip_v4.entry(ip).or_insert_with(HashSet::new);
 
         if !node_ids.contains(&id) && node_ids.len() >= MAX_NODE_IDS_PER_IP {
             return false;
@@ -343,6 +375,25 @@ impl DhtNode {
         }
 
         result.was_inserted()
+    }
+
+    #[cfg(feature = "ipv6")]
+    pub fn observe_node6(&mut self, id: [u8; 20], addr: std::net::SocketAddrV6) -> bool {
+        if !validate_node_id_for_ipv4v6(&id, addr.ip()) {
+            return false;
+        }
+
+        let ip = *addr.ip();
+        let node_ids = self.node_ids_per_ip_v6.entry(ip).or_insert_with(HashSet::new);
+
+        if !node_ids.contains(&id) && node_ids.len() >= MAX_NODE_IDS_PER_IP {
+            return false;
+        }
+
+        node_ids.insert(id);
+
+        self.routing6.insert(id, addr);
+        true
     }
 
     pub fn take_pending_packets(&mut self) -> Vec<(SocketAddrV4, Vec<u8>)> {
@@ -399,7 +450,7 @@ impl DhtNode {
             PendingQuery {
                 query_type,
                 sent_at_ms: now_ms,
-                addr,
+                addr: std::net::SocketAddr::V4(addr),
             },
         );
 
@@ -430,7 +481,7 @@ impl DhtNode {
             PendingQuery {
                 query_type: QueryType::GetPeers(info_hash),
                 sent_at_ms: now_ms,
-                addr,
+                addr: std::net::SocketAddr::V4(addr),
             },
         );
 
@@ -475,12 +526,27 @@ impl DhtNode {
             }
             QueryKind::GetPeers { info_hash, .. } => {
                 let token = self.tokens.token_for(*source.ip());
-                let peers = self
+                let all_peers = self
                     .peers
                     .get(info_hash)
                     .map(|values| limit_peers(values))
                     .unwrap_or_default();
-                let nodes = if peers.is_empty() {
+
+                let mut peers_v4 = Vec::new();
+                #[cfg(feature = "ipv6")]
+                let mut peers_v6 = Vec::new();
+
+                for peer in all_peers {
+                    match peer {
+                        std::net::SocketAddr::V4(v4) => peers_v4.push(v4),
+                        #[cfg(feature = "ipv6")]
+                        std::net::SocketAddr::V6(v6) => peers_v6.push(v6),
+                        #[cfg(not(feature = "ipv6"))]
+                        _ => {}
+                    }
+                }
+
+                let nodes = if peers_v4.is_empty() {
                     self.closest_nodes(*info_hash)
                 } else {
                     Vec::new()
@@ -491,11 +557,11 @@ impl DhtNode {
                         id: self.node_id,
                         token: Some(token),
                         nodes,
-                        values: peers,
+                        values: peers_v4,
                         #[cfg(feature = "ipv6")]
                         nodes6: Vec::new(),
                         #[cfg(feature = "ipv6")]
-                        values6: Vec::new(),
+                        values6: peers_v6,
                     },
                 }))
             }
@@ -514,7 +580,8 @@ impl DhtNode {
                         message: b"invalid token".to_vec(),
                     }));
                 }
-                self.store_peer(*info_hash, SocketAddrV4::new(*source.ip(), peer_port));
+                let peer_addr = std::net::SocketAddr::V4(SocketAddrV4::new(*source.ip(), peer_port));
+                self.store_peer(*info_hash, peer_addr);
                 Some(Message::Response(Response {
                     transaction_id: query.transaction_id.clone(),
                     kind: ResponseKind::Ping { id: self.node_id },
@@ -534,7 +601,7 @@ impl DhtNode {
             .collect()
     }
 
-    fn store_peer(&mut self, info_hash: [u8; 20], peer: SocketAddrV4) {
+    fn store_peer(&mut self, info_hash: [u8; 20], peer: std::net::SocketAddr) {
         let now_ms = self.elapsed_ms();
 
         if self.peers.len() >= MAX_INFOHASHES && !self.peers.contains_key(&info_hash) {
@@ -574,7 +641,7 @@ impl DhtNode {
     }
 }
 
-fn limit_peers(peers: &[StoredPeer]) -> Vec<SocketAddrV4> {
+fn limit_peers(peers: &[StoredPeer]) -> Vec<std::net::SocketAddr> {
     let mut out = Vec::with_capacity(peers.len().min(MAX_PEERS_PER_INFOHASH));
     out.extend(peers.iter().take(MAX_PEERS_PER_INFOHASH).map(|p| p.addr));
     out
@@ -653,7 +720,7 @@ mod tests {
     use crate::rpc::{encode_message, Message, Query, QueryKind};
     use std::net::{Ipv4Addr, SocketAddrV4};
 
-    fn node_id_for_ip(ip: Ipv4Addr, rand: u8) -> [u8; 20] {
+    fn node_id_for_ipv4v4(ip: Ipv4Addr, rand: u8) -> [u8; 20] {
         let ip_bytes = ip.octets();
         let mut v = [0u8; 4];
         v[0] = (ip_bytes[0] & 0x03) | ((rand & 0x07) << 5);
@@ -685,7 +752,7 @@ mod tests {
     fn test_observe_node_updates_count() {
         let mut node = DhtNode::new();
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6881);
-        let other_id = node_id_for_ip(*addr.ip(), 1);
+        let other_id = node_id_for_ipv4(*addr.ip(), 1);
         assert!(node.observe_node(other_id, addr));
         assert_eq!(node.known_nodes(), 1);
     }
@@ -694,7 +761,7 @@ mod tests {
     fn handle_packet_tracks_sender() {
         let mut node = DhtNode::new();
         let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 6881);
-        let sender_id = node_id_for_ip(*addr.ip(), 9);
+        let sender_id = node_id_for_ipv4(*addr.ip(), 9);
         let message = Message::Query(Query {
             transaction_id: b"aa".to_vec(),
             kind: QueryKind::Ping { id: sender_id },
@@ -711,7 +778,7 @@ mod tests {
     fn handle_ping_returns_response() {
         let mut node = DhtNode::new();
         let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 10), 6881);
-        let sender_id = node_id_for_ip(*addr.ip(), 2);
+        let sender_id = node_id_for_ipv4(*addr.ip(), 2);
         let message = Message::Query(Query {
             transaction_id: b"aa".to_vec(),
             kind: QueryKind::Ping { id: sender_id },
@@ -732,11 +799,11 @@ mod tests {
     fn handle_find_node_returns_closest_nodes() {
         let mut node = DhtNode::new();
         let addr = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 6881);
-        let other_id = node_id_for_ip(*addr.ip(), 5);
+        let other_id = node_id_for_ipv4(*addr.ip(), 5);
         node.observe_node(other_id, addr);
 
         let sender_addr = SocketAddrV4::new(Ipv4Addr::new(2, 2, 2, 2), 6881);
-        let sender_id = node_id_for_ip(*sender_addr.ip(), 9);
+        let sender_id = node_id_for_ipv4(*sender_addr.ip(), 9);
         let query = Message::Query(Query {
             transaction_id: b"fn".to_vec(),
             kind: QueryKind::FindNode {
@@ -766,7 +833,7 @@ mod tests {
     fn announce_peer_then_get_peers_returns_value() {
         let mut node = DhtNode::new();
         let source = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 9), 6889);
-        let sender_id = node_id_for_ip(*source.ip(), 7);
+        let sender_id = node_id_for_ipv4(*source.ip(), 7);
         let info_hash = [0x22u8; 20];
 
         let get_query = Message::Query(Query {

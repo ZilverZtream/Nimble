@@ -47,43 +47,56 @@ impl ExtensionHandshake {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut dict = Vec::new();
-        dict.push(b'd');
+        use std::collections::BTreeMap;
+
+        let mut entries: BTreeMap<&[u8], Vec<u8>> = BTreeMap::new();
 
         if !self.extensions.is_empty() {
-            dict.extend_from_slice(b"1:m");
-            dict.push(b'd');
+            let mut m_dict = Vec::new();
+            m_dict.push(b'd');
             for (name, &id) in &self.extensions {
                 let name_len = name.len();
-                dict.extend_from_slice(format!("{}:", name_len).as_bytes());
-                dict.extend_from_slice(name.as_bytes());
-                dict.extend_from_slice(format!("i{}e", id).as_bytes());
+                m_dict.extend_from_slice(format!("{}:", name_len).as_bytes());
+                m_dict.extend_from_slice(name.as_bytes());
+                m_dict.extend_from_slice(format!("i{}e", id).as_bytes());
             }
-            dict.push(b'e');
+            m_dict.push(b'e');
+            entries.insert(b"m", m_dict);
         }
 
         if let Some(size) = self.metadata_size {
-            dict.extend_from_slice(b"13:metadata_size");
-            dict.extend_from_slice(format!("i{}e", size).as_bytes());
+            let mut val = Vec::new();
+            val.extend_from_slice(format!("i{}e", size).as_bytes());
+            entries.insert(b"metadata_size", val);
         }
 
         if let Some(port) = self.listen_port {
-            dict.extend_from_slice(b"1:p");
-            dict.extend_from_slice(format!("i{}e", port).as_bytes());
+            let mut val = Vec::new();
+            val.extend_from_slice(format!("i{}e", port).as_bytes());
+            entries.insert(b"p", val);
         }
 
         if let Some(ref reqq) = self.reqq {
-            dict.extend_from_slice(b"4:reqq");
-            dict.extend_from_slice(format!("i{}e", reqq).as_bytes());
+            let mut val = Vec::new();
+            val.extend_from_slice(format!("i{}e", reqq).as_bytes());
+            entries.insert(b"reqq", val);
         }
 
         if let Some(ref client) = self.client {
             let client_len = client.len().min(MAX_CLIENT_NAME_LEN);
-            dict.extend_from_slice(b"1:v");
-            dict.extend_from_slice(format!("{}:", client_len).as_bytes());
-            dict.extend_from_slice(&client.as_bytes()[..client_len]);
+            let mut val = Vec::new();
+            val.extend_from_slice(format!("{}:", client_len).as_bytes());
+            val.extend_from_slice(&client.as_bytes()[..client_len]);
+            entries.insert(b"v", val);
         }
 
+        let mut dict = Vec::new();
+        dict.push(b'd');
+        for (key, value) in entries {
+            dict.extend_from_slice(format!("{}:", key.len()).as_bytes());
+            dict.extend_from_slice(key);
+            dict.extend_from_slice(&value);
+        }
         dict.push(b'e');
         dict
     }

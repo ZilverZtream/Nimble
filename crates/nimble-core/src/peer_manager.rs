@@ -1,5 +1,5 @@
 use anyhow::Result;
-use nimble_net::peer::{PeerConnection, PeerMessage, PeerState};
+use nimble_net::peer::{AnyPeerConnection, PeerConnection, PeerMessage, PeerState};
 use nimble_storage::disk::DiskStorage;
 use nimble_util::bitfield::Bitfield;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -19,6 +19,19 @@ const BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const FAILED_PEER_TTL: Duration = Duration::from_secs(300);
 const CONNECTION_RATE_WINDOW: Duration = Duration::from_secs(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportPreference {
+    PreferTcp,
+    PreferUtp,
+    UtpOnly,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PeerCapability {
+    supports_utp: bool,
+    from_utp_tracker: bool,
+}
+
 pub struct PeerManager {
     info_hash: [u8; 20],
     peer_id: [u8; 20],
@@ -29,16 +42,19 @@ pub struct PeerManager {
     pending_metadata: Option<Vec<u8>>,
     peers: HashMap<SocketAddrV4, ManagedPeer>,
     candidate_peers: VecDeque<SocketAddrV4>,
+    peer_capabilities: HashMap<SocketAddrV4, PeerCapability>,
     failed_peers: HashMap<SocketAddrV4, (Instant, usize)>,
     piece_picker: PiecePicker,
     endgame: EndgameMode,
     pending_upload_requests: Vec<(SocketAddrV4, u32, u32, u32)>,
     connection_attempts: VecDeque<Instant>,
     last_connection_attempt: Instant,
+    transport_preference: TransportPreference,
+    listen_port: u16,
 }
 
 struct ManagedPeer {
-    connection: PeerConnection,
+    connection: AnyPeerConnection,
     pending_blocks: Vec<BlockRequest>,
 }
 
@@ -58,6 +74,26 @@ impl PeerManager {
         piece_length: u64,
         total_length: u64,
     ) -> Self {
+        Self::with_transport_preference(
+            info_hash,
+            peer_id,
+            piece_count,
+            piece_length,
+            total_length,
+            TransportPreference::PreferTcp,
+            6881,
+        )
+    }
+
+    pub fn with_transport_preference(
+        info_hash: [u8; 20],
+        peer_id: [u8; 20],
+        piece_count: usize,
+        piece_length: u64,
+        total_length: u64,
+        transport_preference: TransportPreference,
+        listen_port: u16,
+    ) -> Self {
         PeerManager {
             info_hash,
             peer_id,
@@ -68,12 +104,15 @@ impl PeerManager {
             pending_metadata: None,
             peers: HashMap::new(),
             candidate_peers: VecDeque::new(),
+            peer_capabilities: HashMap::new(),
             failed_peers: HashMap::new(),
             piece_picker: PiecePicker::new(piece_count),
             endgame: EndgameMode::new(),
             pending_upload_requests: Vec::new(),
             connection_attempts: VecDeque::new(),
             last_connection_attempt: Instant::now(),
+            transport_preference,
+            listen_port,
         }
     }
 
@@ -88,19 +127,37 @@ impl PeerManager {
             pending_metadata: None,
             peers: HashMap::new(),
             candidate_peers: VecDeque::new(),
+            peer_capabilities: HashMap::new(),
             failed_peers: HashMap::new(),
             piece_picker: PiecePicker::new(0),
             endgame: EndgameMode::new(),
             pending_upload_requests: Vec::new(),
             connection_attempts: VecDeque::new(),
             last_connection_attempt: Instant::now(),
+            transport_preference: TransportPreference::PreferTcp,
+            listen_port: 6881,
         }
     }
 
     pub fn add_peers(&mut self, addrs: &[SocketAddrV4]) {
+        self.add_peers_with_capability(addrs, false)
+    }
+
+    pub fn add_utp_peers(&mut self, addrs: &[SocketAddrV4]) {
+        self.add_peers_with_capability(addrs, true)
+    }
+
+    fn add_peers_with_capability(&mut self, addrs: &[SocketAddrV4], from_utp_tracker: bool) {
         for &addr in addrs {
             if self.candidate_peers.len() >= MAX_CANDIDATE_PEERS {
                 break;
+            }
+
+            if from_utp_tracker {
+                self.peer_capabilities.insert(addr, PeerCapability {
+                    supports_utp: true,
+                    from_utp_tracker: true,
+                });
             }
 
             if !self.peers.contains_key(&addr) && !self.candidate_peers.contains(&addr) {
@@ -119,7 +176,24 @@ impl PeerManager {
         }
     }
 
-    pub fn accept_incoming(&mut self, connection: PeerConnection, addr: SocketAddrV4) -> Result<()> {
+    pub fn set_transport_preference(&mut self, preference: TransportPreference) {
+        self.transport_preference = preference;
+    }
+
+    fn should_use_utp(&self, addr: &SocketAddrV4) -> bool {
+        match self.transport_preference {
+            TransportPreference::UtpOnly => true,
+            TransportPreference::PreferUtp => {
+                self.peer_capabilities
+                    .get(addr)
+                    .map(|cap| cap.supports_utp || cap.from_utp_tracker)
+                    .unwrap_or(false)
+            }
+            TransportPreference::PreferTcp => false,
+        }
+    }
+
+    pub fn accept_incoming(&mut self, connection: AnyPeerConnection, addr: SocketAddrV4) -> Result<()> {
         if self.peers.len() >= MAX_PEERS_PER_TORRENT {
             anyhow::bail!("peer limit reached");
         }
@@ -137,6 +211,10 @@ impl PeerManager {
         );
 
         Ok(())
+    }
+
+    pub fn accept_incoming_tcp(&mut self, connection: PeerConnection, addr: SocketAddrV4) -> Result<()> {
+        self.accept_incoming(AnyPeerConnection::Tcp(connection), addr)
     }
 
     pub fn tick(&mut self, mut storage: Option<&mut DiskStorage>) -> Result<PeerManagerStats> {
@@ -331,8 +409,21 @@ impl PeerManager {
             self.connection_attempts.push_back(now);
             attempts += 1;
 
-            let mut conn =
-                PeerConnection::new_v4(addr, self.info_hash, self.peer_id, self.piece_count);
+            let use_utp = self.should_use_utp(&addr);
+            let conn_result = if use_utp {
+                AnyPeerConnection::new_utp_v4(addr, self.info_hash, self.peer_id, self.piece_count)
+            } else {
+                Ok(AnyPeerConnection::new_tcp_v4(addr, self.info_hash, self.peer_id, self.piece_count))
+            };
+
+            let mut conn = match conn_result {
+                Ok(c) => c,
+                Err(_) => {
+                    let entry = self.failed_peers.entry(addr).or_insert((now, 0));
+                    entry.1 += 1;
+                    continue;
+                }
+            };
 
             match conn.connect() {
                 Ok(()) => {
@@ -749,7 +840,7 @@ impl PiecePicker {
         }
     }
 
-    pub fn pick_piece(&self, peer: &PeerConnection) -> Option<usize> {
+    pub fn pick_piece(&self, peer: &AnyPeerConnection) -> Option<usize> {
         for (_rarity, pieces) in self.rarity_buckets.iter() {
             for &piece in pieces {
                 if self.completed.get(piece) {

@@ -31,6 +31,7 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
             settings.enable_upnp,
             settings.enable_nat_pmp,
             settings.enable_lsd,
+            settings.enable_utp,
             settings.max_active_torrents,
         );
         let mut stats = EngineStats::default();

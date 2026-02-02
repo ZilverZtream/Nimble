@@ -3,11 +3,12 @@ use nimble_bencode::torrent::{parse_info_dict, parse_torrent, InfoHash, TorrentI
 use nimble_dht::node::DhtNode;
 use nimble_lsd::bep14::LsdClient;
 use nimble_nat::nat_pmp::{NatPmpClient, Protocol as NatProtocol};
-use nimble_nat::upnp::UpnpClient;
+use nimble_nat::upnp::{UpnpClient, Protocol as UpnpProtocol};
 use nimble_net::listener::PeerListener;
-use nimble_net::peer::PeerConnection;
+use nimble_net::peer::{AnyPeerConnection, PeerConnection};
 use nimble_net::sockets::{poll_readable_sockets, RawSocket};
 use nimble_net::tracker_http::TrackerEvent;
+use nimble_net::utp::UtpListener;
 use nimble_storage::disk::DiskStorage;
 use nimble_util::ids::peer_id_20;
 use std::collections::{HashMap, HashSet};
@@ -34,11 +35,13 @@ pub struct Session {
     announce_worker: AnnounceWorker,
     pending_announces: HashSet<String>,
     peer_listener: Option<PeerListener>,
+    utp_listener: Option<UtpListener>,
     nat_pmp: Option<NatPmpClient>,
     upnp: Option<UpnpClient>,
     lsd: Option<LsdClient>,
     mapped_port: Option<u16>,
     max_active_torrents: u32,
+    enable_utp: bool,
 }
 
 pub enum TorrentEntry {
@@ -102,6 +105,7 @@ impl Session {
         enable_upnp: bool,
         enable_nat_pmp: bool,
         enable_lsd: bool,
+        enable_utp: bool,
         max_active_torrents: u32,
     ) -> Self {
         let (dht, dht_socket) = if enable_dht {
@@ -128,6 +132,9 @@ impl Session {
                     if let Ok(port) = client.add_port_mapping(listen_port, listen_port, NatProtocol::Tcp, None) {
                         eprintln!("NAT-PMP: Mapped TCP port {} -> {}", listen_port, port);
                     }
+                    if let Ok(port) = client.add_port_mapping(listen_port, listen_port, NatProtocol::Udp, None) {
+                        eprintln!("NAT-PMP: Mapped UDP port {} -> {}", listen_port, port);
+                    }
                     Some(client)
                 }
                 Err(e) => {
@@ -144,6 +151,12 @@ impl Session {
             match client.discover() {
                 Ok(_) => {
                     eprintln!("UPnP: Gateway discovered");
+                    if let Ok(()) = client.add_port_mapping(listen_port, listen_port, UpnpProtocol::Tcp, "Nimble TCP") {
+                        eprintln!("UPnP: Mapped TCP port {}", listen_port);
+                    }
+                    if let Ok(()) = client.add_port_mapping(listen_port, listen_port, UpnpProtocol::Udp, "Nimble UDP") {
+                        eprintln!("UPnP: Mapped UDP port {}", listen_port);
+                    }
                     Some(client)
                 }
                 Err(e) => {
@@ -171,6 +184,21 @@ impl Session {
             None
         };
 
+        let utp_listener = if enable_utp {
+            match UtpListener::new(listen_port, false) {
+                Ok(listener) => {
+                    eprintln!("\u{00b5}TP: Listener started on port {}", listen_port);
+                    Some(listener)
+                }
+                Err(e) => {
+                    eprintln!("\u{00b5}TP listener failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut session = Session {
             torrents: HashMap::new(),
             download_dir,
@@ -181,11 +209,13 @@ impl Session {
             announce_worker: AnnounceWorker::new(),
             pending_announces: HashSet::new(),
             peer_listener,
+            utp_listener,
             nat_pmp,
             upnp,
             lsd,
             mapped_port: None,
             max_active_torrents,
+            enable_utp,
         };
 
         if let Err(e) = session.load_saved_torrents() {
@@ -665,6 +695,7 @@ impl Session {
         let mut upgrades = Vec::new();
 
         log_lines.extend(self.process_incoming_peers());
+        log_lines.extend(self.process_incoming_utp_peers());
         log_lines.extend(self.process_dht_incoming());
         log_lines.extend(self.process_lsd());
 
@@ -1203,10 +1234,10 @@ impl Session {
 
             let result = match torrent {
                 TorrentEntry::Active(t) => {
-                    t.peer_manager.accept_incoming(connection, accepted_peer.addr)
+                    t.peer_manager.accept_incoming_tcp(connection, accepted_peer.addr)
                 }
                 TorrentEntry::Magnet(t) => {
-                    t.peer_manager.accept_incoming(connection, accepted_peer.addr)
+                    t.peer_manager.accept_incoming_tcp(connection, accepted_peer.addr)
                 }
             };
 
@@ -1217,6 +1248,68 @@ impl Session {
                     accepted_peer.addr
                 ));
             }
+        }
+
+        log_lines
+    }
+
+    fn process_incoming_utp_peers(&mut self) -> Vec<String> {
+        let mut log_lines = Vec::new();
+        let Some(listener) = self.utp_listener.as_mut() else {
+            return log_lines;
+        };
+
+        if listener.poll().is_err() {
+            return log_lines;
+        }
+
+        while let Some((addr, conn_id)) = listener.accept() {
+            let infohash_hex = format!("{:x}", fastrand::u128(..));
+
+            if let std::net::SocketAddr::V4(v4_addr) = addr {
+                for (hex, torrent) in self.torrents.iter_mut() {
+                    let piece_count = match torrent {
+                        TorrentEntry::Active(t) => t.info.pieces.len(),
+                        TorrentEntry::Magnet(_) => 0,
+                    };
+
+                    let connection_result = nimble_net::utp_peer::UtpPeerConnection::new(
+                        addr,
+                        match torrent {
+                            TorrentEntry::Active(t) => t.info.infohash.0,
+                            TorrentEntry::Magnet(t) => t.info_hash,
+                        },
+                        self.peer_id,
+                        piece_count,
+                        self.listen_port,
+                    );
+
+                    if let Ok(connection) = connection_result {
+                        let any_conn = AnyPeerConnection::Utp(connection);
+                        let result = match torrent {
+                            TorrentEntry::Active(t) => {
+                                t.peer_manager.accept_incoming(any_conn, v4_addr)
+                            }
+                            TorrentEntry::Magnet(t) => {
+                                t.peer_manager.accept_incoming(any_conn, v4_addr)
+                            }
+                        };
+
+                        if result.is_ok() {
+                            log_lines.push(format!(
+                                "Accepted incoming \u{00b5}TP peer for {} from {}",
+                                &hex[..8],
+                                v4_addr
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(listener) = self.utp_listener.as_mut() {
+            let _ = listener.tick();
         }
 
         log_lines

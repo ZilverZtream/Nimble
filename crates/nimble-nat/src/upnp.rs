@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::net::{SocketAddr, UdpSocket, Ipv4Addr};
+use std::net::{SocketAddr, UdpSocket, Ipv4Addr, IpAddr};
 use std::time::{Duration, Instant};
 
 const SSDP_MULTICAST_ADDR: &str = "239.255.255.250:1900";
@@ -7,6 +7,7 @@ const SSDP_SEARCH_TARGET: &str = "urn:schemas-upnp-org:device:InternetGatewayDev
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const RENEWAL_INTERVAL: Duration = Duration::from_secs(1200);
 const MAPPING_LEASE_DURATION: u32 = 3600;
+const MAX_HTTP_RESPONSE_SIZE: usize = 1024 * 1024;
 
 const MSEARCH_REQUEST: &str = "M-SEARCH * HTTP/1.1\r
 Host: 239.255.255.250:1900\r
@@ -91,6 +92,7 @@ impl UpnpClient {
         }
 
         if let Some(url) = location_url {
+            Self::validate_location_url(&url)?;
             self.fetch_device_description(&url)?;
 
             if let Ok(addr) = socket.local_addr() {
@@ -113,6 +115,78 @@ impl UpnpClient {
             }
         }
         None
+    }
+
+    fn validate_location_url(url: &str) -> Result<()> {
+        if url.len() > 2048 {
+            anyhow::bail!("Location URL too long");
+        }
+
+        let lower_url = url.to_lowercase();
+        if !lower_url.starts_with("http://") && !lower_url.starts_with("https://") {
+            anyhow::bail!("Location URL must use http or https scheme");
+        }
+
+        let host_part = if let Some(stripped) = lower_url.strip_prefix("http://") {
+            stripped
+        } else if let Some(stripped) = lower_url.strip_prefix("https://") {
+            stripped
+        } else {
+            anyhow::bail!("Invalid URL scheme");
+        };
+
+        let host_end = host_part.find('/').unwrap_or(host_part.len());
+        let host_and_port = &host_part[..host_end];
+
+        let host = if let Some(colon_pos) = host_and_port.rfind(':') {
+            if host_and_port.starts_with('[') {
+                &host_and_port[1..host_and_port.find(']').unwrap_or(host_and_port.len())]
+            } else {
+                &host_and_port[..colon_pos]
+            }
+        } else if host_and_port.starts_with('[') {
+            &host_and_port[1..host_and_port.find(']').unwrap_or(host_and_port.len())]
+        } else {
+            host_and_port
+        };
+
+        let ip: IpAddr = host.parse()
+            .context("Location URL must use IP address, not hostname")?;
+
+        match ip {
+            IpAddr::V4(v4) => {
+                if !Self::is_private_ipv4(v4) {
+                    anyhow::bail!("Location URL must point to private IP address");
+                }
+            }
+            IpAddr::V6(v6) => {
+                if !Self::is_private_ipv6(&v6) {
+                    anyhow::bail!("Location URL must point to private IPv6 address");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn is_private_ipv4(ip: Ipv4Addr) -> bool {
+        let octets = ip.octets();
+        octets[0] == 10
+            || (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31)
+            || (octets[0] == 192 && octets[1] == 168)
+            || (octets[0] == 127)
+    }
+
+    fn is_private_ipv6(ip: &std::net::Ipv6Addr) -> bool {
+        ip.is_loopback() || ip.is_unicast_link_local() || ip.is_unique_local()
+    }
+
+    fn xml_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
     }
 
     fn fetch_device_description(&mut self, url: &str) -> Result<()> {
@@ -182,9 +256,29 @@ impl UpnpClient {
             .call()
             .context("HTTP GET request failed")?;
 
-        response
-            .into_string()
-            .context("Failed to read response body")
+        let content_length = response.header("Content-Length")
+            .and_then(|s| s.parse::<usize>().ok());
+
+        if let Some(len) = content_length {
+            if len > MAX_HTTP_RESPONSE_SIZE {
+                anyhow::bail!("HTTP response too large: {} bytes", len);
+            }
+        }
+
+        use std::io::Read;
+        let mut reader = response.into_reader();
+        let mut body = Vec::with_capacity(content_length.unwrap_or(8192).min(MAX_HTTP_RESPONSE_SIZE));
+        let mut limited = reader.take(MAX_HTTP_RESPONSE_SIZE as u64 + 1);
+
+        limited.read_to_end(&mut body)
+            .context("Failed to read response body")?;
+
+        if body.len() > MAX_HTTP_RESPONSE_SIZE {
+            anyhow::bail!("HTTP response exceeds maximum size");
+        }
+
+        String::from_utf8(body)
+            .context("Response body is not valid UTF-8")
     }
 
     pub fn add_port_mapping(
@@ -216,12 +310,12 @@ impl UpnpClient {
 </u:AddPortMapping>
 </s:Body>
 </s:Envelope>"#,
-            service_type,
+            Self::xml_escape(service_type),
             external_port,
             protocol.as_str(),
             internal_port,
-            self.local_addr,
-            description,
+            Self::xml_escape(&self.local_addr),
+            Self::xml_escape(description),
             MAPPING_LEASE_DURATION
         );
 
@@ -256,7 +350,7 @@ impl UpnpClient {
 </u:DeletePortMapping>
 </s:Body>
 </s:Envelope>"#,
-            service_type, external_port, protocol.as_str()
+            Self::xml_escape(service_type), external_port, protocol.as_str()
         );
 
         self.soap_request(control_url, service_type, "DeletePortMapping", &soap_body)?;
@@ -286,9 +380,29 @@ impl UpnpClient {
             .send_string(body)
             .context("SOAP request failed")?;
 
-        response
-            .into_string()
-            .context("Failed to read SOAP response")
+        let content_length = response.header("Content-Length")
+            .and_then(|s| s.parse::<usize>().ok());
+
+        if let Some(len) = content_length {
+            if len > MAX_HTTP_RESPONSE_SIZE {
+                anyhow::bail!("SOAP response too large: {} bytes", len);
+            }
+        }
+
+        use std::io::Read;
+        let mut reader = response.into_reader();
+        let mut body = Vec::with_capacity(content_length.unwrap_or(8192).min(MAX_HTTP_RESPONSE_SIZE));
+        let mut limited = reader.take(MAX_HTTP_RESPONSE_SIZE as u64 + 1);
+
+        limited.read_to_end(&mut body)
+            .context("Failed to read SOAP response body")?;
+
+        if body.len() > MAX_HTTP_RESPONSE_SIZE {
+            anyhow::bail!("SOAP response exceeds maximum size");
+        }
+
+        String::from_utf8(body)
+            .context("SOAP response body is not valid UTF-8")
     }
 
     pub fn renew_mappings(&mut self) -> Result<()> {

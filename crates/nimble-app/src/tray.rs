@@ -1,11 +1,14 @@
 use anyhow::Result;
 use crate::ui_status;
+use nimble_core::types::{EngineStats, Event};
 use nimble_core::{EngineHandle, EventReceiver};
 use nimble_util::log;
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::*,
+    Graphics::Gdi::*,
     UI::Shell::*,
     UI::WindowsAndMessaging::*,
     System::LibraryLoader::*,
@@ -18,19 +21,153 @@ const WM_APP: u32 = 0x8000;
 #[cfg(windows)]
 const WM_TRAYICON: u32 = WM_APP + 1;
 #[cfg(windows)]
+const WM_ENGINE_EVENT: u32 = WM_APP + 2;
+#[cfg(windows)]
 const TRAY_UID: u32 = 1;
 
 #[cfg(windows)]
 const GWLP_USERDATA: i32 = -21;
 
-pub fn run_tray_loop(engine: EngineHandle, _events: EventReceiver) -> Result<()> {
+#[cfg(windows)]
+static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrayState {
+    Idle,
+    Active,
+    Paused,
+    Error,
+}
+
+#[cfg(windows)]
+struct TrayIcons {
+    idle: HICON,
+    active: HICON,
+    paused: HICON,
+    error: HICON,
+}
+
+#[cfg(windows)]
+static mut ICONS: Option<TrayIcons> = None;
+
+#[cfg(windows)]
+static mut CURRENT_STATE: TrayState = TrayState::Idle;
+
+#[cfg(windows)]
+static mut CURRENT_STATS: EngineStats = EngineStats {
+    active_torrents: 0,
+    dl_rate_bps: 0,
+    ul_rate_bps: 0,
+    dht_nodes: 0,
+};
+
+#[cfg(windows)]
+static mut IS_PAUSED: bool = false;
+
+#[cfg(windows)]
+unsafe fn create_tray_icons() -> TrayIcons {
+    TrayIcons {
+        idle: create_colored_icon(0x80, 0x80, 0x80),    // Gray
+        active: create_colored_icon(0x00, 0xC8, 0x50),  // Green
+        paused: create_colored_icon(0xFF, 0xA5, 0x00),  // Orange
+        error: create_colored_icon(0xE0, 0x40, 0x40),   // Red
+    }
+}
+
+#[cfg(windows)]
+unsafe fn create_colored_icon(r: u8, g: u8, b: u8) -> HICON {
+    const SIZE: i32 = 16;
+    const PIXELS: usize = (SIZE * SIZE) as usize;
+
+    let hdc_screen = GetDC(0);
+    let hdc_mem = CreateCompatibleDC(hdc_screen);
+    let hbm_color = CreateCompatibleBitmap(hdc_screen, SIZE, SIZE);
+    let old_bm = SelectObject(hdc_mem, hbm_color);
+
+    let brush_bg = CreateSolidBrush(RGB(0, 0, 0));
+    let rect = RECT { left: 0, top: 0, right: SIZE, bottom: SIZE };
+    FillRect(hdc_mem, &rect, brush_bg);
+    DeleteObject(brush_bg);
+
+    let brush_fg = CreateSolidBrush(RGB(r, g, b));
+    let ellipse_rect = RECT { left: 2, top: 2, right: SIZE - 2, bottom: SIZE - 2 };
+    SelectObject(hdc_mem, brush_fg);
+    let null_pen = GetStockObject(NULL_PEN);
+    SelectObject(hdc_mem, null_pen);
+    Ellipse(hdc_mem, ellipse_rect.left, ellipse_rect.top, ellipse_rect.right, ellipse_rect.bottom);
+    DeleteObject(brush_fg);
+
+    SelectObject(hdc_mem, old_bm);
+    DeleteDC(hdc_mem);
+    ReleaseDC(0, hdc_screen);
+
+    let mut mask_bits = [0xFFu8; PIXELS / 8];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let dx = x - SIZE / 2;
+            let dy = y - SIZE / 2;
+            if dx * dx + dy * dy <= (SIZE / 2 - 2) * (SIZE / 2 - 2) {
+                let bit_idx = (y * SIZE + x) as usize;
+                let byte_idx = bit_idx / 8;
+                let bit_off = 7 - (bit_idx % 8);
+                mask_bits[byte_idx] &= !(1 << bit_off);
+            }
+        }
+    }
+    let hbm_mask = CreateBitmap(SIZE, SIZE, 1, 1, mask_bits.as_ptr() as *const _);
+
+    let icon_info = ICONINFO {
+        fIcon: TRUE,
+        xHotspot: 0,
+        yHotspot: 0,
+        hbmMask: hbm_mask,
+        hbmColor: hbm_color,
+    };
+    let hicon = CreateIconIndirect(&icon_info);
+
+    DeleteObject(hbm_mask);
+    DeleteObject(hbm_color);
+
+    hicon
+}
+
+#[cfg(windows)]
+const fn RGB(r: u8, g: u8, b: u8) -> u32 {
+    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+#[cfg(windows)]
+unsafe fn destroy_tray_icons(icons: &TrayIcons) {
+    DestroyIcon(icons.idle);
+    DestroyIcon(icons.active);
+    DestroyIcon(icons.paused);
+    DestroyIcon(icons.error);
+}
+
+#[cfg(windows)]
+unsafe fn get_icon_for_state(state: TrayState) -> HICON {
+    match &ICONS {
+        Some(icons) => match state {
+            TrayState::Idle => icons.idle,
+            TrayState::Active => icons.active,
+            TrayState::Paused => icons.paused,
+            TrayState::Error => icons.error,
+        },
+        None => 0,
+    }
+}
+
+pub fn run_tray_loop(engine: EngineHandle, events: EventReceiver) -> Result<()> {
     #[cfg(not(windows))]
     {
+        let _ = (engine, events);
         anyhow::bail!("Windows-only.");
     }
 
     #[cfg(windows)]
     unsafe {
+        ICONS = Some(create_tray_icons());
+
         let hinstance = GetModuleHandleW(std::ptr::null());
         if hinstance == 0 {
             anyhow::bail!("GetModuleHandleW failed");
@@ -73,11 +210,16 @@ pub fn run_tray_loop(engine: EngineHandle, _events: EventReceiver) -> Result<()>
             anyhow::bail!("CreateWindowExW failed");
         }
 
-        // Store engine handle in window user data
+        TRAY_HWND.store(hwnd, Ordering::SeqCst);
+
         let engine_ptr = Box::into_raw(Box::new(engine));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, engine_ptr as isize);
 
         add_tray_icon(hwnd)?;
+
+        std::thread::spawn(move || {
+            event_listener_thread(events);
+        });
 
         log::info("Nimble tray started.");
 
@@ -89,13 +231,67 @@ pub fn run_tray_loop(engine: EngineHandle, _events: EventReceiver) -> Result<()>
 
         remove_tray_icon(hwnd);
 
-        // Clean up engine handle
         let engine_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EngineHandle;
         if !engine_ptr.is_null() {
             let _ = Box::from_raw(engine_ptr);
         }
 
+        if let Some(ref icons) = ICONS {
+            destroy_tray_icons(icons);
+        }
+        ICONS = None;
+
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn event_listener_thread(events: EventReceiver) {
+    use std::time::Duration;
+
+    loop {
+        match events.recv_timeout(Duration::from_millis(500)) {
+            Ok(event) => {
+                let hwnd = TRAY_HWND.load(Ordering::SeqCst);
+                if hwnd == 0 {
+                    break;
+                }
+                unsafe {
+                    match event {
+                        Event::Stats(stats) => {
+                            CURRENT_STATS = stats.clone();
+                            let new_state = if IS_PAUSED {
+                                TrayState::Paused
+                            } else if stats.active_torrents > 0 {
+                                TrayState::Active
+                            } else {
+                                TrayState::Idle
+                            };
+                            if new_state != CURRENT_STATE {
+                                CURRENT_STATE = new_state;
+                            }
+                            PostMessageW(hwnd, WM_ENGINE_EVENT, 0, 0);
+                        }
+                        Event::Started => {
+                            log::info("Engine started event received");
+                        }
+                        Event::Stopped => {
+                            break;
+                        }
+                        Event::LogLine(_) => {}
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let hwnd = TRAY_HWND.load(Ordering::SeqCst);
+                if hwnd == 0 {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+        }
     }
 }
 
@@ -107,6 +303,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 show_tray_menu(hwnd);
                 return 0;
             }
+            0
+        }
+        WM_ENGINE_EVENT => {
+            update_tray_icon_and_tooltip(hwnd);
             0
         }
         WM_COMMAND => {
@@ -125,6 +325,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
         WM_DESTROY => {
+            TRAY_HWND.store(0, Ordering::SeqCst);
             PostQuitMessage(0);
             0
         }
@@ -138,26 +339,77 @@ unsafe fn add_tray_icon(hwnd: HWND) -> Result<()> {
     nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
     nid.hWnd = hwnd;
     nid.uID = TRAY_UID;
-    nid.uFlags = NIF_MESSAGE | NIF_TIP;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
+    nid.hIcon = get_icon_for_state(TrayState::Idle);
 
-    // Tooltip
-    let tip = widestr("Nimble");
-    // Copy into fixed buffer
-    let dst = nid.szTip.as_mut_ptr();
-    let src = tip.as_ptr();
-    // szTip is 128 wide chars in NOTIFYICONDATAW
-    for i in 0..128 {
-        *dst.add(i) = *src.add(i);
-        if *src.add(i) == 0 {
-            break;
-        }
-    }
+    let tip = widestr("Nimble - Idle");
+    copy_tooltip(&mut nid.szTip, &tip);
 
     if Shell_NotifyIconW(NIM_ADD, &mut nid) == 0 {
         anyhow::bail!("Shell_NotifyIconW(NIM_ADD) failed");
     }
     Ok(())
+}
+
+#[cfg(windows)]
+unsafe fn copy_tooltip(dst: &mut [u16; 128], src: &[u16]) {
+    let len = src.len().min(127);
+    for i in 0..len {
+        dst[i] = src[i];
+    }
+    dst[len] = 0;
+}
+
+#[cfg(windows)]
+unsafe fn update_tray_icon_and_tooltip(hwnd: HWND) {
+    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_UID;
+    nid.uFlags = NIF_ICON | NIF_TIP;
+    nid.hIcon = get_icon_for_state(CURRENT_STATE);
+
+    let tooltip = format_tooltip(&CURRENT_STATS, CURRENT_STATE);
+    let tip_wide = widestr(&tooltip);
+    copy_tooltip(&mut nid.szTip, &tip_wide);
+
+    Shell_NotifyIconW(NIM_MODIFY, &mut nid);
+}
+
+#[cfg(windows)]
+fn format_tooltip(stats: &EngineStats, state: TrayState) -> String {
+    let state_str = match state {
+        TrayState::Idle => "Idle",
+        TrayState::Active => "Active",
+        TrayState::Paused => "Paused",
+        TrayState::Error => "Error",
+    };
+
+    let dl_rate = format_speed(stats.dl_rate_bps);
+    let ul_rate = format_speed(stats.ul_rate_bps);
+
+    if stats.active_torrents > 0 || stats.dl_rate_bps > 0 || stats.ul_rate_bps > 0 {
+        format!(
+            "Nimble - {}\nD: {} | U: {}\n{} torrent(s) | {} DHT",
+            state_str, dl_rate, ul_rate, stats.active_torrents, stats.dht_nodes
+        )
+    } else {
+        format!("Nimble - {}", state_str)
+    }
+}
+
+#[cfg(windows)]
+fn format_speed(bps: u64) -> String {
+    if bps == 0 {
+        "0 B/s".to_string()
+    } else if bps < 1024 {
+        format!("{} B/s", bps)
+    } else if bps < 1024 * 1024 {
+        format!("{:.1} KB/s", bps as f64 / 1024.0)
+    } else {
+        format!("{:.2} MB/s", bps as f64 / (1024.0 * 1024.0))
+    }
 }
 
 #[cfg(windows)]
@@ -337,6 +589,10 @@ unsafe fn handle_status_window(hwnd: HWND) {
 unsafe fn handle_pause_all(hwnd: HWND) {
     use nimble_core::types::Command;
 
+    IS_PAUSED = true;
+    CURRENT_STATE = TrayState::Paused;
+    update_tray_icon_and_tooltip(hwnd);
+
     if let Some(engine) = get_engine(hwnd) {
         let _ = engine.tx.send(Command::PauseAll);
     }
@@ -345,6 +601,15 @@ unsafe fn handle_pause_all(hwnd: HWND) {
 #[cfg(windows)]
 unsafe fn handle_resume_all(hwnd: HWND) {
     use nimble_core::types::Command;
+
+    IS_PAUSED = false;
+    let new_state = if CURRENT_STATS.active_torrents > 0 {
+        TrayState::Active
+    } else {
+        TrayState::Idle
+    };
+    CURRENT_STATE = new_state;
+    update_tray_icon_and_tooltip(hwnd);
 
     if let Some(engine) = get_engine(hwnd) {
         let _ = engine.tx.send(Command::ResumeAll);
@@ -422,6 +687,5 @@ unsafe fn handle_quit(hwnd: HWND) {
 
 #[cfg(windows)]
 fn widestr(s: &str) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }

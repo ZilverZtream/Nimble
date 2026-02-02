@@ -1345,11 +1345,11 @@ impl Session {
                                 let _ = socket.send_to(&response_payload, v4_addr);
                             }
 
-                            for (peer_v4_addr, info_hash) in outcome.discovered_peers {
+                            for (peer_addr, info_hash) in outcome.discovered_peers {
                                 all_discovered_peers
                                     .entry(info_hash)
                                     .or_insert_with(Vec::new)
-                                    .push(SocketAddr::V4(peer_v4_addr));
+                                    .push(peer_addr);
                             }
                         }
                     }

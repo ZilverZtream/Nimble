@@ -26,10 +26,13 @@ const MAX_PENDING_REQUESTS: usize = 16;
 const MAX_PEER_REQUESTS: usize = 500;
 const EXTENDED_MESSAGE_ID: u8 = 20;
 const PEX_MIN_INTERVAL: Duration = Duration::from_secs(30);
+const UT_METADATA_MAX_REQUESTS_PER_SECOND: usize = 10;
+const UT_METADATA_RATE_WINDOW: Duration = Duration::from_secs(1);
+const MAX_PEX_PEERS_PER_MESSAGE: usize = 200;
 
 /// RFC-101 Step 2: Fixed-size receive buffer for zero-allocation message parsing.
-/// 64KB is sufficient for bitfields of huge torrents (500K+ pieces).
-const RECV_BUFFER_SIZE: usize = 64 * 1024;
+/// 256KB is required to support bitfields up to MAX_BITFIELD_BYTES (262144).
+const RECV_BUFFER_SIZE: usize = 256 * 1024;
 
 /// RFC-101 Step 4: Batched message queue limits.
 /// Flush if queue exceeds 4KB to avoid memory buildup.
@@ -393,6 +396,8 @@ pub struct PeerConnection {
     pex_dropped: Vec<SocketAddrV4>,
     pex_dropped_v6: Vec<SocketAddrV6>,
     last_pex_received: Option<Instant>,
+    ut_metadata_request_count: usize,
+    ut_metadata_window_start: Instant,
     mse_handshake: Option<MseHandshake>,
     encryption_enabled: bool,
     handshake: Option<Box<dyn HandshakeProtocol>>,
@@ -471,6 +476,8 @@ impl PeerConnection {
             pex_dropped: Vec::new(),
             pex_dropped_v6: Vec::new(),
             last_pex_received: None,
+            ut_metadata_request_count: 0,
+            ut_metadata_window_start: now,
             mse_handshake,
             encryption_enabled: false,
             handshake: None,
@@ -532,6 +539,8 @@ impl PeerConnection {
             pex_dropped: Vec::new(),
             pex_dropped_v6: Vec::new(),
             last_pex_received: None,
+            ut_metadata_request_count: 0,
+            ut_metadata_window_start: now,
             mse_handshake,
             encryption_enabled,
             handshake: None,
@@ -598,6 +607,8 @@ impl PeerConnection {
             pex_dropped: Vec::new(),
             pex_dropped_v6: Vec::new(),
             last_pex_received: None,
+            ut_metadata_request_count: 0,
+            ut_metadata_window_start: now,
             mse_handshake,
             encryption_enabled,
             handshake: None,
@@ -1174,6 +1185,17 @@ impl PeerConnection {
 
         match msg.msg_type {
             UtMetadataMessageType::Request => {
+                let now = Instant::now();
+                if now.duration_since(self.ut_metadata_window_start) >= UT_METADATA_RATE_WINDOW {
+                    self.ut_metadata_request_count = 0;
+                    self.ut_metadata_window_start = now;
+                }
+
+                self.ut_metadata_request_count += 1;
+                if self.ut_metadata_request_count > UT_METADATA_MAX_REQUESTS_PER_SECOND {
+                    return;
+                }
+
                 if let Some(metadata) = &self.metadata {
                     let piece_index = msg.piece as usize;
                     let total_size = metadata.len() as u32;
@@ -1278,10 +1300,14 @@ impl PeerConnection {
         self.last_pex_received = Some(now);
 
         if !msg.added.is_empty() {
-            self.pex_added.extend(msg.added);
+            let remaining_capacity = MAX_PEX_PEERS_PER_MESSAGE.saturating_sub(self.pex_added.len());
+            let to_add = msg.added.len().min(remaining_capacity);
+            self.pex_added.extend(&msg.added[..to_add]);
         }
         if !msg.dropped.is_empty() {
-            self.pex_dropped.extend(msg.dropped);
+            let remaining_capacity = MAX_PEX_PEERS_PER_MESSAGE.saturating_sub(self.pex_dropped.len());
+            let to_drop = msg.dropped.len().min(remaining_capacity);
+            self.pex_dropped.extend(&msg.dropped[..to_drop]);
         }
     }
 
@@ -1323,6 +1349,18 @@ impl PeerConnection {
 
         if length > BLOCK_SIZE {
             anyhow::bail!("block size too large: {}", length);
+        }
+
+        if index >= self.piece_count as u32 {
+            anyhow::bail!("piece index out of bounds: {} >= {}", index, self.piece_count);
+        }
+
+        if begin > MAX_REASONABLE_PIECE_SIZE as u32 {
+            anyhow::bail!("block offset out of bounds: {}", begin);
+        }
+
+        if begin.saturating_add(length) > MAX_REASONABLE_PIECE_SIZE as u32 {
+            anyhow::bail!("block end offset out of bounds: {} + {}", begin, length);
         }
 
         self.send_message(&PeerMessage::Request {

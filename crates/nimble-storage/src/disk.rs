@@ -424,6 +424,19 @@ impl DiskStorage {
     }
 
     pub fn close(&mut self) -> Result<()> {
+        // Wait for all pending disk operations to complete before saving resume data
+        // This prevents race conditions where resume state claims pieces are complete
+        // but disk writes haven't finished (Issue #12)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !self.writing_pieces.is_empty() && std::time::Instant::now() < deadline {
+            let _ = self.poll_verifications();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        if !self.writing_pieces.is_empty() {
+            eprintln!("Warning: {} pieces still writing during close", self.writing_pieces.len());
+        }
+
         if self.resume_dirty {
             self.save_resume_data()?;
             self.resume_dirty = false;

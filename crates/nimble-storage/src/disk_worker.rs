@@ -82,6 +82,48 @@ impl DiskWorkerState {
 
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
+
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if let Ok(metadata) = fs::symlink_metadata(parent) {
+                        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+                        if (metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                            anyhow::bail!("refusing to write through reparse point: {:?}", parent);
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    if let Ok(metadata) = fs::symlink_metadata(parent) {
+                        if metadata.file_type().is_symlink() {
+                            anyhow::bail!("refusing to write through symlink: {:?}", parent);
+                        }
+                    }
+                }
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if path.exists() {
+                    if let Ok(metadata) = fs::symlink_metadata(&path) {
+                        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+                        if (metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                            anyhow::bail!("refusing to write to reparse point: {:?}", path);
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                if path.exists() {
+                    if let Ok(metadata) = fs::symlink_metadata(&path) {
+                        if metadata.file_type().is_symlink() {
+                            anyhow::bail!("refusing to write to symlink: {:?}", path);
+                        }
+                    }
+                }
             }
 
             let file = OpenOptions::new()

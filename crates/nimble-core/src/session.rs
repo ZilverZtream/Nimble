@@ -25,6 +25,10 @@ use crate::magnet::parse_magnet;
 use crate::peer_manager::PeerManager;
 use crate::tracker_worker::{AnnounceTask, AnnounceWorker};
 
+/// Maximum number of peers that can simultaneously exchange metadata.
+/// With 2MB per peer, this limits metadata memory to ~100MB.
+const MAX_GLOBAL_METADATA_EXCHANGES: usize = 50;
+
 pub struct Session {
     torrents: HashMap<String, TorrentEntry>,
     download_dir: PathBuf,
@@ -44,6 +48,7 @@ pub struct Session {
     mapped_port: Option<u16>,
     max_active_torrents: u32,
     enable_utp: bool,
+    active_metadata_exchanges: usize,
 }
 
 pub enum TorrentEntry {
@@ -242,10 +247,28 @@ impl Session {
             None
         };
 
+        let peer_id = match peer_id_20() {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("CRITICAL: Failed to generate peer ID: {}", e);
+                eprintln!("This usually indicates a system-level issue with the random number generator.");
+                eprintln!("Using fallback peer ID (not cryptographically secure).");
+                let mut fallback_id = [0u8; 20];
+                fallback_id[..8].copy_from_slice(b"-NM0001-");
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                fallback_id[8..16].copy_from_slice(&timestamp.to_be_bytes());
+                fallback_id[16..20].copy_from_slice(&(fastrand::u32(..) as u32).to_be_bytes());
+                fallback_id
+            }
+        };
+
         let mut session = Session {
             torrents: HashMap::new(),
             download_dir,
-            peer_id: peer_id_20().expect("Failed to generate peer ID"),
+            peer_id,
             listen_port,
             dht,
             dht_socket_v4,
@@ -261,6 +284,7 @@ impl Session {
             mapped_port: None,
             max_active_torrents,
             enable_utp,
+            active_metadata_exchanges: 0,
         };
 
         if let Err(e) = session.load_saved_torrents() {
@@ -1472,11 +1496,16 @@ impl Session {
     /// Optimized tick for peer managers using select()-based readiness polling.
     /// Reduces syscalls from O(N*peers) per tick to O(1) + O(ready_peers).
     /// RFC-101 Step 1: Decoupled Readiness Polling.
+    ///
+    /// Note: Collecting socket handles is O(N) but necessary since peer connections
+    /// change frequently. The real optimization is the batched polling in
+    /// poll_readable_sockets() which handles FD_SETSIZE limits efficiently.
     fn tick_torrents_optimized(&mut self) -> Vec<String> {
         let mut log_lines = Vec::new();
 
         // Phase 1: Collect all socket handles across all active torrents
-        let mut all_handles: Vec<(String, SocketAddr, RawSocket)> = Vec::new();
+        // Pre-allocate with estimated capacity to reduce reallocations
+        let mut all_handles: Vec<(String, SocketAddr, RawSocket)> = Vec::with_capacity(256);
 
         for (infohash, torrent) in self.torrents.iter() {
             let peer_manager = match torrent {
@@ -1542,14 +1571,28 @@ impl Session {
             match peer_manager.tick_peer(addr) {
                 Ok(blocks) => {
                     // Write received blocks to storage
+                    let mut write_failed = false;
                     if let Some(storage) = storage {
                         for (index, begin, data) in blocks {
-                            let _ = storage.write_block(index as u64, begin, &data);
+                            match storage.write_block(index as u64, begin, &data) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    let err_msg = e.to_string();
+                                    if err_msg.contains("too many pending pieces")
+                                        || err_msg.contains("pending memory limit exceeded")
+                                        || err_msg.contains("disk queue full") {
+                                        write_failed = true;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
 
-                    // Request more blocks if unchoked
-                    peer_manager.request_blocks_for_peer(addr);
+                    // Request more blocks only if write succeeded and peer is unchoked
+                    if !write_failed {
+                        peer_manager.request_blocks_for_peer(addr);
+                    }
                 }
                 Err(_) => {
                     peers_to_remove.push((infohash.clone(), *addr));

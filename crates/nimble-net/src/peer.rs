@@ -31,9 +31,17 @@ const UT_METADATA_MAX_REQUESTS_PER_SECOND: usize = 10;
 const UT_METADATA_RATE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_PEX_PEERS_PER_MESSAGE: usize = 200;
 const UT_METADATA_MAX_IN_FLIGHT: usize = 3;
+const MAX_METADATA_SIZE: u32 = 10 * 1024 * 1024;
 
 /// RFC-101 Step 2: Fixed-size receive buffer for zero-allocation message parsing.
 /// 256KB is required to support bitfields up to MAX_BITFIELD_BYTES (262144).
+///
+/// NOTE: Current design still involves memory copying:
+/// Socket -> recv_buffer -> Vec (PeerMessage::Piece) -> Channel -> Disk Worker
+/// Future optimization (Issue #10): implement zero-copy path where piece data
+/// is written directly to a memory-mapped buffer or uses io_uring on Linux.
+/// This would require significant architectural changes but could improve
+/// throughput on high-speed connections.
 const RECV_BUFFER_SIZE: usize = 256 * 1024;
 
 /// RFC-101 Step 4: Batched message queue limits.
@@ -648,7 +656,6 @@ impl PeerConnection {
         self.handshake = None;
         self.handshake_phase = None;
 
-        self.socket.set_nonblocking(true)?;
         self.start_handshake();
         self.tick_handshake()?;
         Ok(())
@@ -1188,6 +1195,9 @@ impl PeerConnection {
 
     fn init_metadata_state(&mut self, size: u32) {
         if self.metadata_state.is_none() {
+            if size > MAX_METADATA_SIZE {
+                return;
+            }
             if let Ok(state) = UtMetadataState::new(size) {
                 self.metadata_state = Some(state);
                 self.metadata_requests_sent = false;

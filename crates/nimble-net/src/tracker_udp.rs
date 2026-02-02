@@ -2,6 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::time::{Duration, Instant};
 
+use crate::peer_ip::{is_valid_peer_ip_v4, is_valid_peer_ip_v6};
+
 const PROTOCOL_ID: u64 = 0x41727101980;
 const ACTION_CONNECT: u32 = 0;
 const ACTION_ANNOUNCE: u32 = 1;
@@ -310,7 +312,7 @@ fn parse_announce_response(data: &[u8]) -> Result<UdpAnnounceResponse> {
         for chunk in peers_data.chunks_exact(6) {
             let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
             let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-            if port > 0 {
+            if port > 0 && is_valid_peer_ip_v4(&ip) {
                 peers.push(SocketAddr::V4(SocketAddrV4::new(ip, port)));
             }
         }
@@ -327,7 +329,7 @@ fn parse_announce_response(data: &[u8]) -> Result<UdpAnnounceResponse> {
                 u16::from_be_bytes([chunk[14], chunk[15]]),
             );
             let port = u16::from_be_bytes([chunk[16], chunk[17]]);
-            if port > 0 {
+            if port > 0 && is_valid_peer_ip_v6(&ip) {
                 peers.push(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, 0)));
             }
         }
@@ -488,9 +490,9 @@ mod tests {
         data[8..12].copy_from_slice(&1800u32.to_be_bytes());
         data[12..16].copy_from_slice(&5u32.to_be_bytes());
         data[16..20].copy_from_slice(&10u32.to_be_bytes());
-        data[20..24].copy_from_slice(&[127, 0, 0, 1]);
+        data[20..24].copy_from_slice(&[10, 0, 0, 1]);
         data[24..26].copy_from_slice(&6881u16.to_be_bytes());
-        data[26..30].copy_from_slice(&[192, 168, 1, 100]);
+        data[26..30].copy_from_slice(&[1, 1, 1, 1]);
         data[30..32].copy_from_slice(&6882u16.to_be_bytes());
 
         let response = parse_announce_response(&data).unwrap();
@@ -498,19 +500,11 @@ mod tests {
         assert_eq!(response.interval, 1800);
         assert_eq!(response.leechers, 5);
         assert_eq!(response.seeders, 10);
-        assert_eq!(response.peers.len(), 2);
+        assert_eq!(response.peers.len(), 1);
 
         match response.peers[0] {
             SocketAddr::V4(addr) => {
-                assert_eq!(addr.ip(), &Ipv4Addr::new(127, 0, 0, 1));
-                assert_eq!(addr.port(), 6881);
-            }
-            _ => panic!("Expected IPv4 address"),
-        }
-
-        match response.peers[1] {
-            SocketAddr::V4(addr) => {
-                assert_eq!(addr.ip(), &Ipv4Addr::new(192, 168, 1, 100));
+                assert_eq!(addr.ip(), &Ipv4Addr::new(1, 1, 1, 1));
                 assert_eq!(addr.port(), 6882);
             }
             _ => panic!("Expected IPv4 address"),
@@ -524,7 +518,7 @@ mod tests {
         data[12..16].copy_from_slice(&5u32.to_be_bytes());
         data[16..20].copy_from_slice(&10u32.to_be_bytes());
 
-        data[20..22].copy_from_slice(&0xfe80u16.to_be_bytes());
+        data[20..22].copy_from_slice(&0xfc00u16.to_be_bytes());
         data[22..24].copy_from_slice(&0x0000u16.to_be_bytes());
         data[24..26].copy_from_slice(&0x0000u16.to_be_bytes());
         data[26..28].copy_from_slice(&0x0000u16.to_be_bytes());
@@ -535,13 +529,13 @@ mod tests {
         data[36..38].copy_from_slice(&6881u16.to_be_bytes());
 
         data[38..40].copy_from_slice(&0x2001u16.to_be_bytes());
-        data[40..42].copy_from_slice(&0x0db8u16.to_be_bytes());
-        data[42..44].copy_from_slice(&0x0000u16.to_be_bytes());
+        data[40..42].copy_from_slice(&0x4860u16.to_be_bytes());
+        data[42..44].copy_from_slice(&0x4860u16.to_be_bytes());
         data[44..46].copy_from_slice(&0x0000u16.to_be_bytes());
         data[46..48].copy_from_slice(&0x0000u16.to_be_bytes());
         data[48..50].copy_from_slice(&0x0000u16.to_be_bytes());
         data[50..52].copy_from_slice(&0x0000u16.to_be_bytes());
-        data[52..54].copy_from_slice(&0x0001u16.to_be_bytes());
+        data[52..54].copy_from_slice(&0x8888u16.to_be_bytes());
         data[54..56].copy_from_slice(&6882u16.to_be_bytes());
 
         let response = parse_announce_response(&data).unwrap();
@@ -549,19 +543,14 @@ mod tests {
         assert_eq!(response.interval, 1800);
         assert_eq!(response.leechers, 5);
         assert_eq!(response.seeders, 10);
-        assert_eq!(response.peers.len(), 2);
+        assert_eq!(response.peers.len(), 1);
 
         match response.peers[0] {
             SocketAddr::V6(addr) => {
-                assert_eq!(addr.ip(), &Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
-                assert_eq!(addr.port(), 6881);
-            }
-            _ => panic!("Expected IPv6 address"),
-        }
-
-        match response.peers[1] {
-            SocketAddr::V6(addr) => {
-                assert_eq!(addr.ip(), &Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1));
+                assert_eq!(
+                    addr.ip(),
+                    &Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)
+                );
                 assert_eq!(addr.port(), 6882);
             }
             _ => panic!("Expected IPv6 address"),

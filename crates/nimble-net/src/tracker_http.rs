@@ -437,20 +437,38 @@ fn parse_url(url: &str) -> Result<ParsedUrl> {
         None => (rest, "/"),
     };
 
-    let (host, port) = match host_port.find(':') {
-        Some(idx) => {
-            let h = &host_port[..idx];
-            let p_str = &host_port[idx + 1..];
-            let p = p_str
+    let default_port = if is_https { 443 } else { 80 };
+    let (host, port) = if let Some(stripped) = host_port.strip_prefix('[') {
+        let end = stripped
+            .find(']')
+            .ok_or_else(|| anyhow!("missing closing bracket in IPv6 host"))?;
+        let host = &stripped[..end];
+        let remainder = &stripped[end + 1..];
+        if remainder.is_empty() {
+            (host, default_port)
+        } else if let Some(port_str) = remainder.strip_prefix(':') {
+            let port = port_str
                 .parse::<u16>()
                 .map_err(|_| anyhow!("invalid port"))?;
-            (h, p)
+            (host, port)
+        } else {
+            return Err(anyhow!("invalid IPv6 host/port"));
         }
-        None => {
-            let default_port = if is_https { 443 } else { 80 };
-            (host_port, default_port)
+    } else if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        if host.contains(':') {
+            return Err(anyhow!("IPv6 hosts must be bracketed"));
         }
+        let port = port_str
+            .parse::<u16>()
+            .map_err(|_| anyhow!("invalid port"))?;
+        (host, port)
+    } else {
+        (host_port, default_port)
     };
+
+    if host.is_empty() {
+        return Err(anyhow!("missing host"));
+    }
 
     Ok(ParsedUrl {
         host: host.to_string(),
@@ -678,6 +696,24 @@ mod tests {
         assert_eq!(parsed.host, "example.com");
         assert_eq!(parsed.port, 80);
         assert_eq!(parsed.path, "/");
+    }
+
+    #[test]
+    fn test_parse_url_ipv6_with_port() {
+        let parsed = parse_url("http://[2001:db8::1]:6969/announce").unwrap();
+        assert_eq!(parsed.host, "2001:db8::1");
+        assert_eq!(parsed.port, 6969);
+        assert_eq!(parsed.path, "/announce");
+        assert!(!parsed.is_https);
+    }
+
+    #[test]
+    fn test_parse_url_ipv6_no_port() {
+        let parsed = parse_url("https://[2001:db8::1]/announce").unwrap();
+        assert_eq!(parsed.host, "2001:db8::1");
+        assert_eq!(parsed.port, 443);
+        assert_eq!(parsed.path, "/announce");
+        assert!(parsed.is_https);
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub struct Session {
     upnp: Option<UpnpClient>,
     lsd: Option<LsdClient>,
     mapped_port: Option<u16>,
+    max_active_torrents: u32,
 }
 
 pub enum TorrentEntry {
@@ -96,6 +97,7 @@ impl Session {
         enable_upnp: bool,
         enable_nat_pmp: bool,
         enable_lsd: bool,
+        max_active_torrents: u32,
     ) -> Self {
         let (dht, dht_socket) = if enable_dht {
             let socket = UdpSocket::bind(("0.0.0.0", listen_port))
@@ -178,6 +180,7 @@ impl Session {
             upnp,
             lsd,
             mapped_port: None,
+            max_active_torrents,
         };
 
         if let Err(e) = session.load_saved_torrents() {
@@ -276,6 +279,17 @@ impl Session {
     }
 
     pub fn add_torrent_file(&mut self, path: &str) -> Result<String> {
+        if self.max_active_torrents > 0 {
+            let active = self.count_active_torrents();
+            if active >= self.max_active_torrents {
+                anyhow::bail!(
+                    "max active torrents reached ({}/{})",
+                    active,
+                    self.max_active_torrents
+                );
+            }
+        }
+
         let data = fs::read(path)?;
         let info = parse_torrent(&data)?;
         let infohash = info.infohash.to_hex();
@@ -346,6 +360,17 @@ impl Session {
     }
 
     pub fn add_magnet(&mut self, uri: &str) -> Result<String> {
+        if self.max_active_torrents > 0 {
+            let active = self.count_active_torrents();
+            if active >= self.max_active_torrents {
+                anyhow::bail!(
+                    "max active torrents reached ({}/{})",
+                    active,
+                    self.max_active_torrents
+                );
+            }
+        }
+
         let magnet = parse_magnet(uri)?;
         let infohash = InfoHash(magnet.info_hash).to_hex();
         if self.torrents.contains_key(&infohash) {
@@ -415,6 +440,20 @@ impl Session {
 
     pub fn active_count(&self) -> u32 {
         self.torrents.len() as u32
+    }
+
+    fn count_active_torrents(&self) -> u32 {
+        let mut count = 0;
+        for torrent in self.torrents.values() {
+            let is_paused = match torrent {
+                TorrentEntry::Active(state) => state.paused,
+                TorrentEntry::Magnet(state) => state.paused,
+            };
+            if !is_paused {
+                count += 1;
+            }
+        }
+        count
     }
 
     pub fn tick(&mut self) -> Vec<String> {

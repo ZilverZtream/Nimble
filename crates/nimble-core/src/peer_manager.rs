@@ -231,7 +231,13 @@ impl PeerManager {
         for (&addr, peer) in self.peers.iter_mut() {
             match peer.connection.state() {
                 PeerState::Connected => {
-                    match Self::handle_peer_messages(peer, &mut self.piece_picker, &mut self.endgame, addr) {
+                    match Self::handle_peer_messages(
+                        peer,
+                        &mut self.piece_picker,
+                        &mut self.endgame,
+                        addr,
+                        &mut self.failed_peers,
+                    ) {
                         Ok(blocks) => {
                             if let Some(update) = peer.connection.take_pex_updates() {
                                 for v4_addr in update.added {
@@ -556,6 +562,7 @@ impl PeerManager {
         picker: &mut PiecePicker,
         endgame: &mut EndgameMode,
         peer_addr: SocketAddr,
+        failed_peers: &mut HashMap<SocketAddr, (Instant, usize)>,
     ) -> Result<Vec<(u32, u32, Vec<u8>)>> {
         let mut received_blocks = Vec::new();
 
@@ -567,13 +574,27 @@ impl PeerManager {
                         begin,
                         block,
                     } => {
-                        peer.pending_blocks
-                            .retain(|r| !(r.piece == index && r.offset == begin));
-                        peer.connection.complete_request(index, begin);
-                        received_blocks.push((index, begin, block));
+                        let block_len = block.len() as u32;
+                        let pending_index = peer
+                            .pending_blocks
+                            .iter()
+                            .position(|r| r.piece == index && r.offset == begin);
 
-                        let block_id = BlockId::new(index, begin);
-                        endgame.record_completion(block_id);
+                        if let Some(pos) = pending_index {
+                            let expected = peer.pending_blocks[pos];
+                            if expected.length == block_len {
+                                peer.pending_blocks.swap_remove(pos);
+                                peer.connection.complete_request(index, begin);
+                                received_blocks.push((index, begin, block));
+
+                                let block_id = BlockId::new(index, begin);
+                                endgame.record_completion(block_id);
+                            } else {
+                                Self::record_bad_block(failed_peers, peer_addr);
+                            }
+                        } else {
+                            Self::record_bad_block(failed_peers, peer_addr);
+                        }
                     }
                     PeerMessage::Unchoke => {}
                     PeerMessage::Choke => {
@@ -608,6 +629,15 @@ impl PeerManager {
         }
 
         Ok(received_blocks)
+    }
+
+    fn record_bad_block(
+        failed_peers: &mut HashMap<SocketAddr, (Instant, usize)>,
+        peer_addr: SocketAddr,
+    ) {
+        let entry = failed_peers.entry(peer_addr).or_insert((Instant::now(), 0));
+        entry.0 = Instant::now();
+        entry.1 += 1;
     }
 
     fn request_blocks(
@@ -727,7 +757,13 @@ impl PeerManager {
 
         match peer.connection.state() {
             PeerState::Connected => {
-                Self::handle_peer_messages(peer, &mut self.piece_picker, &mut self.endgame, *addr)
+                Self::handle_peer_messages(
+                    peer,
+                    &mut self.piece_picker,
+                    &mut self.endgame,
+                    *addr,
+                    &mut self.failed_peers,
+                )
             }
             PeerState::Handshaking => {
                 peer.connection.tick_handshake()?;
@@ -963,7 +999,12 @@ impl PiecePicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nimble_bencode::torrent::{InfoHash, TorrentInfo, TorrentMode};
+    use nimble_storage::disk::DiskStorage;
+    use std::io::Write;
+    use std::net::TcpListener;
     use std::net::{Ipv6Addr, SocketAddrV6};
+    use tempfile::tempdir;
 
     #[test]
     fn test_piece_picker_new() {
@@ -1002,5 +1043,78 @@ mod tests {
             manager.peers.contains_key(&addr) || manager.failed_peers.contains_key(&addr),
             "IPv6 candidate was skipped instead of being attempted"
         );
+    }
+
+    fn create_connected_peer(piece_count: usize) -> (PeerConnection, std::net::TcpStream, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let listener_addr = listener.local_addr().expect("listener addr");
+        let client_stream = std::net::TcpStream::connect(listener_addr).expect("connect client");
+        let (server_stream, peer_addr) = listener.accept().expect("accept connection");
+
+        let mut connection = PeerConnection::from_accepted(
+            server_stream,
+            peer_addr,
+            [3u8; 20],
+            [4u8; 20],
+            [5u8; 20],
+            piece_count,
+            6881,
+            None,
+        )
+        .expect("create peer connection");
+        connection
+            .set_nonblocking(true)
+            .expect("set nonblocking");
+
+        (connection, client_stream, peer_addr)
+    }
+
+    #[test]
+    fn unsolicited_blocks_are_ignored() {
+        let (connection, mut client_stream, peer_addr) = create_connected_peer(1);
+        let mut manager = PeerManager::new([1u8; 20], [2u8; 20], 1, 16384, 16384);
+        manager
+            .accept_incoming_tcp(connection, peer_addr)
+            .expect("accept peer");
+
+        let info = TorrentInfo {
+            announce: None,
+            announce_list: Vec::new(),
+            piece_length: 16384,
+            pieces: vec![[0u8; 20]],
+            mode: TorrentMode::SingleFile {
+                name: "test.bin".to_string(),
+                length: 16384,
+            },
+            infohash: InfoHash([9u8; 20]),
+            total_length: 16384,
+            private: false,
+        };
+        let temp_dir = tempdir().expect("temp dir");
+        let mut storage =
+            DiskStorage::new(&info, temp_dir.path().to_path_buf()).expect("storage");
+
+        let message = PeerMessage::Piece {
+            index: 0,
+            begin: 0,
+            block: vec![7u8; 8],
+        };
+        client_stream
+            .write_all(&message.serialize())
+            .expect("write message");
+
+        manager.tick(Some(&mut storage)).expect("tick manager");
+
+        assert_eq!(
+            storage.pending_piece_count(),
+            0,
+            "unsolicited block should not reach storage"
+        );
+        let failures = manager
+            .failed_peers
+            .get(&peer_addr)
+            .map(|(_, count)| *count)
+            .unwrap_or(0);
+        assert_eq!(failures, 1);
     }
 }

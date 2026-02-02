@@ -648,6 +648,10 @@ impl PeerConnection {
         Ok(())
     }
 
+    pub fn set_nonblocking(&mut self, nonblocking: bool) -> Result<()> {
+        self.socket.set_nonblocking(nonblocking)
+    }
+
     pub fn poll(&mut self) -> Result<()> {
         if self.state == PeerState::Handshaking {
             self.tick_handshake()?;

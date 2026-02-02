@@ -138,6 +138,10 @@ impl DiskStorage {
         &self.bitfield
     }
 
+    pub fn pending_piece_count(&self) -> usize {
+        self.pending_pieces.len()
+    }
+
     pub fn write_block(&mut self, piece_index: u64, block_offset: u32, data: &[u8]) -> Result<bool> {
         if piece_index >= self.pieces.len() as u64 {
             anyhow::bail!("invalid piece index: {}", piece_index);

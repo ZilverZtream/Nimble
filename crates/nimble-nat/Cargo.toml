@@ -14,4 +14,5 @@ nat_pmp = []
         anyhow = { workspace = true }
         thiserror = { workspace = true }
         ureq = { workspace = true }
+        quick-xml = { version = "0.31", default-features = false }
         nimble-util = { path = "../nimble-util" }

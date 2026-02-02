@@ -297,10 +297,21 @@ impl PeerMessage {
                 }
                 let index = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
                 let begin = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
+
                 // Issue #10 Fix: Use buffer pool for piece data to reduce allocations
-                let mut pooled_buf = nimble_storage::buffer_pool::global_pool().get();
-                pooled_buf.as_mut().extend_from_slice(&data[9..]);
-                let block = pooled_buf.take();
+                // Issue #4 Fix: Use try_get() to avoid blocking the network thread
+                // If buffer pool is under contention, allocate directly to maintain forward progress
+                let block = match nimble_storage::buffer_pool::global_pool().try_get() {
+                    Some(mut pooled_buf) => {
+                        pooled_buf.as_mut().extend_from_slice(&data[9..]);
+                        pooled_buf.take()
+                    }
+                    None => {
+                        // Pool mutex is contended, allocate directly to avoid blocking
+                        data[9..].to_vec()
+                    }
+                };
+
                 Ok(PeerMessage::Piece {
                     index,
                     begin,

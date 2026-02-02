@@ -1,5 +1,6 @@
 use nimble_bencode::torrent::{TorrentInfo, TorrentMode};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use anyhow::{Context, Result};
 
 #[derive(Clone)]
 pub struct FileLayout {
@@ -29,27 +30,84 @@ pub struct FileSegment {
     pub length: u64,
 }
 
+/// Sanitizes a path component to prevent directory traversal attacks.
+/// Rejects absolute paths, "..", ".", and other dangerous patterns.
+/// Returns None if the component is invalid.
+fn sanitize_path_component(component: &str) -> Option<&str> {
+    // Reject empty components
+    if component.is_empty() {
+        return None;
+    }
+
+    // Reject "." and ".." to prevent traversal
+    if component == "." || component == ".." {
+        return None;
+    }
+
+    // Reject absolute paths (starting with / or \)
+    if component.starts_with('/') || component.starts_with('\\') {
+        return None;
+    }
+
+    // Reject drive letters on Windows (e.g., "C:", "D:")
+    #[cfg(target_os = "windows")]
+    {
+        if component.len() >= 2 && component.chars().nth(1) == Some(':') {
+            let first_char = component.chars().next().unwrap();
+            if first_char.is_ascii_alphabetic() {
+                return None;
+            }
+        }
+    }
+
+    // Reject components containing null bytes
+    if component.contains('\0') {
+        return None;
+    }
+
+    // Reject components with path separators in the middle
+    if component.contains('/') || component.contains('\\') {
+        return None;
+    }
+
+    Some(component)
+}
+
+/// Safely joins path components, sanitizing each one to prevent traversal.
+/// Returns None if any component is invalid.
+fn safe_join(base: &Path, components: &[String]) -> Option<PathBuf> {
+    let mut path = base.to_path_buf();
+    for component in components {
+        let sanitized = sanitize_path_component(component)?;
+        path = path.join(sanitized);
+    }
+    Some(path)
+}
+
 impl FileLayout {
-    pub fn new(info: &TorrentInfo, download_dir: PathBuf) -> Self {
+    pub fn new(info: &TorrentInfo, download_dir: PathBuf) -> Result<Self> {
         let mut files = Vec::new();
         let mut offset = 0u64;
         let root = download_dir.clone();
 
         match &info.mode {
             TorrentMode::SingleFile { name, length } => {
+                let sanitized_name = sanitize_path_component(name)
+                    .ok_or_else(|| anyhow::anyhow!("invalid file name in torrent: {:?}", name))?;
                 files.push(FileEntry {
-                    path: download_dir.join(name),
+                    path: download_dir.join(sanitized_name),
                     offset: 0,
                     length: *length,
                 });
             }
             TorrentMode::MultiFile { name, files: file_list } => {
-                let base = download_dir.join(name);
+                let sanitized_dir = sanitize_path_component(name)
+                    .ok_or_else(|| anyhow::anyhow!("invalid directory name in torrent: {:?}", name))?;
+                let base = download_dir.join(sanitized_dir);
+
                 for file_info in file_list {
-                    let mut path = base.clone();
-                    for component in &file_info.path {
-                        path = path.join(component);
-                    }
+                    let path = safe_join(&base, &file_info.path)
+                        .ok_or_else(|| anyhow::anyhow!("invalid file path in torrent: {:?}", file_info.path))?;
 
                     files.push(FileEntry {
                         path,
@@ -62,12 +120,12 @@ impl FileLayout {
             }
         }
 
-        FileLayout {
+        Ok(FileLayout {
             files,
             piece_length: info.piece_length,
             total_length: info.total_length,
             root_dir: root,
-        }
+        })
     }
 
     pub fn files(&self) -> Vec<FileInfo> {
@@ -180,7 +238,7 @@ mod tests {
     #[test]
     fn test_single_file_layout() {
         let info = make_test_info_single();
-        let layout = FileLayout::new(&info, PathBuf::from("/downloads"));
+        let layout = FileLayout::new(&info, PathBuf::from("/downloads")).unwrap();
 
         assert_eq!(layout.file_count(), 1);
         assert_eq!(
@@ -192,7 +250,7 @@ mod tests {
     #[test]
     fn test_multi_file_layout() {
         let info = make_test_info_multi();
-        let layout = FileLayout::new(&info, PathBuf::from("/downloads"));
+        let layout = FileLayout::new(&info, PathBuf::from("/downloads")).unwrap();
 
         assert_eq!(layout.file_count(), 3);
         assert_eq!(
@@ -204,7 +262,7 @@ mod tests {
     #[test]
     fn test_map_piece_single_file() {
         let info = make_test_info_single();
-        let layout = FileLayout::new(&info, PathBuf::from("/downloads"));
+        let layout = FileLayout::new(&info, PathBuf::from("/downloads")).unwrap();
 
         let segments = layout.map_piece(0);
         assert_eq!(segments.len(), 1);
@@ -216,7 +274,7 @@ mod tests {
     #[test]
     fn test_map_piece_multi_file() {
         let info = make_test_info_multi();
-        let layout = FileLayout::new(&info, PathBuf::from("/downloads"));
+        let layout = FileLayout::new(&info, PathBuf::from("/downloads")).unwrap();
 
         let segments = layout.map_piece(0);
         assert_eq!(segments.len(), 2);
@@ -226,5 +284,28 @@ mod tests {
         assert_eq!(segments[1].file_index, 1);
         assert_eq!(segments[1].file_offset, 0);
         assert_eq!(segments[1].length, 6384);
+    }
+
+    #[test]
+    fn test_path_traversal_rejection() {
+        let mut info = make_test_info_multi();
+        if let TorrentMode::MultiFile { files, .. } = &mut info.mode {
+            // Try to inject path traversal
+            files[0].path = vec!["..".to_string(), "etc".to_string(), "passwd".to_string()];
+        }
+
+        let result = FileLayout::new(&info, PathBuf::from("/downloads"));
+        assert!(result.is_err(), "Should reject .. in path");
+    }
+
+    #[test]
+    fn test_absolute_path_rejection() {
+        let mut info = make_test_info_single();
+        if let TorrentMode::SingleFile { name, .. } = &mut info.mode {
+            *name = "/etc/passwd".to_string();
+        }
+
+        let result = FileLayout::new(&info, PathBuf::from("/downloads"));
+        assert!(result.is_err(), "Should reject absolute path");
     }
 }

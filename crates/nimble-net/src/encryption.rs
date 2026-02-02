@@ -2,6 +2,19 @@ use std::io::{self, Read, Write};
 use num_bigint::BigUint;
 use nimble_util::hash::sha1;
 
+// SECURITY WARNING: This 768-bit Diffie-Hellman prime is WEAK and vulnerable to
+// state-level cryptanalysis (Logjam attack). 768-bit primes are well below the
+// modern minimum of 2048 bits.
+//
+// This prime is mandated by the BitTorrent Message Stream Encryption (MSE) protocol
+// specification and cannot be changed without breaking protocol compatibility.
+//
+// MSE is designed for OBFUSCATION, not for SECURITY:
+// - It prevents passive ISP traffic analysis
+// - It does NOT protect against active attacks or state-level adversaries
+// - The weak DH key exchange makes it vulnerable to MitM attacks
+//
+// For true privacy, users should rely on external VPN/Tor, not MSE.
 const DH_PRIME_HEX: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A63A36210000000000090563";
 const DH_GENERATOR: u32 = 2;
 const VC_LENGTH: usize = 8;

@@ -159,7 +159,6 @@ impl UtpHeader {
     }
 }
 
-#[derive(Debug, Clone)]
 struct InFlightPacket {
     seq_nr: u16,
     data: PacketBuffer,
@@ -216,7 +215,8 @@ impl PacketBuffer {
     }
 
     fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.buffer.as_mut().expect("packet buffer missing")
+        let buffer = self.buffer.as_mut().expect("packet buffer missing");
+        &mut buffer[..]
     }
 
     fn len(&self) -> usize {

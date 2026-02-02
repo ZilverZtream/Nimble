@@ -609,6 +609,28 @@ mod tests {
     use crate::rpc::{encode_message, Message, Query, QueryKind};
     use std::net::{Ipv4Addr, SocketAddrV4};
 
+    fn node_id_for_ip(ip: Ipv4Addr, rand: u8) -> [u8; 20] {
+        let ip_bytes = ip.octets();
+        let mut v = [0u8; 4];
+        v[0] = (ip_bytes[0] & 0x03) | ((rand & 0x07) << 5);
+        v[1] = (ip_bytes[1] & 0x0f) | ((rand >> 3) & 0x70);
+        v[2] = (ip_bytes[2] & 0x3f) | ((rand >> 5) & 0xc0);
+        v[3] = ip_bytes[3];
+
+        let hash_base = (v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | v[3] as u32;
+
+        let expected_0 = (hash_base.wrapping_mul(0x9E3779B1) >> 24) as u8;
+        let expected_1 = (hash_base.wrapping_mul(0x9E3779B1).wrapping_add(0x12345678) >> 24) as u8;
+        let expected_2 = (hash_base.wrapping_mul(0x9E3779B1).wrapping_add(0x23456789) >> 24) as u8;
+
+        let mut node_id = [0u8; 20];
+        node_id[0] = expected_0;
+        node_id[1] = expected_1;
+        node_id[2] = expected_2;
+        node_id[19] = rand;
+        node_id
+    }
+
     #[test]
     fn test_node_id_generated() {
         let node = DhtNode::new();
@@ -619,8 +641,7 @@ mod tests {
     fn test_observe_node_updates_count() {
         let mut node = DhtNode::new();
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 6881);
-        let mut other_id = [0u8; 20];
-        other_id[19] = 1;
+        let other_id = node_id_for_ip(*addr.ip(), 1);
         assert!(node.observe_node(other_id, addr));
         assert_eq!(node.known_nodes(), 1);
     }
@@ -628,14 +649,13 @@ mod tests {
     #[test]
     fn handle_packet_tracks_sender() {
         let mut node = DhtNode::new();
-        let mut sender_id = [0u8; 20];
-        sender_id[19] = 9;
+        let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 6881);
+        let sender_id = node_id_for_ip(*addr.ip(), 9);
         let message = Message::Query(Query {
             transaction_id: b"aa".to_vec(),
             kind: QueryKind::Ping { id: sender_id },
         });
         let payload = encode_message(&message);
-        let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 6881);
 
         let outcome = node.handle_packet(addr, &payload).unwrap();
         assert_eq!(outcome.message, message);
@@ -646,14 +666,13 @@ mod tests {
     #[test]
     fn handle_ping_returns_response() {
         let mut node = DhtNode::new();
-        let mut sender_id = [0u8; 20];
-        sender_id[19] = 2;
+        let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 10), 6881);
+        let sender_id = node_id_for_ip(*addr.ip(), 2);
         let message = Message::Query(Query {
             transaction_id: b"aa".to_vec(),
             kind: QueryKind::Ping { id: sender_id },
         });
         let payload = encode_message(&message);
-        let addr = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 10), 6881);
 
         let outcome = node.handle_packet(addr, &payload).unwrap();
         assert!(matches!(
@@ -669,12 +688,11 @@ mod tests {
     fn handle_find_node_returns_closest_nodes() {
         let mut node = DhtNode::new();
         let addr = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 6881);
-        let mut other_id = [0u8; 20];
-        other_id[19] = 5;
+        let other_id = node_id_for_ip(*addr.ip(), 5);
         node.observe_node(other_id, addr);
 
-        let mut sender_id = [0u8; 20];
-        sender_id[19] = 9;
+        let sender_addr = SocketAddrV4::new(Ipv4Addr::new(2, 2, 2, 2), 6881);
+        let sender_id = node_id_for_ip(*sender_addr.ip(), 9);
         let query = Message::Query(Query {
             transaction_id: b"fn".to_vec(),
             kind: QueryKind::FindNode {
@@ -685,7 +703,7 @@ mod tests {
 
         let payload = encode_message(&query);
         let outcome = node
-            .handle_packet(SocketAddrV4::new(Ipv4Addr::new(2, 2, 2, 2), 6881), &payload)
+            .handle_packet(sender_addr, &payload)
             .unwrap();
 
         let response = outcome.response.expect("response");
@@ -703,10 +721,9 @@ mod tests {
     #[test]
     fn announce_peer_then_get_peers_returns_value() {
         let mut node = DhtNode::new();
-        let mut sender_id = [0u8; 20];
-        sender_id[19] = 7;
-        let info_hash = [0x22u8; 20];
         let source = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 9), 6889);
+        let sender_id = node_id_for_ip(*source.ip(), 7);
+        let info_hash = [0x22u8; 20];
 
         let get_query = Message::Query(Query {
             transaction_id: b"gp".to_vec(),

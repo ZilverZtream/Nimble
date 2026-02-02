@@ -100,9 +100,9 @@ mod tests {
     fn parse_added_and_dropped_peers() {
         let mut payload = Vec::new();
         payload.extend_from_slice(b"d5:added6:");
-        payload.extend_from_slice(&[127, 0, 0, 1, 0x1a, 0xe1]);
+        payload.extend_from_slice(&[1, 1, 1, 1, 0x1a, 0xe1]);
         payload.extend_from_slice(b"7:dropped6:");
-        payload.extend_from_slice(&[10, 0, 0, 2, 0x1a, 0xe2]);
+        payload.extend_from_slice(&[8, 8, 8, 8, 0x1a, 0xe2]);
         payload.extend_from_slice(b"e");
 
         let msg = parse_pex(&payload).unwrap();
@@ -110,11 +110,11 @@ mod tests {
         assert_eq!(msg.dropped.len(), 1);
         assert_eq!(
             msg.added[0],
-            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6881)
+            SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 6881)
         );
         assert_eq!(
             msg.dropped[0],
-            SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 6882)
+            SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 6882)
         );
     }
 

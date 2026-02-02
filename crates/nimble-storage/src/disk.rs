@@ -474,6 +474,7 @@ mod tests {
     use nimble_bencode::torrent::{InfoHash, TorrentMode};
     use sha1::{Digest, Sha1};
     use tempfile::TempDir;
+    use std::time::{Duration, Instant};
 
     fn make_test_info() -> TorrentInfo {
         let piece_data = vec![0u8; 16384];
@@ -496,6 +497,21 @@ mod tests {
         }
     }
 
+    fn wait_for_piece(storage: &mut DiskStorage, piece_index: u64) -> Vec<u64> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut completed = Vec::new();
+
+        while Instant::now() < deadline {
+            completed.extend(storage.poll_verifications());
+            if completed.iter().any(|&piece| piece == piece_index) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        completed
+    }
+
     #[test]
     fn test_write_block_and_complete() {
         let temp_dir = TempDir::new().unwrap();
@@ -505,8 +521,7 @@ mod tests {
         let data = vec![0u8; 16384];
         storage.write_block(0, 0, &data).unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let completed = storage.poll_verifications();
+        let completed = wait_for_piece(&mut storage, 0);
 
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0], 0);
@@ -537,8 +552,7 @@ mod tests {
 
         storage.write_block(0, 16384, &block2).unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let completed = storage.poll_verifications();
+        let completed = wait_for_piece(&mut storage, 0);
 
         assert_eq!(completed.len(), 1);
         assert!(storage.has_piece(0));

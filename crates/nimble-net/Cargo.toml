@@ -27,3 +27,4 @@ fastrand = { version = "2", default-features = true }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 libc = "0.2"
+ureq = { workspace = true }

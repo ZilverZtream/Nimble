@@ -282,6 +282,7 @@ dependencies = [
  "nimble-storage",
  "nimble-util",
  "thiserror",
+ "windows-sys",
 ]
 
 [[package]]

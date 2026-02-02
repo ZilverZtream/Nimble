@@ -21,3 +21,6 @@ nimble-net = { path = "../nimble-net" }
 nimble-dht = { path = "../nimble-dht" }
 nimble-lsd = { path = "../nimble-lsd" }
 nimble-nat = { path = "../nimble-nat" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

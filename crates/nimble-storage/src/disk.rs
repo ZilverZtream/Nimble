@@ -427,6 +427,37 @@ impl DiskStorage {
         Ok(())
     }
 
+    pub fn delete_files(&self) -> Result<()> {
+        for file_info in self.layout.files() {
+            if file_info.path.exists() {
+                std::fs::remove_file(&file_info.path)
+                    .with_context(|| format!("failed to delete {:?}", file_info.path))?;
+            }
+        }
+        let resume_path = ResumeData::resume_file_path(&self.download_dir, self.info_hash);
+        if resume_path.exists() {
+            let _ = std::fs::remove_file(&resume_path);
+        }
+        Ok(())
+    }
+
+    pub fn force_recheck(&mut self) -> Result<()> {
+        self.bitfield = Bitfield::new(self.pieces.len());
+        self.pending_pieces.clear();
+        self.pending_memory = 0;
+        self.verifying_pieces.clear();
+        self.writing_pieces.clear();
+        self.failed_pieces.clear();
+        let _ = self.checkpoint_manager.clear();
+        self.resume_dirty = true;
+        self.save_resume_data()?;
+        Ok(())
+    }
+
+    pub fn root_dir(&self) -> PathBuf {
+        self.layout.root_dir()
+    }
+
     fn save_resume_data(&self) -> Result<()> {
         let resume_data = ResumeData {
             info_hash: self.info_hash,

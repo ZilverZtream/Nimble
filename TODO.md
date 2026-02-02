@@ -246,9 +246,9 @@ Leaving completed TODOs unchecked is considered a bug.
 - [x] H3.4 Retry & timeout logic
 
 ## H4. Tracker management
-- [ ] H4.1 Tier rotation
-- [ ] H4.2 Backoff strategy
-- [ ] H4.3 Multi-tracker aggregation
+- [x] H4.1 Tier rotation
+- [x] H4.2 Backoff strategy
+- [x] H4.3 Multi-tracker aggregation
 
 -------------------------------------------------------------------------------
 
@@ -359,16 +359,16 @@ Leaving completed TODOs unchecked is considered a bug.
 
 ## O1. Status window
 - [x] O1.1 Window creation
-- [ ] O1.2 Torrent list view
-- [ ] O1.3 Live stats updates
-- [ ] O1.4 Per-torrent context menu
+- [x] O1.2 Torrent list view
+- [x] O1.3 Live stats updates
+- [x] O1.4 Per-torrent context menu
 
 ## O2. Per-torrent actions
-- [ ] O2.1 Pause/resume torrent
-- [ ] O2.2 Remove torrent (keep data)
-- [ ] O2.3 Remove torrent + delete data
-- [ ] O2.4 Force recheck
-- [ ] O2.5 Open containing folder
+- [x] O2.1 Pause/resume torrent
+- [x] O2.2 Remove torrent (keep data)
+- [x] O2.3 Remove torrent + delete data
+- [x] O2.4 Force recheck
+- [x] O2.5 Open containing folder
 
 ## O3. File priorities UI
 - [ ] O3.1 File list view

@@ -272,6 +272,9 @@ fn event_listener_thread(events: EventReceiver) {
                             }
                             PostMessageW(hwnd, WM_ENGINE_EVENT, 0, 0);
                         }
+                        Event::TorrentList(torrents) => {
+                            ui_status::update_torrents_from_event(torrents);
+                        }
                         Event::Started => {
                             log::info("Engine started event received");
                         }
@@ -580,7 +583,13 @@ unsafe fn handle_open_downloads(_hwnd: HWND) {
 
 #[cfg(windows)]
 unsafe fn handle_status_window(hwnd: HWND) {
-    if let Err(err) = ui_status::open_status_window(hwnd) {
+    let engine_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const EngineHandle;
+    if engine_ptr.is_null() {
+        log::info("Engine handle not found");
+        return;
+    }
+    let engine = (*engine_ptr).clone();
+    if let Err(err) = ui_status::open_status_window(hwnd, engine) {
         log::info(&format!("Status window failed: {err:?}"));
     }
 }

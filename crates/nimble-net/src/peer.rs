@@ -28,9 +28,51 @@ const EXTENDED_MESSAGE_ID: u8 = 20;
 const PEX_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const TEMP_RECV_BUFFER_SIZE: usize = 8192;
 
+const MAX_CHOKE_SIZE: u32 = 1;
+const MAX_UNCHOKE_SIZE: u32 = 1;
+const MAX_INTERESTED_SIZE: u32 = 1;
+const MAX_NOT_INTERESTED_SIZE: u32 = 1;
+const MAX_HAVE_SIZE: u32 = 5;
+const MAX_REQUEST_SIZE: u32 = 13;
+const MAX_CANCEL_SIZE: u32 = 13;
+const MAX_PIECE_SIZE: u32 = 32768 + 9;
+
 fn is_timeout_error(e: &anyhow::Error) -> bool {
     let msg = e.to_string();
     msg.contains("timed out") || msg.contains("WSAETIMEDOUT") || msg.contains("10060")
+}
+
+fn validate_message_size(msg_len: u32, data: &[u8]) -> Result<(), anyhow::Error> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let msg_id = data[0];
+
+    let max_size = match PeerMessageId::from_u8(msg_id) {
+        Some(PeerMessageId::Choke) => MAX_CHOKE_SIZE,
+        Some(PeerMessageId::Unchoke) => MAX_UNCHOKE_SIZE,
+        Some(PeerMessageId::Interested) => MAX_INTERESTED_SIZE,
+        Some(PeerMessageId::NotInterested) => MAX_NOT_INTERESTED_SIZE,
+        Some(PeerMessageId::Have) => MAX_HAVE_SIZE,
+        Some(PeerMessageId::Request) => MAX_REQUEST_SIZE,
+        Some(PeerMessageId::Cancel) => MAX_CANCEL_SIZE,
+        Some(PeerMessageId::Piece) => MAX_PIECE_SIZE,
+        Some(PeerMessageId::Bitfield) => MAX_BITFIELD_BYTES,
+        Some(PeerMessageId::Extended) => MAX_EXTENDED_MESSAGE_LENGTH,
+        None => return Err(anyhow::anyhow!("invalid message id: {}", msg_id)),
+    };
+
+    if msg_len > max_size {
+        return Err(anyhow::anyhow!(
+            "message type {} size {} exceeds limit {}",
+            msg_id,
+            msg_len,
+            max_size
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -698,24 +740,19 @@ impl PeerConnection {
                         }
                     }
 
-                    if self.recv_buffer.len() == 4 {
+                    if self.recv_buffer.len() >= 4 {
                         let msg_len =
                             u32::from_be_bytes([self.recv_buffer[0], self.recv_buffer[1], self.recv_buffer[2], self.recv_buffer[3]]);
-
-                        let expected_bitfield_bytes = ((self.piece_count + 7) / 8) as u32 + 1;
-                        let max_allowed = MAX_MESSAGE_LENGTH
-                            .max(expected_bitfield_bytes.min(MAX_BITFIELD_BYTES))
-                            .max(MAX_EXTENDED_MESSAGE_LENGTH);
-
-                        if msg_len > max_allowed {
-                            anyhow::bail!("message too large: {} bytes (max {})", msg_len, max_allowed);
-                        }
 
                         if msg_len == 0 {
                             self.recv_buffer.clear();
                             self.recv_state = RecvState::ReadingLength;
                             self.last_message_received = Instant::now();
                             return Ok(Some(PeerMessage::KeepAlive));
+                        }
+
+                        if msg_len > MAX_EXTENDED_MESSAGE_LENGTH {
+                            anyhow::bail!("message too large: {} bytes (absolute max {})", msg_len, MAX_EXTENDED_MESSAGE_LENGTH);
                         }
 
                         self.recv_buffer.clear();
@@ -751,6 +788,7 @@ impl PeerConnection {
                     }
 
                     if self.recv_buffer.len() == msg_len as usize {
+                        validate_message_size(msg_len, &self.recv_buffer)?;
                         let msg = PeerMessage::parse(&self.recv_buffer)?;
                         self.apply_incoming_message(&msg);
                         self.recv_buffer.clear();

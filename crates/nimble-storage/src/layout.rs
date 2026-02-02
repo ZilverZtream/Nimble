@@ -1,12 +1,14 @@
 use nimble_bencode::torrent::{TorrentInfo, TorrentMode};
 use std::path::PathBuf;
 
+#[derive(Clone)]
 pub struct FileLayout {
     files: Vec<FileEntry>,
     piece_length: u64,
     total_length: u64,
 }
 
+#[derive(Clone)]
 struct FileEntry {
     path: PathBuf,
     offset: u64,

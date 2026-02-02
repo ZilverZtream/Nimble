@@ -10,13 +10,14 @@ use crate::endgame::{BlockId, EndgameMode};
 
 const MAX_PEERS_PER_TORRENT: usize = 50;
 const MAX_CONNECT_ATTEMPTS: usize = 5;
-const MAX_CONNECT_PER_TICK: usize = 5;
+const MAX_CONNECT_PER_SECOND: usize = 10;
 const BLOCK_SIZE: u32 = 16384;
 const MAX_PENDING_PER_PEER: usize = 5;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MAX_CANDIDATE_PEERS: usize = 2000;
 const BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const FAILED_PEER_TTL: Duration = Duration::from_secs(300);
+const CONNECTION_RATE_WINDOW: Duration = Duration::from_secs(1);
 
 pub struct PeerManager {
     info_hash: [u8; 20],
@@ -31,6 +32,9 @@ pub struct PeerManager {
     failed_peers: HashMap<SocketAddrV4, (Instant, usize)>,
     piece_picker: PiecePicker,
     endgame: EndgameMode,
+    pending_upload_requests: Vec<(SocketAddrV4, u32, u32, u32)>,
+    connection_attempts: VecDeque<Instant>,
+    last_connection_attempt: Instant,
 }
 
 struct ManagedPeer {
@@ -67,6 +71,9 @@ impl PeerManager {
             failed_peers: HashMap::new(),
             piece_picker: PiecePicker::new(piece_count),
             endgame: EndgameMode::new(),
+            pending_upload_requests: Vec::new(),
+            connection_attempts: VecDeque::new(),
+            last_connection_attempt: Instant::now(),
         }
     }
 
@@ -84,6 +91,9 @@ impl PeerManager {
             failed_peers: HashMap::new(),
             piece_picker: PiecePicker::new(0),
             endgame: EndgameMode::new(),
+            pending_upload_requests: Vec::new(),
+            connection_attempts: VecDeque::new(),
+            last_connection_attempt: Instant::now(),
         }
     }
 
@@ -186,12 +196,10 @@ impl PeerManager {
                             }
 
                             if !self.metadata_only {
-                                if let Some(storage) = storage.as_mut() {
+                                if storage.is_some() {
                                     let requests = peer.connection.take_peer_requests();
                                     for req in requests {
-                                        if let Ok(data) = storage.read_block(req.index as u64, req.begin, req.length) {
-                                            let _ = peer.connection.send_piece(req.index, req.begin, data);
-                                        }
+                                        self.pending_upload_requests.push((addr, req.index, req.begin, req.length));
                                     }
                                 }
                             }
@@ -230,6 +238,27 @@ impl PeerManager {
             for (_, peer) in self.peers.iter_mut() {
                 if peer.connection.state() == PeerState::Connected {
                     let _ = peer.connection.send_have(*piece_index);
+                }
+            }
+        }
+
+        if !self.metadata_only {
+            if let Some(storage) = storage.as_mut() {
+                for (addr, index, begin, length) in self.pending_upload_requests.drain(..) {
+                    if self.peers.contains_key(&addr) {
+                        let _ = storage.request_read_block(index as u64, begin, length, Some(addr));
+                    }
+                }
+
+                let completed_reads = storage.poll_read_completions();
+                for (peer_addr, piece_index, block_offset, data) in completed_reads {
+                    if let Some(addr) = peer_addr {
+                        if let Some(peer) = self.peers.get_mut(&addr) {
+                            if peer.connection.state() == PeerState::Connected {
+                                let _ = peer.connection.send_piece(piece_index as u32, block_offset, data);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -277,13 +306,29 @@ impl PeerManager {
     }
 
     fn connect_to_candidates(&mut self) {
+        let now = Instant::now();
+
+        while let Some(&oldest) = self.connection_attempts.front() {
+            if now.duration_since(oldest) > CONNECTION_RATE_WINDOW {
+                self.connection_attempts.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let budget = MAX_CONNECT_PER_SECOND.saturating_sub(self.connection_attempts.len());
+        if budget == 0 {
+            return;
+        }
+
         let mut attempts = 0;
-        while self.peers.len() < MAX_PEERS_PER_TORRENT && attempts < MAX_CONNECT_PER_TICK {
+        while self.peers.len() < MAX_PEERS_PER_TORRENT && attempts < budget {
             let addr = match self.candidate_peers.pop_front() {
                 Some(a) => a,
                 None => break,
             };
 
+            self.connection_attempts.push_back(now);
             attempts += 1;
 
             let mut conn =
@@ -308,6 +353,8 @@ impl PeerManager {
                 }
             }
         }
+
+        self.last_connection_attempt = now;
     }
 
     fn apply_pex_dropped(&mut self, dropped: &HashSet<SocketAddrV4>) {
@@ -536,12 +583,15 @@ pub struct PeerManagerStats {
     pub pieces_total: u32,
 }
 
+use std::collections::BTreeMap;
+
 pub struct PiecePicker {
     piece_count: usize,
     completed: Bitfield,
     downloading: Bitfield,
     availability: Vec<u32>,
     pending_blocks: HashSet<(usize, u32)>,
+    rarity_buckets: BTreeMap<u32, Vec<usize>>,
 }
 
 impl PiecePicker {
@@ -552,6 +602,7 @@ impl PiecePicker {
             downloading: Bitfield::new(piece_count),
             availability: vec![0; piece_count],
             pending_blocks: HashSet::new(),
+            rarity_buckets: BTreeMap::new(),
         }
     }
 
@@ -560,52 +611,92 @@ impl PiecePicker {
     }
 
     pub fn update_availability(&mut self, piece: usize, has: bool) {
-        if piece < self.piece_count {
-            if has {
-                self.availability[piece] = self.availability[piece].saturating_add(1);
-            } else {
-                self.availability[piece] = self.availability[piece].saturating_sub(1);
+        if piece >= self.piece_count {
+            return;
+        }
+
+        let old_rarity = self.availability[piece];
+
+        if has {
+            self.availability[piece] = self.availability[piece].saturating_add(1);
+        } else {
+            self.availability[piece] = self.availability[piece].saturating_sub(1);
+        }
+
+        let new_rarity = self.availability[piece];
+
+        if old_rarity != new_rarity && !self.completed.get(piece) && !self.downloading.get(piece) {
+            if old_rarity > 0 {
+                if let Some(bucket) = self.rarity_buckets.get_mut(&old_rarity) {
+                    bucket.retain(|&p| p != piece);
+                    if bucket.is_empty() {
+                        self.rarity_buckets.remove(&old_rarity);
+                    }
+                }
+            }
+
+            if new_rarity > 0 {
+                self.rarity_buckets.entry(new_rarity).or_insert_with(Vec::new).push(piece);
             }
         }
     }
 
     pub fn pick_piece(&self, peer: &PeerConnection) -> Option<usize> {
-        let mut best_piece = None;
-        let mut best_rarity = u32::MAX;
-
-        for piece in 0..self.piece_count {
-            if self.completed.get(piece) {
-                continue;
-            }
-            if self.downloading.get(piece) {
-                continue;
-            }
-            if !peer.has_piece(piece as u32) {
-                continue;
-            }
-
-            let rarity = self.availability[piece];
-            if rarity > 0 && rarity < best_rarity {
-                best_piece = Some(piece);
-                best_rarity = rarity;
+        for (_rarity, pieces) in self.rarity_buckets.iter() {
+            for &piece in pieces {
+                if self.completed.get(piece) {
+                    continue;
+                }
+                if self.downloading.get(piece) {
+                    continue;
+                }
+                if !peer.has_piece(piece as u32) {
+                    continue;
+                }
+                return Some(piece);
             }
         }
-
-        best_piece
+        None
     }
 
     pub fn mark_piece_downloading(&mut self, piece: usize) {
-        self.downloading.set(piece, true);
+        if !self.downloading.get(piece) {
+            let rarity = self.availability[piece];
+            if rarity > 0 {
+                if let Some(bucket) = self.rarity_buckets.get_mut(&rarity) {
+                    bucket.retain(|&p| p != piece);
+                    if bucket.is_empty() {
+                        self.rarity_buckets.remove(&rarity);
+                    }
+                }
+            }
+            self.downloading.set(piece, true);
+        }
     }
 
     pub fn mark_completed(&mut self, piece: usize) {
+        let rarity = self.availability[piece];
+        if rarity > 0 {
+            if let Some(bucket) = self.rarity_buckets.get_mut(&rarity) {
+                bucket.retain(|&p| p != piece);
+                if bucket.is_empty() {
+                    self.rarity_buckets.remove(&rarity);
+                }
+            }
+        }
         self.completed.set(piece, true);
         self.downloading.set(piece, false);
         self.pending_blocks.retain(|&(p, _)| p != piece);
     }
 
     pub fn cancel_piece(&mut self, piece: usize) {
-        self.downloading.set(piece, false);
+        if self.downloading.get(piece) {
+            let rarity = self.availability[piece];
+            if rarity > 0 && !self.completed.get(piece) {
+                self.rarity_buckets.entry(rarity).or_insert_with(Vec::new).push(piece);
+            }
+            self.downloading.set(piece, false);
+        }
         self.pending_blocks.retain(|&(p, _)| p != piece);
     }
 

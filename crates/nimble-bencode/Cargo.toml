@@ -11,4 +11,4 @@ default = []
         [dependencies]
         anyhow = { workspace = true }
         thiserror = { workspace = true }
-        nimble-util = { path = "../nimble-util", features = ["sha1_crate"] }
+        nimble-util = { path = "../nimble-util" }

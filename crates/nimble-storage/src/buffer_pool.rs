@@ -14,7 +14,7 @@ pub fn global_pool() -> &'static BufferPool {
 
 /// A pool of reusable buffers to reduce allocations for piece data.
 ///
-/// Issue #10 Fix: Implements buffer pooling to eliminate excessive memory copying.
+/// Implements buffer pooling to eliminate excessive memory copying.
 /// Instead of allocating new Vec<u8> for every piece block, buffers are reused
 /// from a global pool, reducing GC pressure and improving throughput.
 #[derive(Clone)]
@@ -51,6 +51,9 @@ impl BufferPool {
     }
 
     /// Gets a buffer from the pool, or allocates a new one if pool is empty.
+    ///
+    /// This method blocks on the pool mutex. For network threads that need
+    /// non-blocking behavior, use `try_get()` instead.
     pub fn get(&self) -> PooledBuffer {
         let mut inner = self.inner.lock().unwrap();
         let data = inner.buffers.pop().unwrap_or_else(|| Vec::with_capacity(inner.buffer_size));
@@ -59,6 +62,21 @@ impl BufferPool {
             data: Some(data),
             pool: self.inner.clone(),
         }
+    }
+
+    /// Attempts to get a buffer from the pool without blocking.
+    ///
+    /// Returns None if the pool mutex cannot be acquired immediately.
+    /// This prevents network threads from blocking on buffer allocation
+    /// during high contention scenarios.
+    pub fn try_get(&self) -> Option<PooledBuffer> {
+        let mut inner = self.inner.try_lock().ok()?;
+        let data = inner.buffers.pop().unwrap_or_else(|| Vec::with_capacity(inner.buffer_size));
+
+        Some(PooledBuffer {
+            data: Some(data),
+            pool: self.inner.clone(),
+        })
     }
 
     /// Returns a buffer to the pool.

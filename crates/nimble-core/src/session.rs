@@ -1537,7 +1537,7 @@ impl Session {
     /// Reduces syscalls from O(N*peers) per tick to O(1) + O(ready_peers).
     /// RFC-101 Step 1: Decoupled Readiness Polling.
     ///
-    /// Issue #7 Fix: Caches socket handles between ticks to eliminate O(N) allocation
+    /// Caches socket handles between ticks to eliminate O(N) allocation
     /// on every tick. Cache is only rebuilt when peers are added/removed (socket_cache_dirty).
     fn tick_torrents_optimized(&mut self) -> Vec<String> {
         let mut log_lines = Vec::new();

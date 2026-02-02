@@ -11,7 +11,6 @@ use crate::types::{Command, CommandSender, EngineStats, Event, EventReceiver};
 const TICK_INTERVAL_MS: u64 = 20;
 const STATS_UPDATE_INTERVAL_MS: u64 = 1000;
 const COMMAND_CHANNEL_SIZE: usize = 128;
-const EVENT_CHANNEL_SIZE: usize = 1024;
 
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -20,7 +19,10 @@ pub struct EngineHandle {
 
 pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> {
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(COMMAND_CHANNEL_SIZE);
-    let (evt_tx, evt_rx) = mpsc::sync_channel::<Event>(EVENT_CHANNEL_SIZE);
+    // Use unbounded channel for events to prevent engine thread blocking
+    // if UI is slow to process events. This trades memory for guaranteed
+    // forward progress in the core engine thread.
+    let (evt_tx, evt_rx) = mpsc::channel::<Event>();
 
     thread::spawn(move || {
         let _ = evt_tx.send(Event::Started);
@@ -122,16 +124,35 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
                             let infohash_clone = infohash.clone();
                             thread::spawn(move || {
                                 use std::os::windows::ffi::OsStrExt;
-                                let path_wide: Vec<u16> = std::ffi::OsStr::new(&path)
+                                use std::path::Path;
+
+                                // Determine the directory to open
+                                // If path is a file, use its parent directory. If it's a directory, use it directly.
+                                let target_dir = Path::new(&path);
+                                let folder_to_open = if target_dir.is_file() {
+                                    // For single-file torrents, open the parent directory
+                                    target_dir.parent().unwrap_or(target_dir)
+                                } else {
+                                    // For multi-file torrents, open the torrent directory itself
+                                    target_dir
+                                };
+
+                                let path_wide: Vec<u16> = std::ffi::OsStr::new(folder_to_open)
                                     .encode_wide()
                                     .chain(std::iter::once(0))
                                     .collect();
+
                                 unsafe {
                                     use windows_sys::Win32::UI::Shell::ShellExecuteW;
                                     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
+
+                                    // Use "explore" verb instead of "open" to prevent executing files
+                                    // "explore" always opens a folder view, never executes files
+                                    let verb_wide: Vec<u16> = "explore\0".encode_utf16().collect();
+
                                     let result = ShellExecuteW(
                                         0,
-                                        "open\0".encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>().as_ptr(),
+                                        verb_wide.as_ptr(),
                                         path_wide.as_ptr(),
                                         std::ptr::null(),
                                         std::ptr::null(),

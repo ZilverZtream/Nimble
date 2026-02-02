@@ -172,15 +172,27 @@ mod windows_impl {
         }
 
         fn set_timeouts(&self, recv_ms: u32, send_ms: u32) -> Result<()> {
+            // Proper pointer casting with explicit safety checks.
+            // Windows API expects DWORD (u32) for timeout values, but we use i32 for safety.
+            // Ensure the timeout values fit in i32 to avoid overflow.
+            if recv_ms > i32::MAX as u32 {
+                anyhow::bail!("receive timeout {} exceeds i32::MAX", recv_ms);
+            }
+            if send_ms > i32::MAX as u32 {
+                anyhow::bail!("send timeout {} exceeds i32::MAX", send_ms);
+            }
+
             let recv_timeout = recv_ms as i32;
             let send_timeout = send_ms as i32;
 
             unsafe {
+                // Cast via byte pointer is safe: i32 and u8 have compatible alignment,
+                // and we pass the correct size to WinSock
                 let result = WinSock::setsockopt(
                     self.socket,
                     SOL_SOCKET,
                     SO_RCVTIMEO,
-                    &recv_timeout as *const i32 as *const u8,
+                    std::ptr::addr_of!(recv_timeout) as *const u8,
                     std::mem::size_of::<i32>() as i32,
                 );
                 if result == SOCKET_ERROR {
@@ -191,7 +203,7 @@ mod windows_impl {
                     self.socket,
                     SOL_SOCKET,
                     SO_SNDTIMEO,
-                    &send_timeout as *const i32 as *const u8,
+                    std::ptr::addr_of!(send_timeout) as *const u8,
                     std::mem::size_of::<i32>() as i32,
                 );
                 if result == SOCKET_ERROR {
@@ -208,7 +220,7 @@ mod windows_impl {
                     self.socket,
                     SOL_SOCKET,
                     SO_KEEPALIVE,
-                    &value as *const i32 as *const u8,
+                    std::ptr::addr_of!(value) as *const u8,
                     std::mem::size_of::<i32>() as i32,
                 )
             };
@@ -619,7 +631,7 @@ mod windows_impl {
                 socket,
                 SOL_SOCKET,
                 SO_RCVBUF,
-                &recv_size as *const i32 as *const u8,
+                std::ptr::addr_of!(recv_size) as *const u8,
                 std::mem::size_of::<i32>() as i32,
             )
         };
@@ -632,7 +644,7 @@ mod windows_impl {
                 socket,
                 SOL_SOCKET,
                 SO_SNDBUF,
-                &send_size as *const i32 as *const u8,
+                std::ptr::addr_of!(send_size) as *const u8,
                 std::mem::size_of::<i32>() as i32,
             )
         };
@@ -650,14 +662,14 @@ mod windows_impl {
                 socket,
                 SOL_SOCKET,
                 SO_RCVBUF,
-                &mut actual_recv as *mut i32 as *mut u8,
+                std::ptr::addr_of_mut!(actual_recv) as *mut u8,
                 &mut len,
             );
             WinSock::getsockopt(
                 socket,
                 SOL_SOCKET,
                 SO_SNDBUF,
-                &mut actual_send as *mut i32 as *mut u8,
+                std::ptr::addr_of_mut!(actual_send) as *mut u8,
                 &mut len,
             );
         }

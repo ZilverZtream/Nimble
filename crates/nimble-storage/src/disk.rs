@@ -16,6 +16,12 @@ const STALE_PIECE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const MAX_PENDING_PIECES: usize = 16;
 const MAX_PENDING_MEMORY: u64 = 512 * 1024 * 1024;
 
+// Maximum piece size to prevent DoS via OOM.
+// Limit to 64MB per piece, which is far larger than any legitimate torrent
+// (typical max is 16MB). This prevents a malicious torrent from requesting
+// allocation of multi-GB pieces that would crash the client.
+const MAX_PIECE_SIZE: u64 = 64 * 1024 * 1024;
+
 pub struct DiskStorage {
     layout: FileLayout,
     piece_length: u64,
@@ -46,7 +52,7 @@ struct PendingPiece {
 
 impl DiskStorage {
     pub fn new(info: &TorrentInfo, download_dir: PathBuf) -> Result<Self> {
-        let layout = FileLayout::new(info, download_dir.clone());
+        let layout = FileLayout::new(info, download_dir.clone())?;
         let piece_count = info.pieces.len();
         let info_hash = *info.infohash.as_bytes();
 
@@ -183,6 +189,29 @@ impl DiskStorage {
             );
         }
 
+        // Reject pieces that exceed maximum size to prevent DoS.
+        if piece_len > MAX_PIECE_SIZE {
+            anyhow::bail!(
+                "piece {} size {} exceeds maximum {} (possible DoS attack)",
+                piece_index,
+                piece_len,
+                MAX_PIECE_SIZE
+            );
+        }
+
+        // Ensure piece_len fits in usize to prevent truncation on 32-bit systems.
+        // On 32-bit systems, usize is 32-bit (max 4GB). If piece_len > usize::MAX, casting
+        // to usize will truncate, leading to heap corruption when we allocate a smaller
+        // buffer than expected.
+        if piece_len > usize::MAX as u64 {
+            anyhow::bail!(
+                "piece {} size {} exceeds usize::MAX {} on this platform",
+                piece_index,
+                piece_len,
+                usize::MAX
+            );
+        }
+
         let block_count = ((piece_len + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64) as u32;
         let block_index = block_offset / BLOCK_SIZE;
 
@@ -197,6 +226,7 @@ impl DiskStorage {
 
         let is_new_piece = !self.pending_pieces.contains_key(&piece_index);
         let pending = self.pending_pieces.entry(piece_index).or_insert_with(|| {
+            // Safe to cast: we verified piece_len <= usize::MAX above
             PendingPiece {
                 data: vec![0u8; piece_len as usize],
                 received_blocks: Bitfield::new(block_count as usize),
@@ -220,9 +250,18 @@ impl DiskStorage {
 
         if pending.received_blocks.count_ones() == block_count as usize {
             self.submit_piece_for_verification(piece_index);
+            // Clear checkpoint since piece is complete and will be verified
             let _ = self.checkpoint_manager.clear();
             Ok(false)
         } else {
+            // Checkpoint contains UNVERIFIED data for crash recovery only.
+            // This data will be SHA-1 verified in submit_piece_for_verification() before
+            // being written to the final file. If verification fails, the checkpoint
+            // will be discarded and blocks will be re-requested.
+            // This is safe because:
+            // 1. Checkpoint is only used to resume incomplete pieces after crash
+            // 2. All pieces are hash-verified before final write to disk
+            // 3. Failed verification discards the checkpoint and re-downloads blocks
             let _ = self.checkpoint_manager.write_partial_piece(
                 piece_index,
                 &pending.received_blocks,
@@ -424,23 +463,42 @@ impl DiskStorage {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        // Wait for all pending disk operations to complete before saving resume data
-        // This prevents race conditions where resume state claims pieces are complete
-        // but disk writes haven't finished (Issue #12)
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !self.writing_pieces.is_empty() && std::time::Instant::now() < deadline {
+        // Use explicit timeout to prevent indefinite blocking on shutdown.
+        // Wait for pending disk operations to complete, but enforce hard timeout to
+        // prevent hanging if disk is slow or unresponsive.
+        const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+        let deadline = std::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        let mut poll_count = 0;
+
+        while !self.writing_pieces.is_empty() {
+            if std::time::Instant::now() >= deadline {
+                // Hard timeout reached - log warning and proceed with shutdown
+                // This prevents indefinite hang, though some pieces may not be marked complete
+                eprintln!(
+                    "Warning: Shutdown timeout after {} polls. {} pieces still pending write.",
+                    poll_count,
+                    self.writing_pieces.len()
+                );
+                break;
+            }
+
+            // Poll for completions without blocking
             let _ = self.poll_verifications();
-            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            // Brief sleep to avoid busy-wait CPU burn
+            std::thread::sleep(POLL_INTERVAL);
+            poll_count += 1;
         }
 
-        if !self.writing_pieces.is_empty() {
-            eprintln!("Warning: {} pieces still writing during close", self.writing_pieces.len());
-        }
-
+        // Save resume data even if some writes are still pending
+        // The bitfield will accurately reflect only completed pieces
         if self.resume_dirty {
             self.save_resume_data()?;
             self.resume_dirty = false;
         }
+
         Ok(())
     }
 

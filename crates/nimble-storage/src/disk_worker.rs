@@ -163,7 +163,7 @@ impl DiskWorkerState {
         let global_end = global_start + length as u64;
 
         let segments = self.layout.map_range(global_start, global_end);
-        // Issue #10 Fix: Use buffer pool for disk reads to reduce allocations
+        // Use buffer pool for disk reads to reduce allocations.
         let mut pooled_buf = crate::buffer_pool::global_pool().get();
         pooled_buf.as_mut().resize(length as usize, 0);
         let data_slice = pooled_buf.as_mut().as_mut_slice();

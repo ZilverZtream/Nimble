@@ -24,3 +24,6 @@ nimble-util = { path = "../nimble-util", features = ["sha1_crate"] }
 nimble-bencode = { path = "../nimble-bencode" }
 num-bigint = { version = "0.4", default-features = false }
 fastrand = { version = "2", default-features = true }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+libc = "0.2"

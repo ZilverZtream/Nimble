@@ -6,6 +6,7 @@ use nimble_nat::nat_pmp::{NatPmpClient, Protocol as NatProtocol};
 use nimble_nat::upnp::UpnpClient;
 use nimble_net::listener::PeerListener;
 use nimble_net::peer::PeerConnection;
+use nimble_net::sockets::{poll_readable_sockets, RawSocket};
 use nimble_net::tracker_http::TrackerEvent;
 use nimble_storage::disk::DiskStorage;
 use nimble_util::ids::peer_id_20;
@@ -14,6 +15,10 @@ use std::fs;
 use std::net::{SocketAddrV4, UdpSocket};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// Timeout for socket readiness polling in milliseconds (RFC-101 Step 1).
+/// Short timeout to maintain responsive UI while reducing syscalls.
+const POLL_TIMEOUT_MS: u32 = 5;
 
 use crate::magnet::parse_magnet;
 use crate::peer_manager::PeerManager;
@@ -1323,6 +1328,137 @@ impl Session {
                             peers.len()
                         ));
                     }
+                }
+            }
+        }
+
+        log_lines
+    }
+
+    /// Optimized tick for peer managers using select()-based readiness polling.
+    /// Reduces syscalls from O(N*peers) per tick to O(1) + O(ready_peers).
+    /// RFC-101 Step 1: Decoupled Readiness Polling.
+    fn tick_torrents_optimized(&mut self) -> Vec<String> {
+        let mut log_lines = Vec::new();
+
+        // Phase 1: Collect all socket handles across all active torrents
+        let mut all_handles: Vec<(String, SocketAddrV4, RawSocket)> = Vec::new();
+
+        for (infohash, torrent) in self.torrents.iter() {
+            let peer_manager = match torrent {
+                TorrentEntry::Active(t) if !t.paused => &t.peer_manager,
+                TorrentEntry::Magnet(t) if !t.paused => &t.peer_manager,
+                _ => continue,
+            };
+
+            for (addr, handle) in peer_manager.get_socket_handles() {
+                all_handles.push((infohash.clone(), addr, handle));
+            }
+        }
+
+        if all_handles.is_empty() {
+            // No connected peers, just run logic ticks
+            for torrent in self.torrents.values_mut() {
+                match torrent {
+                    TorrentEntry::Active(t) if !t.paused => t.peer_manager.tick_logic(),
+                    TorrentEntry::Magnet(t) if !t.paused => t.peer_manager.tick_logic(),
+                    _ => {}
+                }
+            }
+            return log_lines;
+        }
+
+        // Phase 2: Poll for readiness (single syscall)
+        let raw_handles: Vec<RawSocket> = all_handles.iter().map(|(_, _, h)| *h).collect();
+        let ready_indices = match poll_readable_sockets(&raw_handles, POLL_TIMEOUT_MS) {
+            Ok(indices) => indices,
+            Err(e) => {
+                log_lines.push(format!("poll_readable_sockets error: {}", e));
+                // Fall back to running all logic ticks
+                for torrent in self.torrents.values_mut() {
+                    match torrent {
+                        TorrentEntry::Active(t) if !t.paused => t.peer_manager.tick_logic(),
+                        TorrentEntry::Magnet(t) if !t.paused => t.peer_manager.tick_logic(),
+                        _ => {}
+                    }
+                }
+                return log_lines;
+            }
+        };
+
+        // Phase 3: Process only ready peers
+        let mut pex_updates: HashMap<String, (HashSet<SocketAddrV4>, HashSet<SocketAddrV4>)> = HashMap::new();
+        let mut peers_to_remove: Vec<(String, SocketAddrV4)> = Vec::new();
+
+        for idx in &ready_indices {
+            let (infohash, addr, _) = &all_handles[*idx];
+
+            let torrent = match self.torrents.get_mut(infohash) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            let (peer_manager, storage) = match torrent {
+                TorrentEntry::Active(t) if !t.paused => (&mut t.peer_manager, Some(&mut t.storage)),
+                TorrentEntry::Magnet(t) if !t.paused => (&mut t.peer_manager, None),
+                _ => continue,
+            };
+
+            // Tick this specific peer
+            match peer_manager.tick_peer(addr) {
+                Ok(blocks) => {
+                    // Write received blocks to storage
+                    if let Some(storage) = storage {
+                        for (index, begin, data) in blocks {
+                            let _ = storage.write_block(index as u64, begin, &data);
+                        }
+                    }
+
+                    // Request more blocks if unchoked
+                    peer_manager.request_blocks_for_peer(addr);
+                }
+                Err(_) => {
+                    peers_to_remove.push((infohash.clone(), *addr));
+                }
+            }
+        }
+
+        // Phase 4: Run logic tick for all torrents (timers, connections, etc.)
+        let mut pieces_received: HashMap<String, Vec<u32>> = HashMap::new();
+
+        for (infohash, torrent) in self.torrents.iter_mut() {
+            let (peer_manager, storage, stats) = match torrent {
+                TorrentEntry::Active(t) if !t.paused => {
+                    (&mut t.peer_manager, Some(&mut t.storage), &mut t.stats)
+                }
+                TorrentEntry::Magnet(t) if !t.paused => {
+                    (&mut t.peer_manager, None, &mut t.stats)
+                }
+                _ => continue,
+            };
+
+            // Run timer-based logic (connection attempts, block timeouts)
+            peer_manager.tick_logic();
+
+            // Poll storage for verified pieces
+            if let Some(storage) = storage {
+                for piece_index in storage.poll_verifications() {
+                    pieces_received.entry(infohash.clone())
+                        .or_insert_with(Vec::new)
+                        .push(piece_index as u32);
+                }
+            }
+
+            // Update stats
+            stats.connected_peers = peer_manager.connected_peer_count() as u32;
+        }
+
+        // Phase 5: Remove failed peers
+        for (infohash, addr) in peers_to_remove {
+            if let Some(torrent) = self.torrents.get_mut(&infohash) {
+                match torrent {
+                    TorrentEntry::Active(t) => t.peer_manager.remove_peer(&addr),
+                    TorrentEntry::Magnet(t) => t.peer_manager.remove_peer(&addr),
                 }
             }
         }

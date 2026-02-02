@@ -1,6 +1,14 @@
 use anyhow::Result;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 
+/// Opaque raw socket handle type for readiness polling.
+/// On Windows this is SOCKET (usize), on Unix this is RawFd (i32).
+#[cfg(target_os = "windows")]
+pub type RawSocket = usize;
+
+#[cfg(not(target_os = "windows"))]
+pub type RawSocket = i32;
+
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::*;
@@ -8,13 +16,24 @@ mod windows_impl {
         self, INVALID_SOCKET, SOCKET, SOCKET_ERROR, WSADATA, AF_INET, AF_INET6, SOCK_STREAM,
         IPPROTO_TCP, FIONBIO, SOCKADDR_IN, SOCKADDR_IN6, SD_BOTH, WSAEWOULDBLOCK, WSAEINPROGRESS,
         WSAECONNRESET, FD_SET, TIMEVAL,
-        SOL_SOCKET, SO_ERROR, SO_RCVTIMEO, SO_SNDTIMEO, SO_KEEPALIVE, IPV6_V6ONLY,
+        SOL_SOCKET, SO_ERROR, SO_RCVTIMEO, SO_SNDTIMEO, SO_KEEPALIVE, SO_RCVBUF, SO_SNDBUF, IPV6_V6ONLY,
     };
 
     const MAX_RECV_BUFFER: usize = 65536;
     const CONNECT_TIMEOUT_MS: u32 = 10000;
     const RECV_TIMEOUT_MS: u32 = 30000;
     const SEND_TIMEOUT_MS: u32 = 30000;
+
+    /// Conservative TCP buffer sizes (Step 3: TCP Tuning)
+    /// 512KB is sufficient to buffer 20ms of data at ~200Mbps per peer.
+    /// Total Kernel Memory for 500 peers: ~250MB (Safe).
+    pub const SO_RCVBUF_SIZE: i32 = 512 * 1024;
+    pub const SO_SNDBUF_SIZE: i32 = 256 * 1024;
+    /// For high-priority peers (fast uploaders), dynamically upgrade to 2MB
+    pub const SO_RCVBUF_SIZE_PRIORITY: i32 = 2 * 1024 * 1024;
+
+    /// Maximum sockets that can be polled in a single select() call (Windows FD_SETSIZE).
+    const MAX_POLL_SOCKETS: usize = 64;
 
     pub struct TcpSocket {
         socket: SOCKET,
@@ -118,6 +137,8 @@ mod windows_impl {
             sock.set_nonblocking(true)?;
             sock.set_timeouts(RECV_TIMEOUT_MS, SEND_TIMEOUT_MS)?;
             sock.set_keepalive(true)?;
+            // Apply TCP buffer tuning for optimal throughput (RFC-101 Step 3)
+            let _ = sock.apply_default_tuning();
 
             Ok(sock)
         }
@@ -237,6 +258,8 @@ mod windows_impl {
             self.set_nonblocking(false)?;
             self.set_timeouts(RECV_TIMEOUT_MS, SEND_TIMEOUT_MS)?;
             self.set_keepalive(true)?;
+            // Apply TCP buffer tuning for optimal throughput (RFC-101 Step 3)
+            let _ = self.apply_default_tuning();
 
             self.connected = true;
             self.peer_addr = Some(addr);
@@ -387,6 +410,29 @@ mod windows_impl {
             }
         }
 
+        /// Returns the raw socket handle for use with poll_readable_sockets().
+        /// The socket remains owned by this TcpSocket.
+        pub fn raw_socket(&self) -> super::RawSocket {
+            self.socket as super::RawSocket
+        }
+
+        /// Sets the TCP buffer sizes for this socket (RFC-101 Step 3).
+        /// Uses conservative defaults that balance throughput with memory usage.
+        pub fn set_buffer_sizes(&self, recv_size: i32, send_size: i32) -> Result<()> {
+            let _ = set_socket_buffer_sizes(self.socket, recv_size, send_size)?;
+            Ok(())
+        }
+
+        /// Applies default TCP buffer tuning for peer connections.
+        pub fn apply_default_tuning(&self) -> Result<()> {
+            self.set_buffer_sizes(SO_RCVBUF_SIZE, SO_SNDBUF_SIZE)
+        }
+
+        /// Applies priority TCP buffer tuning for fast peers.
+        pub fn apply_priority_tuning(&self) -> Result<()> {
+            self.set_buffer_sizes(SO_RCVBUF_SIZE_PRIORITY, SO_SNDBUF_SIZE)
+        }
+
         pub fn close(&mut self) {
             if self.socket != INVALID_SOCKET {
                 unsafe {
@@ -461,6 +507,145 @@ mod windows_impl {
         }
         Ok(())
     }
+
+    /// Polls multiple sockets for read readiness using select().
+    /// Returns the indices of sockets that are ready to read.
+    ///
+    /// This reduces syscall overhead from O(N) recv() calls per tick to a single
+    /// select() call, addressing the "polling storm" bottleneck (RFC-101 Step 1).
+    ///
+    /// # Arguments
+    /// * `sockets` - Slice of raw socket handles to poll
+    /// * `timeout_ms` - Timeout in milliseconds (0 = immediate return)
+    ///
+    /// # Returns
+    /// Vector of indices into the input slice that are ready to read
+    pub fn poll_readable_sockets(sockets: &[super::RawSocket], timeout_ms: u32) -> Result<Vec<usize>> {
+        if sockets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        init_winsock()?;
+
+        let mut ready_indices = Vec::new();
+
+        // Process sockets in batches of MAX_POLL_SOCKETS (FD_SETSIZE limit)
+        for batch_start in (0..sockets.len()).step_by(MAX_POLL_SOCKETS) {
+            let batch_end = (batch_start + MAX_POLL_SOCKETS).min(sockets.len());
+            let batch = &sockets[batch_start..batch_end];
+
+            let mut read_set = FD_SET {
+                fd_count: batch.len() as u32,
+                fd_array: [0; 64],
+            };
+
+            for (i, &socket) in batch.iter().enumerate() {
+                read_set.fd_array[i] = socket as SOCKET;
+            }
+
+            // Use short timeout for first batch, zero for subsequent batches
+            let batch_timeout = if batch_start == 0 { timeout_ms } else { 0 };
+            let timeout = TIMEVAL {
+                tv_sec: (batch_timeout / 1000) as i32,
+                tv_usec: ((batch_timeout % 1000) * 1000) as i32,
+            };
+
+            let result = unsafe {
+                WinSock::select(
+                    0, // Ignored on Windows
+                    &mut read_set,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &timeout,
+                )
+            };
+
+            if result == SOCKET_ERROR {
+                let err = get_last_error();
+                // WSAENOTSOCK (10038) means socket is invalid, skip it
+                if err == 10038 {
+                    continue;
+                }
+                anyhow::bail!("select() failed: error {}", err);
+            }
+
+            if result > 0 {
+                // Check which sockets in this batch are ready
+                for (i, &socket) in batch.iter().enumerate() {
+                    let is_set = unsafe {
+                        // Manually check if socket is in the set
+                        let mut found = false;
+                        for j in 0..read_set.fd_count as usize {
+                            if read_set.fd_array[j] == socket as SOCKET {
+                                found = true;
+                                break;
+                            }
+                        }
+                        found
+                    };
+                    if is_set {
+                        ready_indices.push(batch_start + i);
+                    }
+                }
+            }
+        }
+
+        Ok(ready_indices)
+    }
+
+    /// Sets the receive and send buffer sizes on a socket.
+    /// Returns the actual buffer sizes set by the OS.
+    pub fn set_socket_buffer_sizes(socket: SOCKET, recv_size: i32, send_size: i32) -> Result<(i32, i32)> {
+        let result = unsafe {
+            WinSock::setsockopt(
+                socket,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                &recv_size as *const i32 as *const u8,
+                std::mem::size_of::<i32>() as i32,
+            )
+        };
+        if result == SOCKET_ERROR {
+            anyhow::bail!("setsockopt(SO_RCVBUF) failed: {}", get_last_error());
+        }
+
+        let result = unsafe {
+            WinSock::setsockopt(
+                socket,
+                SOL_SOCKET,
+                SO_SNDBUF,
+                &send_size as *const i32 as *const u8,
+                std::mem::size_of::<i32>() as i32,
+            )
+        };
+        if result == SOCKET_ERROR {
+            anyhow::bail!("setsockopt(SO_SNDBUF) failed: {}", get_last_error());
+        }
+
+        // Get actual sizes set
+        let mut actual_recv: i32 = 0;
+        let mut actual_send: i32 = 0;
+        let mut len = std::mem::size_of::<i32>() as i32;
+
+        unsafe {
+            WinSock::getsockopt(
+                socket,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                &mut actual_recv as *mut i32 as *mut u8,
+                &mut len,
+            );
+            WinSock::getsockopt(
+                socket,
+                SOL_SOCKET,
+                SO_SNDBUF,
+                &mut actual_send as *mut i32 as *mut u8,
+                &mut len,
+            );
+        }
+
+        Ok((actual_recv, actual_send))
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -468,7 +653,13 @@ mod unix_impl {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpStream;
+    use std::os::unix::io::AsRawFd;
     use std::time::Duration;
+
+    /// Conservative TCP buffer sizes (Step 3: TCP Tuning)
+    pub const SO_RCVBUF_SIZE: i32 = 512 * 1024;
+    pub const SO_SNDBUF_SIZE: i32 = 256 * 1024;
+    pub const SO_RCVBUF_SIZE_PRIORITY: i32 = 2 * 1024 * 1024;
 
     pub struct TcpSocket {
         stream: Option<TcpStream>,
@@ -573,6 +764,28 @@ mod unix_impl {
             }
         }
 
+        /// Returns the raw file descriptor for use with poll_readable_sockets().
+        pub fn raw_socket(&self) -> super::RawSocket {
+            self.stream.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1)
+        }
+
+        /// Sets TCP buffer sizes (no-op on Unix as we use system defaults).
+        pub fn set_buffer_sizes(&self, _recv_size: i32, _send_size: i32) -> Result<()> {
+            // On Unix, the buffer sizes are typically managed by the kernel
+            // and set via sysctl. We keep the method for API compatibility.
+            Ok(())
+        }
+
+        /// Applies default TCP buffer tuning (no-op on Unix).
+        pub fn apply_default_tuning(&self) -> Result<()> {
+            Ok(())
+        }
+
+        /// Applies priority TCP buffer tuning (no-op on Unix).
+        pub fn apply_priority_tuning(&self) -> Result<()> {
+            Ok(())
+        }
+
         pub fn close(&mut self) {
             self.stream = None;
             self.peer_addr = None;
@@ -584,13 +797,57 @@ mod unix_impl {
             self.close();
         }
     }
+
+    /// Polls multiple sockets for read readiness using poll() on Unix.
+    pub fn poll_readable_sockets(sockets: &[super::RawSocket], timeout_ms: u32) -> Result<Vec<usize>> {
+        use libc::{poll, pollfd, POLLIN};
+
+        if sockets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut pollfds: Vec<pollfd> = sockets
+            .iter()
+            .map(|&fd| pollfd {
+                fd,
+                events: POLLIN,
+                revents: 0,
+            })
+            .collect();
+
+        let result = unsafe { poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout_ms as i32) };
+
+        if result < 0 {
+            let err = std::io::Error::last_os_error();
+            // EINTR is not fatal
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(Vec::new());
+            }
+            anyhow::bail!("poll() failed: {}", err);
+        }
+
+        let mut ready_indices = Vec::new();
+        for (i, pfd) in pollfds.iter().enumerate() {
+            if pfd.revents & POLLIN != 0 {
+                ready_indices.push(i);
+            }
+        }
+
+        Ok(ready_indices)
+    }
 }
 
 #[cfg(target_os = "windows")]
 pub use windows_impl::TcpSocket;
 
+#[cfg(target_os = "windows")]
+pub use windows_impl::{poll_readable_sockets, SO_RCVBUF_SIZE, SO_SNDBUF_SIZE, SO_RCVBUF_SIZE_PRIORITY};
+
 #[cfg(not(target_os = "windows"))]
 pub use unix_impl::TcpSocket;
+
+#[cfg(not(target_os = "windows"))]
+pub use unix_impl::{poll_readable_sockets, SO_RCVBUF_SIZE, SO_SNDBUF_SIZE, SO_RCVBUF_SIZE_PRIORITY};
 
 #[cfg(test)]
 mod tests {

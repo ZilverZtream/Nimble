@@ -115,6 +115,15 @@ impl MseHandshake {
             .expect("invalid DH prime");
 
         let peer_pub = BigUint::from_bytes_be(peer_public_key);
+
+        let zero = BigUint::from(0u32);
+        let one = BigUint::from(1u32);
+        let p_minus_one = &prime - &one;
+
+        if peer_pub == zero || peer_pub == one || peer_pub == p_minus_one || peer_pub >= prime {
+            panic!("invalid DH public key: weak or out-of-range key rejected");
+        }
+
         let shared = peer_pub.modpow(&self.private_key, &prime);
         let mut shared_bytes = shared.to_bytes_be();
 
@@ -178,15 +187,8 @@ impl MseHandshake {
 }
 
 fn generate_random_key() -> BigUint {
-    let mut bytes = [0u8; 20];
-    let r1 = fastrand::u64(..);
-    let r2 = fastrand::u64(..);
-    let r3 = fastrand::u32(..);
-
-    bytes[0..8].copy_from_slice(&r1.to_be_bytes());
-    bytes[8..16].copy_from_slice(&r2.to_be_bytes());
-    bytes[16..20].copy_from_slice(&r3.to_be_bytes()[0..4]);
-
+    let bytes = nimble_util::ids::generate_random_bytes::<20>()
+        .expect("failed to generate cryptographically secure random key");
     BigUint::from_bytes_be(&bytes)
 }
 

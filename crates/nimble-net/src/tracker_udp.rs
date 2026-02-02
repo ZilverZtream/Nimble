@@ -243,18 +243,9 @@ impl UdpTracker {
 }
 
 fn generate_transaction_id() -> u32 {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-
-    let state = RandomState::new();
-    let mut hasher = state.build_hasher();
-    hasher.write_u64(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64,
-    );
-    hasher.finish() as u32
+    let bytes = nimble_util::ids::generate_random_bytes::<4>()
+        .expect("failed to generate transaction ID");
+    u32::from_be_bytes(bytes)
 }
 
 fn calculate_timeout(retry: u32) -> Duration {

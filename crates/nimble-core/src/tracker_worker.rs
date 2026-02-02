@@ -1,14 +1,15 @@
 use nimble_net::tracker_http::{announce, AnnounceRequest as HttpAnnounceRequest, TrackerEvent};
 use nimble_net::tracker_udp::{UdpTracker, UdpAnnounceRequest, UdpTrackerEvent};
 use std::net::{SocketAddrV4, ToSocketAddrs};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 const WORKER_THREAD_COUNT: usize = 4;
+const ANNOUNCE_QUEUE_DEPTH: usize = 256;
 
 pub struct AnnounceWorker {
-    task_tx: Sender<AnnounceTask>,
+    task_tx: SyncSender<AnnounceTask>,
     result_rx: Receiver<AnnounceResult>,
     _workers: Vec<JoinHandle<()>>,
 }
@@ -37,8 +38,8 @@ pub struct AnnounceResult {
 
 impl AnnounceWorker {
     pub fn new() -> Self {
-        let (task_tx, task_rx) = channel::<AnnounceTask>();
-        let (result_tx, result_rx) = channel::<AnnounceResult>();
+        let (task_tx, task_rx) = sync_channel::<AnnounceTask>(ANNOUNCE_QUEUE_DEPTH);
+        let (result_tx, result_rx) = sync_channel::<AnnounceResult>(ANNOUNCE_QUEUE_DEPTH);
 
         let task_rx = Arc::new(Mutex::new(task_rx));
         let mut workers = Vec::with_capacity(WORKER_THREAD_COUNT);
@@ -83,7 +84,7 @@ impl AnnounceWorker {
     }
 
     pub fn submit_announce(&self, task: AnnounceTask) {
-        let _ = self.task_tx.send(task);
+        let _ = self.task_tx.try_send(task);
     }
 
     pub fn try_recv_result(&self) -> Option<AnnounceResult> {

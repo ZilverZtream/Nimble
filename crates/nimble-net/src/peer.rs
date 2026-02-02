@@ -21,6 +21,7 @@ const MAX_BITFIELD_BYTES: u32 = 262144;
 const MAX_EXTENDED_MESSAGE_LENGTH: u32 = 1024 * 1024;
 const BLOCK_SIZE: u32 = 16384;
 const MAX_BLOCK_SIZE: u32 = 32768;
+const MAX_REASONABLE_PIECE_SIZE: u64 = 16 * 1024 * 1024;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 const MAX_PENDING_REQUESTS: usize = 16;
 const MAX_PEER_REQUESTS: usize = 500;
@@ -78,7 +79,8 @@ fn validate_message_size(msg_len: u32, data: &[u8]) -> Result<(), anyhow::Error>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecvState {
     ReadingLength,
-    ReadingMessage { msg_len: u32 },
+    ReadingMessageType { msg_len: u32 },
+    ReadingMessage { msg_len: u32, validated: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -756,12 +758,44 @@ impl PeerConnection {
                         }
 
                         self.recv_buffer.clear();
-                        self.recv_state = RecvState::ReadingMessage { msg_len };
+                        self.recv_state = RecvState::ReadingMessageType { msg_len };
                     } else {
                         return Ok(None);
                     }
                 }
-                RecvState::ReadingMessage { msg_len } => {
+                RecvState::ReadingMessageType { msg_len } => {
+                    if self.recv_buffer.is_empty() {
+                        let read_len = 1;
+                        match self.socket.recv(&mut self.temp_recv_buf[..read_len]) {
+                            Ok(0) => {
+                                anyhow::bail!("connection closed");
+                            }
+                            Ok(n) => {
+                                let mut chunk = self.temp_recv_buf[..n].to_vec();
+                                if self.encryption_enabled {
+                                    if let Some(ref mut mse) = self.mse_handshake {
+                                        mse.decrypt(&mut chunk);
+                                    }
+                                }
+                                self.recv_buffer.extend_from_slice(&chunk);
+                            }
+                            Err(e) => {
+                                if is_timeout_error(&e) {
+                                    return Ok(None);
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+
+                    if !self.recv_buffer.is_empty() {
+                        validate_message_size(msg_len, &self.recv_buffer)?;
+                        self.recv_state = RecvState::ReadingMessage { msg_len, validated: true };
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                RecvState::ReadingMessage { msg_len, validated } => {
                     let needed = msg_len as usize - self.recv_buffer.len();
                     if needed > 0 {
                         let read_len = needed.min(TEMP_RECV_BUFFER_SIZE);
@@ -788,7 +822,6 @@ impl PeerConnection {
                     }
 
                     if self.recv_buffer.len() == msg_len as usize {
-                        validate_message_size(msg_len, &self.recv_buffer)?;
                         let msg = PeerMessage::parse(&self.recv_buffer)?;
                         self.apply_incoming_message(&msg);
                         self.recv_buffer.clear();
@@ -825,7 +858,7 @@ impl PeerConnection {
             }
             PeerMessage::Bitfield { bitfield } => {
                 let expected_bytes = (self.piece_count + 7) / 8;
-                if bitfield.len() > expected_bytes * 2 {
+                if bitfield.len() != expected_bytes {
                     return;
                 }
                 let mut bf = Bitfield::new(self.piece_count);
@@ -848,6 +881,15 @@ impl PeerConnection {
                         return;
                     }
                     if *index as usize >= self.piece_count {
+                        return;
+                    }
+                    if *begin % BLOCK_SIZE != 0 {
+                        return;
+                    }
+                    if (*begin as u64) + (*length as u64) > MAX_REASONABLE_PIECE_SIZE {
+                        return;
+                    }
+                    if (*begin as u64).checked_add(*length as u64).is_none() {
                         return;
                     }
                     if self.peer_requests.len() >= MAX_PEER_REQUESTS {

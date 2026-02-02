@@ -31,6 +31,33 @@ const QUERY_TIMEOUT_MS: u64 = 5_000;
 const MAX_PENDING_QUERIES: usize = 256;
 const MAX_NODE_IDS_PER_IP: usize = 3;
 
+fn validate_node_id_for_ip(node_id: &[u8; 20], ip: &Ipv4Addr) -> bool {
+    let ip_bytes = ip.octets();
+    let rand = node_id[19];
+
+    let mut v = [0u8; 4];
+    v[0] = (ip_bytes[0] & 0x03) | ((rand & 0x07) << 5);
+    v[1] = (ip_bytes[1] & 0x0f) | ((rand >> 3) & 0x70);
+    v[2] = (ip_bytes[2] & 0x3f) | ((rand >> 5) & 0xc0);
+    v[3] = ip_bytes[3];
+
+    let expected_0 = ((v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | v[3] as u32)
+        .wrapping_mul(0x9E3779B1);
+    let expected_0 = ((expected_0 >> 24) & 0xFF) as u8;
+
+    let expected_1 = ((v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | v[3] as u32)
+        .wrapping_mul(0x9E3779B1)
+        .wrapping_add(0x12345678);
+    let expected_1 = ((expected_1 >> 24) & 0xFF) as u8;
+
+    let expected_2 = ((v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | v[3] as u32)
+        .wrapping_mul(0x9E3779B1)
+        .wrapping_add(0x23456789);
+    let expected_2 = ((expected_2 >> 24) & 0xFF) as u8;
+
+    node_id[0] == expected_0 && node_id[1] == expected_1 && node_id[2] == expected_2
+}
+
 pub struct DhtNode {
     node_id: [u8; 20],
     logged_startup: bool,
@@ -274,6 +301,10 @@ impl DhtNode {
 
     pub fn observe_node(&mut self, id: [u8; 20], addr: SocketAddrV4) -> bool {
         use crate::routing::InsertResult;
+
+        if !validate_node_id_for_ip(&id, addr.ip()) {
+            return false;
+        }
 
         let ip = *addr.ip();
         let node_ids = self.node_ids_per_ip.entry(ip).or_insert_with(HashSet::new);

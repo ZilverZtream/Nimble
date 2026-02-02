@@ -20,6 +20,7 @@ mod windows_impl {
     const MSE_VC_LENGTH: usize = 8;
     const WSAEWOULDBLOCK: i32 = 10035;
     const WSAEINPROGRESS: i32 = 10036;
+    const MAX_MSE_INFOHASH_ATTEMPTS: usize = 8;
 
     struct SafeSocket(SOCKET);
 
@@ -507,7 +508,13 @@ mod windows_impl {
             peer_pubkey: &[u8],
             encrypted_vc: &[u8],
         ) -> Option<([u8; 20], [u8; 20], MseHandshake)> {
+            let mut attempts = 0;
             for (info_hash, entry) in registry.iter() {
+                if attempts >= MAX_MSE_INFOHASH_ATTEMPTS {
+                    break;
+                }
+                attempts += 1;
+
                 let mut candidate = base.clone_without_ciphers();
                 candidate.compute_shared_secret(peer_pubkey, info_hash);
                 let mut vc = encrypted_vc.to_vec();
@@ -609,6 +616,7 @@ mod unix_impl {
     const PROTOCOL_STRING_LENGTH: u8 = 19;
     const HANDSHAKE_LENGTH: usize = 68;
     const MSE_VC_LENGTH: usize = 8;
+    const MAX_MSE_INFOHASH_ATTEMPTS: usize = 8;
 
     pub struct PeerListener {
         listener: TcpListener,
@@ -962,7 +970,13 @@ mod unix_impl {
             peer_pubkey: &[u8],
             encrypted_vc: &[u8],
         ) -> Option<([u8; 20], [u8; 20], MseHandshake)> {
+            let mut attempts = 0;
             for (info_hash, entry) in registry.iter() {
+                if attempts >= MAX_MSE_INFOHASH_ATTEMPTS {
+                    break;
+                }
+                attempts += 1;
+
                 let mut candidate = base.clone_without_ciphers();
                 candidate.compute_shared_secret(peer_pubkey, info_hash);
                 let mut vc = encrypted_vc.to_vec();

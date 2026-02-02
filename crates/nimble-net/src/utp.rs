@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const UTP_VERSION: u8 = 1;
@@ -173,19 +172,20 @@ struct PacketPoolInner {
 
 #[derive(Clone)]
 struct PacketPool {
-    inner: Rc<RefCell<PacketPoolInner>>,
+    inner: Arc<Mutex<PacketPoolInner>>,
 }
 
 impl PacketPool {
     fn new() -> Self {
         PacketPool {
-            inner: Rc::new(RefCell::new(PacketPoolInner { buffers: Vec::new() })),
+            inner: Arc::new(Mutex::new(PacketPoolInner { buffers: Vec::new() })),
         }
     }
 
     fn checkout(&self) -> PacketBuffer {
         let buffer = self.inner
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .buffers
             .pop()
             .unwrap_or_else(|| Box::new([0u8; PACKET_POOL_BUFFER_SIZE]));
@@ -198,7 +198,7 @@ impl PacketPool {
     }
 
     fn checkin(&self, buffer: Box<[u8; PACKET_POOL_BUFFER_SIZE]>) {
-        self.inner.borrow_mut().buffers.push(buffer);
+        self.inner.lock().unwrap().buffers.push(buffer);
     }
 }
 
@@ -415,7 +415,7 @@ pub struct UtpSocket {
 }
 
 impl UtpSocket {
-    pub fn new_outgoing(addr: SocketAddr) -> Self {
+    pub fn new_outgoing(addr: SocketAddr, packet_pool: PacketPool) -> Self {
         let conn_id = rand_u16();
         let now = Instant::now();
         UtpSocket {
@@ -446,11 +446,11 @@ impl UtpSocket {
             reorder_buffer: HashMap::new(),
             reorder_buffer_bytes: 0,
             sack_ranges: Vec::new(),
-            packet_pool: PacketPool::new(),
+            packet_pool,
         }
     }
 
-    pub fn new_incoming(addr: SocketAddr, conn_id: u16, seq_nr: u16, timestamp_us: u32) -> Self {
+    pub fn new_incoming(addr: SocketAddr, conn_id: u16, seq_nr: u16, timestamp_us: u32, packet_pool: PacketPool) -> Self {
         let now = Instant::now();
         let timestamp_diff = micros_since(&now).saturating_sub(timestamp_us);
         UtpSocket {
@@ -481,7 +481,7 @@ impl UtpSocket {
             reorder_buffer: HashMap::new(),
             reorder_buffer_bytes: 0,
             sack_ranges: Vec::new(),
-            packet_pool: PacketPool::new(),
+            packet_pool,
         }
     }
 
@@ -967,6 +967,7 @@ pub struct UtpMultiplexer {
     sockets: HashMap<(SocketAddr, u16), UtpSocket>,
     pending_incoming: VecDeque<UtpSocket>,
     bound_addr: SocketAddr,
+    packet_pool: PacketPool,
 }
 
 impl UtpMultiplexer {
@@ -975,11 +976,12 @@ impl UtpMultiplexer {
             sockets: HashMap::new(),
             pending_incoming: VecDeque::new(),
             bound_addr,
+            packet_pool: PacketPool::new(),
         }
     }
 
     pub fn connect(&mut self, addr: SocketAddr) -> Result<u16> {
-        let mut socket = UtpSocket::new_outgoing(addr);
+        let mut socket = UtpSocket::new_outgoing(addr, self.packet_pool.clone());
         socket.initiate_connect();
         let conn_id = socket.conn_id_recv();
         self.sockets.insert((addr, conn_id), socket);
@@ -1004,7 +1006,7 @@ impl UtpMultiplexer {
         let (header, _) = UtpHeader::parse(data)?;
 
         if header.packet_type == PacketType::Syn {
-            let mut socket = UtpSocket::new_incoming(from, header.connection_id, header.seq_nr, header.timestamp_us);
+            let mut socket = UtpSocket::new_incoming(from, header.connection_id, header.seq_nr, header.timestamp_us, self.packet_pool.clone());
             socket.accept();
             socket.flush_outgoing(&mut send_fn)?;
             self.pending_incoming.push_back(socket);
@@ -1625,7 +1627,8 @@ mod tests {
     #[test]
     fn test_socket_outgoing_creation() {
         let addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 6881));
-        let socket = UtpSocket::new_outgoing(addr);
+        let pool = PacketPool::new();
+        let socket = UtpSocket::new_outgoing(addr, pool);
         assert_eq!(socket.state(), ConnectionState::Idle);
         assert_eq!(socket.addr(), addr);
     }
@@ -1633,7 +1636,8 @@ mod tests {
     #[test]
     fn test_socket_initiate_connect() {
         let addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 6881));
-        let mut socket = UtpSocket::new_outgoing(addr);
+        let pool = PacketPool::new();
+        let mut socket = UtpSocket::new_outgoing(addr, pool);
         socket.initiate_connect();
         assert_eq!(socket.state(), ConnectionState::SynSent);
         let packet = socket.inflight.values().next().expect("missing syn packet");
@@ -1685,7 +1689,8 @@ mod tests {
     #[test]
     fn test_socket_send_buffer() {
         let addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 6881));
-        let mut socket = UtpSocket::new_outgoing(addr);
+        let pool = PacketPool::new();
+        let mut socket = UtpSocket::new_outgoing(addr, pool);
         socket.state = ConnectionState::Connected;
         let data = vec![0u8; 1000];
         let sent = socket.send(&data).unwrap();
@@ -1695,7 +1700,8 @@ mod tests {
     #[test]
     fn test_socket_recv_buffer() {
         let addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 6881));
-        let mut socket = UtpSocket::new_outgoing(addr);
+        let pool = PacketPool::new();
+        let mut socket = UtpSocket::new_outgoing(addr, pool);
         socket.recv_buffer.extend(&[1, 2, 3, 4, 5]);
         let mut buf = [0u8; 10];
         let read = socket.recv(&mut buf);

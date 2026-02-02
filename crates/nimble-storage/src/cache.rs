@@ -127,28 +127,26 @@ impl CacheWorker {
 
     fn flush_oldest(&mut self, target_bytes: usize) -> Result<()> {
         let mut flushed = 0;
-        let mut writes_to_flush = Vec::new();
 
         while flushed < target_bytes {
-            match self.pending_writes.pop_front() {
+            match self.pending_writes.front().cloned() {
                 Some(write) => {
-                    flushed += write.data.len();
-                    writes_to_flush.push(write);
+                    let write_size = write.data.len();
+                    self.write_to_disk(&write)?;
+                    self.pending_writes.pop_front();
+                    flushed += write_size;
                 }
                 None => break,
             }
-        }
-
-        for write in writes_to_flush {
-            self.write_to_disk(&write)?;
         }
 
         Ok(())
     }
 
     fn flush_all(&mut self) -> Result<()> {
-        while let Some(write) = self.pending_writes.pop_front() {
+        while let Some(write) = self.pending_writes.front().cloned() {
             self.write_to_disk(&write)?;
+            self.pending_writes.pop_front();
         }
 
         for file in self.file_handles.values_mut() {

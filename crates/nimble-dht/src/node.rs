@@ -1,3 +1,4 @@
+use nimble_util::hash::crc32c;
 use nimble_util::ids::dht_node_id_20;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -56,21 +57,9 @@ fn validate_node_id_for_ipv4v4(node_id: &[u8; 20], ip: &Ipv4Addr) -> bool {
     v[2] = (ip_bytes[2] & 0x3f) | ((rand >> 5) & 0xc0);
     v[3] = ip_bytes[3];
 
-    let expected_0 = ((v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | v[3] as u32)
-        .wrapping_mul(0x9E3779B1);
-    let expected_0 = ((expected_0 >> 24) & 0xFF) as u8;
+    let hash = crc32c(&v).to_be_bytes();
 
-    let expected_1 = ((v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | v[3] as u32)
-        .wrapping_mul(0x9E3779B1)
-        .wrapping_add(0x12345678);
-    let expected_1 = ((expected_1 >> 24) & 0xFF) as u8;
-
-    let expected_2 = ((v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | v[3] as u32)
-        .wrapping_mul(0x9E3779B1)
-        .wrapping_add(0x23456789);
-    let expected_2 = ((expected_2 >> 24) & 0xFF) as u8;
-
-    node_id[0] == expected_0 && node_id[1] == expected_1 && node_id[2] == expected_2
+    node_id[0] == hash[0] && node_id[1] == hash[1] && node_id[2] == hash[2]
 }
 
 #[cfg(feature = "ipv6")]
@@ -1066,7 +1055,7 @@ mod tests {
     use crate::rpc::{encode_message, Message, Query, QueryKind};
     use std::net::{Ipv4Addr, SocketAddrV4};
 
-    fn node_id_for_ipv4v4(ip: Ipv4Addr, rand: u8) -> [u8; 20] {
+    fn node_id_for_ipv4(ip: Ipv4Addr, rand: u8) -> [u8; 20] {
         let ip_bytes = ip.octets();
         let mut v = [0u8; 4];
         v[0] = (ip_bytes[0] & 0x03) | ((rand & 0x07) << 5);
@@ -1074,16 +1063,12 @@ mod tests {
         v[2] = (ip_bytes[2] & 0x3f) | ((rand >> 5) & 0xc0);
         v[3] = ip_bytes[3];
 
-        let hash_base = (v[0] as u32) << 24 | (v[1] as u32) << 16 | (v[2] as u32) << 8 | v[3] as u32;
-
-        let expected_0 = (hash_base.wrapping_mul(0x9E3779B1) >> 24) as u8;
-        let expected_1 = (hash_base.wrapping_mul(0x9E3779B1).wrapping_add(0x12345678) >> 24) as u8;
-        let expected_2 = (hash_base.wrapping_mul(0x9E3779B1).wrapping_add(0x23456789) >> 24) as u8;
+        let hash = crc32c(&v).to_be_bytes();
 
         let mut node_id = [0u8; 20];
-        node_id[0] = expected_0;
-        node_id[1] = expected_1;
-        node_id[2] = expected_2;
+        node_id[0] = hash[0];
+        node_id[1] = hash[1];
+        node_id[2] = hash[2];
         node_id[19] = rand;
         node_id
     }

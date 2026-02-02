@@ -10,8 +10,6 @@ use std::thread;
 #[cfg(not(windows))]
 use std::time::Duration;
 #[cfg(windows)]
-use windows_sys::core::w;
-#[cfg(windows)]
 use windows_sys::Win32::Foundation::GetLastError;
 #[cfg(windows)]
 use windows_sys::Win32::Networking::WinHttp::*;
@@ -147,8 +145,9 @@ fn build_query_string(req: &AnnounceRequest) -> Result<String> {
 #[cfg(windows)]
 fn http_get_async(url: &str, request_id: u64, sender: Sender<HttpAnnounceEvent>) -> Result<()> {
     unsafe {
+        let user_agent = to_wide("Nimble/1.0");
         let h_session = WinHttpOpen(
-            w!("Nimble/1.0"),
+            user_agent.as_ptr(),
             WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
             std::ptr::null(),
             std::ptr::null(),
@@ -188,9 +187,10 @@ unsafe fn http_get_async_inner(
         0
     };
 
+    let method_wide = to_wide("GET");
     let h_request = WinHttpOpenRequest(
         h_connect,
-        w!("GET"),
+        method_wide.as_ptr(),
         path_wide.as_ptr(),
         std::ptr::null(),
         std::ptr::null(),

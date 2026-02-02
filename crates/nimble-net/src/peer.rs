@@ -429,6 +429,15 @@ impl PeerConnection {
         Self::new(SocketAddr::V4(addr), info_hash, our_peer_id, piece_count)
     }
 
+    pub fn new_v6(
+        addr: SocketAddrV6,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        piece_count: usize,
+    ) -> Result<Self> {
+        Self::new(SocketAddr::V6(addr), info_hash, our_peer_id, piece_count)
+    }
+
     pub fn with_options(
         addr: SocketAddr,
         info_hash: [u8; 20],
@@ -1653,6 +1662,15 @@ impl AnyPeerConnection {
         Ok(AnyPeerConnection::Tcp(PeerConnection::new_v4(addr, info_hash, our_peer_id, piece_count)?))
     }
 
+    pub fn new_tcp_v6(
+        addr: SocketAddrV6,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        piece_count: usize,
+    ) -> Result<Self> {
+        Ok(AnyPeerConnection::Tcp(PeerConnection::new_v6(addr, info_hash, our_peer_id, piece_count)?))
+    }
+
     pub fn new_utp(
         addr: SocketAddr,
         info_hash: [u8; 20],
@@ -1676,6 +1694,20 @@ impl AnyPeerConnection {
         piece_count: usize,
     ) -> Result<Self> {
         Ok(AnyPeerConnection::Utp(crate::utp_peer::UtpPeerConnection::new_v4(
+            addr,
+            info_hash,
+            our_peer_id,
+            piece_count,
+        )?))
+    }
+
+    pub fn new_utp_v6(
+        addr: SocketAddrV6,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        piece_count: usize,
+    ) -> Result<Self> {
+        Ok(AnyPeerConnection::Utp(crate::utp_peer::UtpPeerConnection::new_v6(
             addr,
             info_hash,
             our_peer_id,

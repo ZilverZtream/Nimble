@@ -418,18 +418,42 @@ impl PeerManager {
             self.connection_attempts.push_back(now);
             attempts += 1;
 
-            let v4_addr = match addr {
-                SocketAddr::V4(a) => a,
-                SocketAddr::V6(_) => {
-                    continue;
-                }
-            };
-
             let use_utp = self.should_use_utp(&addr);
-            let conn_result = if use_utp {
-                AnyPeerConnection::new_utp_v4(v4_addr, self.info_hash, self.peer_id, self.piece_count)
-            } else {
-                AnyPeerConnection::new_tcp_v4(v4_addr, self.info_hash, self.peer_id, self.piece_count)
+            let conn_result = match addr {
+                SocketAddr::V4(v4_addr) => {
+                    if use_utp {
+                        AnyPeerConnection::new_utp_v4(
+                            v4_addr,
+                            self.info_hash,
+                            self.peer_id,
+                            self.piece_count,
+                        )
+                    } else {
+                        AnyPeerConnection::new_tcp_v4(
+                            v4_addr,
+                            self.info_hash,
+                            self.peer_id,
+                            self.piece_count,
+                        )
+                    }
+                }
+                SocketAddr::V6(v6_addr) => {
+                    if use_utp {
+                        AnyPeerConnection::new_utp_v6(
+                            v6_addr,
+                            self.info_hash,
+                            self.peer_id,
+                            self.piece_count,
+                        )
+                    } else {
+                        AnyPeerConnection::new_tcp_v6(
+                            v6_addr,
+                            self.info_hash,
+                            self.peer_id,
+                            self.piece_count,
+                        )
+                    }
+                }
             };
 
             let mut conn = match conn_result {
@@ -939,6 +963,7 @@ impl PiecePicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv6Addr, SocketAddrV6};
 
     #[test]
     fn test_piece_picker_new() {
@@ -962,5 +987,20 @@ mod tests {
         assert_eq!(picker.availability[3], 2);
         picker.update_availability(3, false);
         assert_eq!(picker.availability[3], 1);
+    }
+
+    #[test]
+    fn ipv6_candidates_are_attempted() {
+        let mut manager = PeerManager::new([1u8; 20], [2u8; 20], 1, 16384, 16384);
+        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1, 0, 0));
+        manager.add_peers(&[addr]);
+
+        manager.connect_to_candidates();
+
+        assert!(!manager.candidate_peers.contains(&addr));
+        assert!(
+            manager.peers.contains_key(&addr) || manager.failed_peers.contains_key(&addr),
+            "IPv6 candidate was skipped instead of being attempted"
+        );
     }
 }

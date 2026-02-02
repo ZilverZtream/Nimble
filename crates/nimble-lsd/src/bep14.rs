@@ -8,6 +8,7 @@ const LSD_PORT: u16 = 6771;
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(120);
 const MIN_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
 const PEER_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_MESSAGES_PER_TICK: usize = 100;
 
 pub struct LsdClient {
     socket: Option<UdpSocket>,
@@ -191,6 +192,10 @@ impl LsdClient {
         let mut messages_to_process = Vec::new();
 
         loop {
+            if messages_to_process.len() >= MAX_MESSAGES_PER_TICK {
+                break;
+            }
+
             let socket = self.socket.as_ref().unwrap();
             match socket.recv_from(&mut buf) {
                 Ok((n, addr)) => {

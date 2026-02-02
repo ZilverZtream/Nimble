@@ -13,7 +13,8 @@ use crate::disk_worker::{DiskWorker, DiskRequest, DiskResult};
 const BLOCK_SIZE: u32 = 16384;
 const RESUME_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const STALE_PIECE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-const MAX_PENDING_PIECES: usize = 256;
+const MAX_PENDING_PIECES: usize = 16;
+const MAX_PENDING_MEMORY: u64 = 512 * 1024 * 1024;
 
 pub struct DiskStorage {
     layout: FileLayout,
@@ -22,6 +23,7 @@ pub struct DiskStorage {
     pieces: Vec<[u8; 20]>,
     bitfield: Bitfield,
     pending_pieces: HashMap<u64, PendingPiece>,
+    pending_memory: u64,
     verifying_pieces: HashMap<u64, ()>,
     writing_pieces: HashMap<u64, ()>,
     failed_pieces: Vec<u64>,
@@ -72,6 +74,7 @@ impl DiskStorage {
         )?;
 
         let mut pending_pieces = HashMap::new();
+        let mut pending_memory = 0u64;
 
         if let Ok(Some(checkpoint)) = checkpoint_manager.load_checkpoint() {
             let piece_len = if checkpoint.piece_index == piece_count as u64 - 1 {
@@ -89,6 +92,7 @@ impl DiskStorage {
                 checkpoint.data_offset,
                 piece_len as usize,
             ) {
+                pending_memory += data.len() as u64;
                 pending_pieces.insert(checkpoint.piece_index, PendingPiece {
                     data,
                     received_blocks: checkpoint.received_blocks,
@@ -106,6 +110,7 @@ impl DiskStorage {
             pieces: info.pieces.clone(),
             bitfield,
             pending_pieces,
+            pending_memory,
             verifying_pieces: HashMap::new(),
             writing_pieces: HashMap::new(),
             failed_pieces: Vec::new(),
@@ -177,10 +182,16 @@ impl DiskStorage {
         let block_count = ((piece_len + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64) as u32;
         let block_index = block_offset / BLOCK_SIZE;
 
-        if !self.pending_pieces.contains_key(&piece_index) && self.pending_pieces.len() >= MAX_PENDING_PIECES {
-            anyhow::bail!("too many pending pieces: {} (max {})", self.pending_pieces.len(), MAX_PENDING_PIECES);
+        if !self.pending_pieces.contains_key(&piece_index) {
+            if self.pending_pieces.len() >= MAX_PENDING_PIECES {
+                anyhow::bail!("too many pending pieces: {} (max {})", self.pending_pieces.len(), MAX_PENDING_PIECES);
+            }
+            if self.pending_memory + piece_len > MAX_PENDING_MEMORY {
+                anyhow::bail!("pending memory limit exceeded: {} + {} > {}", self.pending_memory, piece_len, MAX_PENDING_MEMORY);
+            }
         }
 
+        let is_new_piece = !self.pending_pieces.contains_key(&piece_index);
         let pending = self.pending_pieces.entry(piece_index).or_insert_with(|| {
             PendingPiece {
                 data: vec![0u8; piece_len as usize],
@@ -188,6 +199,10 @@ impl DiskStorage {
                 last_updated: std::time::Instant::now(),
             }
         });
+
+        if is_new_piece {
+            self.pending_memory += piece_len;
+        }
 
         if pending.received_blocks.get(block_index as usize) {
             return Ok(false);
@@ -294,6 +309,7 @@ impl DiskStorage {
     fn submit_piece_for_verification(&mut self, piece_index: u64) {
         if let Some(pending) = self.pending_pieces.get(&piece_index) {
             let expected_hash = self.pieces[piece_index as usize];
+            let data_len = pending.data.len() as u64;
             let request = VerifyRequest {
                 piece_index,
                 data: pending.data.clone(),
@@ -301,6 +317,7 @@ impl DiskStorage {
             };
             if self.hasher.submit(request) {
                 self.pending_pieces.remove(&piece_index);
+                self.pending_memory = self.pending_memory.saturating_sub(data_len);
                 self.verifying_pieces.insert(piece_index, ());
             }
         }
@@ -374,7 +391,11 @@ impl DiskStorage {
 
         let now = std::time::Instant::now();
         self.pending_pieces.retain(|_, piece| {
-            now.duration_since(piece.last_updated) < STALE_PIECE_TIMEOUT
+            let is_stale = now.duration_since(piece.last_updated) >= STALE_PIECE_TIMEOUT;
+            if is_stale {
+                self.pending_memory = self.pending_memory.saturating_sub(piece.data.len() as u64);
+            }
+            !is_stale
         });
 
         Ok(())

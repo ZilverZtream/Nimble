@@ -330,18 +330,18 @@ fn parse_announce_response(data: &[u8]) -> Result<AnnounceResponse> {
         .and_then(|v: &Value| v.as_integer())
         .ok_or_else(|| anyhow!("missing interval"))?;
 
-    if interval <= 0 {
-        return Err(anyhow!("interval must be positive"));
+    if interval <= 0 || interval > u32::MAX as i64 {
+        return Err(anyhow!("interval out of valid range"));
     }
 
     let complete = dict.get(b"complete".as_ref()).and_then(|v: &Value| {
         v.as_integer()
-            .and_then(|i| if i >= 0 { Some(i as u32) } else { None })
+            .and_then(|i| if i >= 0 && i <= u32::MAX as i64 { Some(i as u32) } else { None })
     });
 
     let incomplete = dict.get(b"incomplete".as_ref()).and_then(|v: &Value| {
         v.as_integer()
-            .and_then(|i| if i >= 0 { Some(i as u32) } else { None })
+            .and_then(|i| if i >= 0 && i <= u32::MAX as i64 { Some(i as u32) } else { None })
     });
 
     let peers = if let Some(peers_val) = dict.get(b"peers".as_ref()) {

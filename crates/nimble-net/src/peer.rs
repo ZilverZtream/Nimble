@@ -21,7 +21,7 @@ const MAX_BITFIELD_BYTES: u32 = 262144;
 const MAX_EXTENDED_MESSAGE_LENGTH: u32 = 1024 * 1024;
 const BLOCK_SIZE: u32 = 16384;
 const MAX_BLOCK_SIZE: u32 = 32768;
-const MAX_REASONABLE_PIECE_SIZE: u64 = 16 * 1024 * 1024;
+const MAX_REASONABLE_PIECE_SIZE: u64 = 64 * 1024 * 1024;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 const MAX_PENDING_REQUESTS: usize = 16;
 const MAX_PEER_REQUESTS: usize = 500;
@@ -641,7 +641,8 @@ impl PeerConnection {
 
         let mse = self.mse_handshake.as_mut().unwrap();
         let info_hash = self.info_hash;
-        mse.compute_shared_secret(&their_pubkey, &info_hash);
+        mse.compute_shared_secret(&their_pubkey, &info_hash)
+            .map_err(|e| anyhow::anyhow!("MSE handshake failed: {}", e))?;
 
         let mut vc = [0u8; 8];
         mse.encrypt(&mut vc);

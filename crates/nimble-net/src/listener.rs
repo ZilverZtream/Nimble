@@ -516,7 +516,9 @@ mod windows_impl {
                 attempts += 1;
 
                 let mut candidate = base.clone_without_ciphers();
-                candidate.compute_shared_secret(peer_pubkey, info_hash);
+                if candidate.compute_shared_secret(peer_pubkey, info_hash).is_err() {
+                    continue;
+                }
                 let mut vc = encrypted_vc.to_vec();
                 candidate.decrypt(&mut vc);
                 if vc == [0u8; MSE_VC_LENGTH] {
@@ -978,7 +980,9 @@ mod unix_impl {
                 attempts += 1;
 
                 let mut candidate = base.clone_without_ciphers();
-                candidate.compute_shared_secret(peer_pubkey, info_hash);
+                if candidate.compute_shared_secret(peer_pubkey, info_hash).is_err() {
+                    continue;
+                }
                 let mut vc = encrypted_vc.to_vec();
                 candidate.decrypt(&mut vc);
                 if vc == [0u8; MSE_VC_LENGTH] {

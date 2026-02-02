@@ -291,6 +291,10 @@ fn parse_announce_response(data: &[u8]) -> Result<UdpAnnounceResponse> {
     }
 
     let interval = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+    if interval == 0 {
+        return Err(anyhow!("interval must be non-zero"));
+    }
+
     let leechers = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
     let seeders = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
 

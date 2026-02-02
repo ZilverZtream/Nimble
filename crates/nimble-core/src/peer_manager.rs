@@ -571,6 +571,104 @@ impl PeerManager {
     pub fn take_metadata(&mut self) -> Option<Vec<u8>> {
         self.pending_metadata.take()
     }
+
+    /// Returns raw socket handles for all connected peers along with their addresses.
+    /// Used for select()-based readiness polling (RFC-101 Step 1).
+    pub fn get_socket_handles(&self) -> Vec<(SocketAddrV4, nimble_net::sockets::RawSocket)> {
+        self.peers
+            .iter()
+            .filter(|(_, peer)| peer.connection.state() == PeerState::Connected)
+            .map(|(&addr, peer)| (addr, peer.connection.raw_socket()))
+            .collect()
+    }
+
+    /// Tick a specific peer by address instead of iterating all peers.
+    /// Returns received blocks if successful.
+    /// Used by session to tick only peers that are ready (RFC-101 Step 1).
+    pub fn tick_peer(&mut self, addr: &SocketAddrV4) -> Result<Vec<(u32, u32, Vec<u8>)>> {
+        let peer = self.peers.get_mut(addr)
+            .ok_or_else(|| anyhow::anyhow!("peer not found"))?;
+
+        if peer.connection.state() != PeerState::Connected {
+            anyhow::bail!("peer not connected");
+        }
+
+        Self::handle_peer_messages(peer, &mut self.piece_picker, &mut self.endgame, *addr)
+    }
+
+    /// Request blocks for a specific peer that has been identified as unchoked.
+    /// Called after tick_peer when the peer might have become unchoked.
+    pub fn request_blocks_for_peer(&mut self, addr: &SocketAddrV4) {
+        let Some(peer) = self.peers.get_mut(addr) else {
+            return;
+        };
+
+        if peer.connection.is_choking() || peer.pending_blocks.len() >= MAX_PENDING_PER_PEER {
+            return;
+        }
+
+        Self::request_blocks(
+            peer,
+            &mut self.piece_picker,
+            &mut self.endgame,
+            *addr,
+            self.piece_length,
+            self.total_length,
+            self.piece_count,
+        );
+    }
+
+    /// Separate logic tick for timers and non-network operations.
+    /// Called once per session tick regardless of socket readiness.
+    pub fn tick_logic(&mut self) {
+        self.connect_to_candidates();
+        self.check_block_timeouts();
+    }
+
+    /// Take peer requests for a specific peer.
+    pub fn take_peer_requests_for(&mut self, addr: &SocketAddrV4) -> Vec<(u32, u32, u32)> {
+        if let Some(peer) = self.peers.get_mut(addr) {
+            peer.connection
+                .take_peer_requests()
+                .into_iter()
+                .map(|req| (req.index, req.begin, req.length))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Remove a failed peer from the manager.
+    pub fn remove_peer(&mut self, addr: &SocketAddrV4) {
+        if let Some(peer) = self.peers.remove(addr) {
+            for block in peer.pending_blocks {
+                self.piece_picker
+                    .cancel_block(block.piece as usize, block.offset);
+            }
+
+            if let Some(bitfield) = peer.connection.bitfield() {
+                for piece in 0..bitfield.len() {
+                    if bitfield.get(piece) {
+                        self.piece_picker.update_availability(piece, false);
+                    }
+                }
+            }
+
+            self.endgame.remove_peer(addr);
+
+            let entry = self.failed_peers.entry(*addr).or_insert((Instant::now(), 0));
+            entry.0 = Instant::now();
+            entry.1 += 1;
+        }
+    }
+
+    /// Check if a specific peer is connected.
+    pub fn is_peer_connected(&self, addr: &SocketAddrV4) -> bool {
+        self.peers
+            .get(addr)
+            .map(|p| p.connection.state() == PeerState::Connected)
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Default)]

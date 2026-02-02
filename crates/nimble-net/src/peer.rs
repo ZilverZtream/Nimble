@@ -29,6 +29,16 @@ const EXTENDED_MESSAGE_ID: u8 = 20;
 const PEX_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const TEMP_RECV_BUFFER_SIZE: usize = 8192;
 
+/// RFC-101 Step 2: Fixed-size receive buffer for zero-allocation message parsing.
+/// 64KB is sufficient for bitfields of huge torrents (500K+ pieces).
+const RECV_BUFFER_SIZE: usize = 64 * 1024;
+
+/// RFC-101 Step 4: Batched message queue limits.
+/// Flush if queue exceeds 4KB to avoid memory buildup.
+const MAX_QUEUE_BYTES: usize = 4096;
+/// Flush if oldest message in queue is older than 100ms.
+const MAX_QUEUE_AGE_MS: u64 = 100;
+
 const MAX_CHOKE_SIZE: u32 = 1;
 const MAX_UNCHOKE_SIZE: u32 = 1;
 const MAX_INTERESTED_SIZE: u32 = 1;
@@ -352,7 +362,12 @@ pub struct PeerConnection {
     last_message_received: Instant,
     downloaded: u64,
     uploaded: u64,
-    recv_buffer: Vec<u8>,
+    /// RFC-101 Step 2: Fixed-size receive buffer to eliminate allocation churn.
+    /// Uses a heap-allocated box to avoid stack overflow while maintaining
+    /// predictable memory usage. Reused for all control messages.
+    recv_buffer: Box<[u8; RECV_BUFFER_SIZE]>,
+    /// Current position in recv_buffer (amount of valid data).
+    recv_cursor: usize,
     recv_state: RecvState,
     temp_recv_buf: [u8; TEMP_RECV_BUFFER_SIZE],
     extensions_enabled: bool,
@@ -369,6 +384,12 @@ pub struct PeerConnection {
     last_pex_received: Option<Instant>,
     mse_handshake: Option<MseHandshake>,
     encryption_enabled: bool,
+    /// RFC-101 Step 4: Outbound message queue for batching Have messages.
+    /// Messages are serialized and queued, then flushed together to reduce syscalls.
+    outbound_queue: Vec<u8>,
+    /// Timestamp when first message was added to current queue batch.
+    /// Used to enforce MAX_QUEUE_AGE_MS limit.
+    queue_first_message_time: Option<Instant>,
 }
 
 impl PeerConnection {
@@ -420,7 +441,9 @@ impl PeerConnection {
             last_message_received: now,
             downloaded: 0,
             uploaded: 0,
-            recv_buffer: Vec::new(),
+            // RFC-101 Step 2: Fixed-size buffer to eliminate allocation churn
+            recv_buffer: Box::new([0u8; RECV_BUFFER_SIZE]),
+            recv_cursor: 0,
             recv_state: RecvState::ReadingLength,
             temp_recv_buf: [0u8; TEMP_RECV_BUFFER_SIZE],
             extensions_enabled: false,
@@ -437,6 +460,9 @@ impl PeerConnection {
             last_pex_received: None,
             mse_handshake,
             encryption_enabled: false,
+            // RFC-101 Step 4: Initialize empty outbound queue
+            outbound_queue: Vec::with_capacity(MAX_QUEUE_BYTES),
+            queue_first_message_time: None,
         }
     }
 
@@ -475,7 +501,9 @@ impl PeerConnection {
             last_message_received: now,
             downloaded: 0,
             uploaded: 0,
-            recv_buffer: Vec::new(),
+            // RFC-101 Step 2: Fixed-size buffer to eliminate allocation churn
+            recv_buffer: Box::new([0u8; RECV_BUFFER_SIZE]),
+            recv_cursor: 0,
             recv_state: RecvState::ReadingLength,
             temp_recv_buf: [0u8; TEMP_RECV_BUFFER_SIZE],
             extensions_enabled: true,
@@ -492,6 +520,9 @@ impl PeerConnection {
             last_pex_received: None,
             mse_handshake,
             encryption_enabled,
+            // RFC-101 Step 4: Initialize empty outbound queue
+            outbound_queue: Vec::with_capacity(MAX_QUEUE_BYTES),
+            queue_first_message_time: None,
         };
 
         conn.init_extension_state();
@@ -535,7 +566,9 @@ impl PeerConnection {
             last_message_received: now,
             downloaded: 0,
             uploaded: 0,
-            recv_buffer: Vec::new(),
+            // RFC-101 Step 2: Fixed-size buffer to eliminate allocation churn
+            recv_buffer: Box::new([0u8; RECV_BUFFER_SIZE]),
+            recv_cursor: 0,
             recv_state: RecvState::ReadingLength,
             temp_recv_buf: [0u8; TEMP_RECV_BUFFER_SIZE],
             extensions_enabled: true,
@@ -552,6 +585,9 @@ impl PeerConnection {
             last_pex_received: None,
             mse_handshake,
             encryption_enabled,
+            // RFC-101 Step 4: Initialize empty outbound queue
+            outbound_queue: Vec::with_capacity(MAX_QUEUE_BYTES),
+            queue_first_message_time: None,
         };
 
         conn.init_extension_state();
@@ -718,7 +754,7 @@ impl PeerConnection {
         loop {
             match self.recv_state {
                 RecvState::ReadingLength => {
-                    let needed = 4 - self.recv_buffer.len();
+                    let needed = 4 - self.recv_cursor;
                     if needed > 0 {
                         let read_len = needed.min(TEMP_RECV_BUFFER_SIZE);
                         match self.socket.recv(&mut self.temp_recv_buf[..read_len]) {
@@ -726,13 +762,20 @@ impl PeerConnection {
                                 anyhow::bail!("connection closed");
                             }
                             Ok(n) => {
-                                let mut chunk = self.temp_recv_buf[..n].to_vec();
+                                // RFC-101 Step 2: Decrypt in temp buffer, copy to fixed buffer
                                 if self.encryption_enabled {
                                     if let Some(ref mut mse) = self.mse_handshake {
-                                        mse.decrypt(&mut chunk);
+                                        mse.decrypt(&mut self.temp_recv_buf[..n]);
                                     }
                                 }
-                                self.recv_buffer.extend_from_slice(&chunk);
+                                // Copy to fixed recv_buffer without allocation
+                                let end = self.recv_cursor + n;
+                                if end <= RECV_BUFFER_SIZE {
+                                    self.recv_buffer[self.recv_cursor..end].copy_from_slice(&self.temp_recv_buf[..n]);
+                                    self.recv_cursor = end;
+                                } else {
+                                    anyhow::bail!("recv buffer overflow");
+                                }
                             }
                             Err(e) => {
                                 if is_timeout_error(&e) {
@@ -743,12 +786,12 @@ impl PeerConnection {
                         }
                     }
 
-                    if self.recv_buffer.len() >= 4 {
+                    if self.recv_cursor >= 4 {
                         let msg_len =
                             u32::from_be_bytes([self.recv_buffer[0], self.recv_buffer[1], self.recv_buffer[2], self.recv_buffer[3]]);
 
                         if msg_len == 0 {
-                            self.recv_buffer.clear();
+                            self.recv_cursor = 0;
                             self.recv_state = RecvState::ReadingLength;
                             self.last_message_received = Instant::now();
                             return Ok(Some(PeerMessage::KeepAlive));
@@ -758,27 +801,32 @@ impl PeerConnection {
                             anyhow::bail!("message too large: {} bytes (absolute max {})", msg_len, MAX_EXTENDED_MESSAGE_LENGTH);
                         }
 
-                        self.recv_buffer.clear();
+                        // Check if message fits in fixed buffer
+                        if msg_len as usize > RECV_BUFFER_SIZE {
+                            anyhow::bail!("message {} bytes exceeds fixed buffer size {}", msg_len, RECV_BUFFER_SIZE);
+                        }
+
+                        self.recv_cursor = 0;
                         self.recv_state = RecvState::ReadingMessageType { msg_len };
                     } else {
                         return Ok(None);
                     }
                 }
                 RecvState::ReadingMessageType { msg_len } => {
-                    if self.recv_buffer.is_empty() {
+                    if self.recv_cursor == 0 {
                         let read_len = 1;
                         match self.socket.recv(&mut self.temp_recv_buf[..read_len]) {
                             Ok(0) => {
                                 anyhow::bail!("connection closed");
                             }
                             Ok(n) => {
-                                let mut chunk = self.temp_recv_buf[..n].to_vec();
                                 if self.encryption_enabled {
                                     if let Some(ref mut mse) = self.mse_handshake {
-                                        mse.decrypt(&mut chunk);
+                                        mse.decrypt(&mut self.temp_recv_buf[..n]);
                                     }
                                 }
-                                self.recv_buffer.extend_from_slice(&chunk);
+                                self.recv_buffer[0..n].copy_from_slice(&self.temp_recv_buf[..n]);
+                                self.recv_cursor = n;
                             }
                             Err(e) => {
                                 if is_timeout_error(&e) {
@@ -789,15 +837,15 @@ impl PeerConnection {
                         }
                     }
 
-                    if !self.recv_buffer.is_empty() {
-                        validate_message_size(msg_len, &self.recv_buffer)?;
+                    if self.recv_cursor > 0 {
+                        validate_message_size(msg_len, &self.recv_buffer[..self.recv_cursor])?;
                         self.recv_state = RecvState::ReadingMessage { msg_len, validated: true };
                     } else {
                         return Ok(None);
                     }
                 }
-                RecvState::ReadingMessage { msg_len, validated } => {
-                    let needed = msg_len as usize - self.recv_buffer.len();
+                RecvState::ReadingMessage { msg_len, validated: _ } => {
+                    let needed = msg_len as usize - self.recv_cursor;
                     if needed > 0 {
                         let read_len = needed.min(TEMP_RECV_BUFFER_SIZE);
                         match self.socket.recv(&mut self.temp_recv_buf[..read_len]) {
@@ -805,13 +853,18 @@ impl PeerConnection {
                                 anyhow::bail!("connection closed");
                             }
                             Ok(n) => {
-                                let mut chunk = self.temp_recv_buf[..n].to_vec();
                                 if self.encryption_enabled {
                                     if let Some(ref mut mse) = self.mse_handshake {
-                                        mse.decrypt(&mut chunk);
+                                        mse.decrypt(&mut self.temp_recv_buf[..n]);
                                     }
                                 }
-                                self.recv_buffer.extend_from_slice(&chunk);
+                                let end = self.recv_cursor + n;
+                                if end <= RECV_BUFFER_SIZE {
+                                    self.recv_buffer[self.recv_cursor..end].copy_from_slice(&self.temp_recv_buf[..n]);
+                                    self.recv_cursor = end;
+                                } else {
+                                    anyhow::bail!("recv buffer overflow");
+                                }
                             }
                             Err(e) => {
                                 if is_timeout_error(&e) {
@@ -822,10 +875,10 @@ impl PeerConnection {
                         }
                     }
 
-                    if self.recv_buffer.len() == msg_len as usize {
-                        let msg = PeerMessage::parse(&self.recv_buffer)?;
+                    if self.recv_cursor == msg_len as usize {
+                        let msg = PeerMessage::parse(&self.recv_buffer[..self.recv_cursor])?;
                         self.apply_incoming_message(&msg);
-                        self.recv_buffer.clear();
+                        self.recv_cursor = 0;
                         self.recv_state = RecvState::ReadingLength;
                         self.last_message_received = Instant::now();
                         return Ok(Some(msg));
@@ -1248,6 +1301,81 @@ impl PeerConnection {
             .as_ref()
             .map(|s| s.peer_supports(name))
             .unwrap_or(false)
+    }
+
+    /// Returns the raw socket handle for use with poll_readable_sockets().
+    /// Used by PeerManager to implement decoupled readiness polling (RFC-101 Step 1).
+    pub fn raw_socket(&self) -> crate::sockets::RawSocket {
+        self.socket.raw_socket()
+    }
+
+    /// RFC-101 Step 4: Queue a message for batched sending.
+    /// Messages are serialized and added to the outbound queue.
+    /// Use `flush_queue()` or `tick()` to actually send.
+    fn queue_message(&mut self, msg: &PeerMessage) {
+        let data = msg.serialize();
+
+        // Start tracking queue age if this is the first message
+        if self.queue_first_message_time.is_none() {
+            self.queue_first_message_time = Some(Instant::now());
+        }
+
+        // Encrypt if needed
+        let mut data = data;
+        if self.encryption_enabled {
+            if let Some(ref mut mse) = self.mse_handshake {
+                mse.encrypt(&mut data);
+            }
+        }
+
+        self.outbound_queue.extend_from_slice(&data);
+    }
+
+    /// RFC-101 Step 4: Flush all queued messages to the socket.
+    /// Returns Ok(()) if queue was empty or all data was sent.
+    pub fn flush_queue(&mut self) -> Result<()> {
+        if self.outbound_queue.is_empty() {
+            return Ok(());
+        }
+
+        self.socket.send_all(&self.outbound_queue)?;
+        self.outbound_queue.clear();
+        self.queue_first_message_time = None;
+        self.last_message_sent = Instant::now();
+
+        Ok(())
+    }
+
+    /// RFC-101 Step 4: Auto-flush logic for batched messages.
+    /// Flushes if queue exceeds MAX_QUEUE_BYTES or oldest message exceeds MAX_QUEUE_AGE_MS.
+    /// Should be called once per tick.
+    pub fn tick(&mut self) -> Result<()> {
+        if self.outbound_queue.is_empty() {
+            return Ok(());
+        }
+
+        let should_flush = self.outbound_queue.len() > MAX_QUEUE_BYTES
+            || self.queue_first_message_time
+                .map(|t| t.elapsed().as_millis() as u64 > MAX_QUEUE_AGE_MS)
+                .unwrap_or(false);
+
+        if should_flush {
+            self.flush_queue()?;
+        }
+
+        Ok(())
+    }
+
+    /// RFC-101 Step 4: Queue a Have message for batched sending.
+    /// Does NOT send immediately - use `flush_queue()` or `tick()` to send.
+    /// This reduces syscalls when multiple pieces complete in quick succession.
+    pub fn send_have_batched(&mut self, piece_index: u32) {
+        self.queue_message(&PeerMessage::Have { piece_index });
+    }
+
+    /// Returns the current outbound queue size in bytes.
+    pub fn outbound_queue_size(&self) -> usize {
+        self.outbound_queue.len()
     }
 
     pub fn peer_metadata_size(&self) -> Option<u32> {

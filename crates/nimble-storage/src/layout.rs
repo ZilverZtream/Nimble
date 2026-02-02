@@ -144,6 +144,7 @@ mod tests {
             },
             infohash: InfoHash([0u8; 20]),
             total_length: 32768,
+            private: false,
         }
     }
 
@@ -172,6 +173,7 @@ mod tests {
             },
             infohash: InfoHash([0u8; 20]),
             total_length: 35000,
+            private: false,
         }
     }
 

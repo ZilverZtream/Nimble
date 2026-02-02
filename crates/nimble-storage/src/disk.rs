@@ -492,6 +492,7 @@ mod tests {
             },
             infohash: InfoHash([0u8; 20]),
             total_length: 16384,
+            private: false,
         }
     }
 

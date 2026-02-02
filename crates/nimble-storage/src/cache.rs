@@ -12,6 +12,7 @@ const DEFAULT_CACHE_SIZE: usize = 32 * 1024 * 1024;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 const BLOCK_SIZE: usize = 16384;
 const MAX_QUEUED_WRITES: usize = 2048;
+const MAX_OPEN_FILES: usize = 64;
 
 #[derive(Debug, Clone)]
 struct CachedWrite {
@@ -36,6 +37,7 @@ struct CacheWorker {
     file_handles: HashMap<usize, File>,
     file_paths: HashMap<usize, PathBuf>,
     pending_writes: VecDeque<CachedWrite>,
+    open_order: VecDeque<usize>,
     cache_size: usize,
     current_cache_bytes: usize,
 }
@@ -51,6 +53,7 @@ impl CacheWorker {
             file_handles: HashMap::new(),
             file_paths,
             pending_writes: VecDeque::new(),
+            open_order: VecDeque::new(),
             cache_size,
             current_cache_bytes: 0,
         }
@@ -171,9 +174,17 @@ impl CacheWorker {
     }
 
     fn get_or_open_file(&mut self, file_index: usize) -> Result<&mut File> {
-        if !self.file_handles.contains_key(&file_index) {
+        if self.file_handles.contains_key(&file_index) {
+            self.touch_open_order(file_index);
+        } else {
             let path = self.file_paths.get(&file_index)
                 .context("File index not found in paths")?;
+
+            if self.file_handles.len() >= MAX_OPEN_FILES {
+                if let Some(oldest) = self.open_order.pop_front() {
+                    self.file_handles.remove(&oldest);
+                }
+            }
 
             let file = File::options()
                 .read(true)
@@ -183,16 +194,25 @@ impl CacheWorker {
                 .with_context(|| format!("Failed to open file: {:?}", path))?;
 
             self.file_handles.insert(file_index, file);
+            self.open_order.push_back(file_index);
         }
 
         self.file_handles.get_mut(&file_index)
             .ok_or_else(|| anyhow::anyhow!("File handle missing after insertion for index {}", file_index))
     }
 
+    fn touch_open_order(&mut self, file_index: usize) {
+        if let Some(pos) = self.open_order.iter().position(|idx| *idx == file_index) {
+            self.open_order.remove(pos);
+        }
+        self.open_order.push_back(file_index);
+    }
+
     fn close_all_files(&mut self) {
         for (_, mut file) in self.file_handles.drain() {
             let _ = file.flush();
         }
+        self.open_order.clear();
     }
 }
 
@@ -301,6 +321,34 @@ mod tests {
 
         let cache = DiskCache::new(file_paths);
         drop(cache);
+    }
+
+    #[test]
+    fn test_cache_worker_lru_eviction() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut file_paths = HashMap::new();
+
+        for i in 0..(MAX_OPEN_FILES + 2) {
+            file_paths.insert(i, temp_dir.path().join(format!("file-{}", i)));
+        }
+
+        let (_tx, rx) = channel();
+        let mut worker = CacheWorker::new(rx, file_paths, DEFAULT_CACHE_SIZE);
+
+        for i in 0..MAX_OPEN_FILES {
+            worker.get_or_open_file(i).unwrap();
+        }
+
+        assert_eq!(worker.file_handles.len(), MAX_OPEN_FILES);
+
+        worker.get_or_open_file(0).unwrap();
+        worker.get_or_open_file(MAX_OPEN_FILES).unwrap();
+
+        assert!(worker.file_handles.contains_key(&0));
+        assert!(!worker.file_handles.contains_key(&1));
+
+        worker.get_or_open_file(MAX_OPEN_FILES + 1).unwrap();
+        assert!(!worker.file_handles.contains_key(&2));
     }
 
     #[test]

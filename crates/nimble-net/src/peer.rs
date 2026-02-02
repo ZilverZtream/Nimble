@@ -31,9 +31,16 @@ const UT_METADATA_MAX_REQUESTS_PER_SECOND: usize = 10;
 const UT_METADATA_RATE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_PEX_PEERS_PER_MESSAGE: usize = 200;
 const UT_METADATA_MAX_IN_FLIGHT: usize = 3;
+const MAX_METADATA_SIZE: u32 = 10 * 1024 * 1024;
 
 /// RFC-101 Step 2: Fixed-size receive buffer for zero-allocation message parsing.
 /// 256KB is required to support bitfields up to MAX_BITFIELD_BYTES (262144).
+///
+/// Issue #10 Fix: Piece data now uses buffer pooling to reduce allocation overhead.
+/// Flow: Socket -> recv_buffer -> PooledBuffer (reused) -> Channel -> Disk Worker -> Pool
+/// The buffer pool maintains up to 256 reusable 16KB buffers, significantly reducing
+/// GC pressure and allocation overhead. When a piece block is consumed by disk worker,
+/// the buffer is automatically returned to the pool for reuse.
 const RECV_BUFFER_SIZE: usize = 256 * 1024;
 
 /// RFC-101 Step 4: Batched message queue limits.
@@ -290,7 +297,10 @@ impl PeerMessage {
                 }
                 let index = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
                 let begin = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
-                let block = data[9..].to_vec();
+                // Issue #10 Fix: Use buffer pool for piece data to reduce allocations
+                let mut pooled_buf = nimble_storage::buffer_pool::global_pool().get();
+                pooled_buf.as_mut().extend_from_slice(&data[9..]);
+                let block = pooled_buf.take();
                 Ok(PeerMessage::Piece {
                     index,
                     begin,
@@ -648,7 +658,6 @@ impl PeerConnection {
         self.handshake = None;
         self.handshake_phase = None;
 
-        self.socket.set_nonblocking(true)?;
         self.start_handshake();
         self.tick_handshake()?;
         Ok(())
@@ -1188,6 +1197,9 @@ impl PeerConnection {
 
     fn init_metadata_state(&mut self, size: u32) {
         if self.metadata_state.is_none() {
+            if size > MAX_METADATA_SIZE {
+                return;
+            }
             if let Ok(state) = UtMetadataState::new(size) {
                 self.metadata_state = Some(state);
                 self.metadata_requests_sent = false;

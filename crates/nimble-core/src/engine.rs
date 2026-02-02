@@ -118,30 +118,34 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
                     Ok(path) => {
                         #[cfg(target_os = "windows")]
                         {
-                            use std::os::windows::ffi::OsStrExt;
-                            let path_wide: Vec<u16> = std::ffi::OsStr::new(&path)
-                                .encode_wide()
-                                .chain(std::iter::once(0))
-                                .collect();
-                            unsafe {
-                                use windows_sys::Win32::UI::Shell::ShellExecuteW;
-                                use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
-                                let result = ShellExecuteW(
-                                    0,
-                                    "open\0".encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>().as_ptr(),
-                                    path_wide.as_ptr(),
-                                    std::ptr::null(),
-                                    std::ptr::null(),
-                                    SW_SHOW,
-                                );
-                                if result <= 32 {
-                                    let msg = format!("Failed to open folder for {}", &infohash[..8]);
-                                    let _ = evt_tx.send(Event::LogLine(msg));
-                                } else {
-                                    let msg = format!("Opened folder for {}", &infohash[..8]);
-                                    let _ = evt_tx.send(Event::LogLine(msg));
+                            let evt_tx_clone = evt_tx.clone();
+                            let infohash_clone = infohash.clone();
+                            thread::spawn(move || {
+                                use std::os::windows::ffi::OsStrExt;
+                                let path_wide: Vec<u16> = std::ffi::OsStr::new(&path)
+                                    .encode_wide()
+                                    .chain(std::iter::once(0))
+                                    .collect();
+                                unsafe {
+                                    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+                                    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
+                                    let result = ShellExecuteW(
+                                        0,
+                                        "open\0".encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>().as_ptr(),
+                                        path_wide.as_ptr(),
+                                        std::ptr::null(),
+                                        std::ptr::null(),
+                                        SW_SHOW,
+                                    );
+                                    if result <= 32 {
+                                        let msg = format!("Failed to open folder for {}", &infohash_clone[..8]);
+                                        let _ = evt_tx_clone.send(Event::LogLine(msg));
+                                    } else {
+                                        let msg = format!("Opened folder for {}", &infohash_clone[..8]);
+                                        let _ = evt_tx_clone.send(Event::LogLine(msg));
+                                    }
                                 }
-                            }
+                            });
                         }
                         #[cfg(not(target_os = "windows"))]
                         {

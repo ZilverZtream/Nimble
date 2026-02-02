@@ -255,7 +255,6 @@ mod windows_impl {
                 anyhow::bail!("connect() timed out");
             }
 
-            self.set_nonblocking(false)?;
             self.set_timeouts(RECV_TIMEOUT_MS, SEND_TIMEOUT_MS)?;
             self.set_keepalive(true)?;
             // Apply TCP buffer tuning for optimal throughput (RFC-101 Step 3)
@@ -348,12 +347,31 @@ mod windows_impl {
 
         pub fn send_all(&self, data: &[u8]) -> Result<()> {
             let mut sent = 0;
+            let mut retry_count = 0;
+            const MAX_RETRIES: usize = 3;
+
             while sent < data.len() {
-                let n = self.send(&data[sent..])?;
-                if n == 0 {
-                    anyhow::bail!("send() returned 0");
+                match self.send(&data[sent..]) {
+                    Ok(0) => {
+                        anyhow::bail!("send() returned 0");
+                    }
+                    Ok(n) => {
+                        sent += n;
+                        retry_count = 0;
+                    }
+                    Err(e) => {
+                        let err_code = get_last_error();
+                        if err_code == WSAEWOULDBLOCK as i32 {
+                            retry_count += 1;
+                            if retry_count > MAX_RETRIES {
+                                anyhow::bail!("send would block after {} retries", MAX_RETRIES);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            continue;
+                        }
+                        return Err(e);
+                    }
                 }
-                sent += n;
             }
             Ok(())
         }
@@ -739,7 +757,30 @@ mod unix_impl {
         pub fn send_all(&mut self, data: &[u8]) -> Result<()> {
             let stream = self.stream.as_mut()
                 .ok_or_else(|| anyhow::anyhow!("not connected"))?;
-            stream.write_all(data)?;
+
+            let mut sent = 0;
+            let mut retry_count = 0;
+            const MAX_RETRIES: usize = 3;
+
+            while sent < data.len() {
+                match stream.write(&data[sent..]) {
+                    Ok(0) => {
+                        anyhow::bail!("write() returned 0");
+                    }
+                    Ok(n) => {
+                        sent += n;
+                        retry_count = 0;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        retry_count += 1;
+                        if retry_count > MAX_RETRIES {
+                            anyhow::bail!("send would block after {} retries", MAX_RETRIES);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
             Ok(())
         }
 

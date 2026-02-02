@@ -82,6 +82,48 @@ impl DiskWorkerState {
 
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
+
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if let Ok(metadata) = fs::symlink_metadata(parent) {
+                        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+                        if (metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                            anyhow::bail!("refusing to write through reparse point: {:?}", parent);
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    if let Ok(metadata) = fs::symlink_metadata(parent) {
+                        if metadata.file_type().is_symlink() {
+                            anyhow::bail!("refusing to write through symlink: {:?}", parent);
+                        }
+                    }
+                }
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if path.exists() {
+                    if let Ok(metadata) = fs::symlink_metadata(&path) {
+                        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+                        if (metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                            anyhow::bail!("refusing to write to reparse point: {:?}", path);
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                if path.exists() {
+                    if let Ok(metadata) = fs::symlink_metadata(&path) {
+                        if metadata.file_type().is_symlink() {
+                            anyhow::bail!("refusing to write to symlink: {:?}", path);
+                        }
+                    }
+                }
             }
 
             let file = OpenOptions::new()
@@ -121,7 +163,10 @@ impl DiskWorkerState {
         let global_end = global_start + length as u64;
 
         let segments = self.layout.map_range(global_start, global_end);
-        let mut data = vec![0u8; length as usize];
+        // Issue #10 Fix: Use buffer pool for disk reads to reduce allocations
+        let mut pooled_buf = crate::buffer_pool::global_pool().get();
+        pooled_buf.as_mut().resize(length as usize, 0);
+        let data_slice = pooled_buf.as_mut().as_mut_slice();
         let mut data_offset = 0;
 
         for segment in segments {
@@ -129,7 +174,7 @@ impl DiskWorkerState {
             file_handle.seek(SeekFrom::Start(segment.file_offset))?;
 
             let read_length = segment.length as usize;
-            file_handle.read_exact(&mut data[data_offset..data_offset + read_length])?;
+            file_handle.read_exact(&mut data_slice[data_offset..data_offset + read_length])?;
 
             data_offset += read_length;
         }
@@ -138,7 +183,7 @@ impl DiskWorkerState {
             anyhow::bail!("incomplete read: expected {} bytes, got {}", length, data_offset);
         }
 
-        Ok(data)
+        Ok(pooled_buf.take())
     }
 
     fn flush_all(&mut self) -> Result<()> {

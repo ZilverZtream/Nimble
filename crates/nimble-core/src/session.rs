@@ -25,6 +25,10 @@ use crate::magnet::parse_magnet;
 use crate::peer_manager::PeerManager;
 use crate::tracker_worker::{AnnounceTask, AnnounceWorker};
 
+/// Maximum number of peers that can simultaneously exchange metadata.
+/// With 2MB per peer, this limits metadata memory to ~100MB.
+const MAX_GLOBAL_METADATA_EXCHANGES: usize = 50;
+
 pub struct Session {
     torrents: HashMap<String, TorrentEntry>,
     download_dir: PathBuf,
@@ -44,6 +48,9 @@ pub struct Session {
     mapped_port: Option<u16>,
     max_active_torrents: u32,
     enable_utp: bool,
+    active_metadata_exchanges: usize,
+    socket_handle_cache: Vec<(String, SocketAddr, RawSocket)>,
+    socket_cache_dirty: bool,
 }
 
 pub enum TorrentEntry {
@@ -242,10 +249,28 @@ impl Session {
             None
         };
 
+        let peer_id = match peer_id_20() {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("CRITICAL: Failed to generate peer ID: {}", e);
+                eprintln!("This usually indicates a system-level issue with the random number generator.");
+                eprintln!("Using fallback peer ID (not cryptographically secure).");
+                let mut fallback_id = [0u8; 20];
+                fallback_id[..8].copy_from_slice(b"-NM0001-");
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                fallback_id[8..16].copy_from_slice(&timestamp.to_be_bytes());
+                fallback_id[16..20].copy_from_slice(&(fastrand::u32(..) as u32).to_be_bytes());
+                fallback_id
+            }
+        };
+
         let mut session = Session {
             torrents: HashMap::new(),
             download_dir,
-            peer_id: peer_id_20().expect("Failed to generate peer ID"),
+            peer_id,
             listen_port,
             dht,
             dht_socket_v4,
@@ -261,6 +286,9 @@ impl Session {
             mapped_port: None,
             max_active_torrents,
             enable_utp,
+            active_metadata_exchanges: 0,
+            socket_handle_cache: Vec::with_capacity(512),
+            socket_cache_dirty: true,
         };
 
         if let Err(e) = session.load_saved_torrents() {
@@ -766,6 +794,7 @@ impl Session {
                             torrent.tracker.next_announce = Some(now + torrent.tracker.interval);
                             torrent.tracker.peers = result.peers.clone();
                             torrent.peer_manager.add_peers(&result.peers);
+                            self.invalidate_socket_cache();
 
                             log_lines.push(format!(
                                 "Tracker announce for {}: {} peers",
@@ -804,6 +833,7 @@ impl Session {
                             torrent.tracker.next_announce = Some(now + torrent.tracker.interval);
                             torrent.tracker.peers = result.peers.clone();
                             torrent.peer_manager.add_peers(&result.peers);
+                            self.invalidate_socket_cache();
 
                             log_lines.push(format!(
                                 "Magnet announce for {}: {} peers",
@@ -1191,6 +1221,7 @@ impl Session {
 
     fn process_lsd(&mut self) -> Vec<String> {
         let mut log_lines = Vec::new();
+        let mut cache_dirty = false;
         let Some(lsd) = self.lsd.as_mut() else {
             return log_lines;
         };
@@ -1215,6 +1246,7 @@ impl Session {
                     TorrentEntry::Active(t) => t.peer_manager.add_peers(&discovered),
                     TorrentEntry::Magnet(t) => t.peer_manager.add_peers(&discovered),
                 }
+                cache_dirty = true;
 
                 log_lines.push(format!(
                     "LSD discovered {} peers for {}",
@@ -1224,6 +1256,10 @@ impl Session {
 
                 lsd.clear_discovered_peers(&info_hash);
             }
+        }
+
+        if cache_dirty {
+            self.invalidate_socket_cache();
         }
 
         log_lines
@@ -1448,6 +1484,7 @@ impl Session {
                 match torrent {
                     TorrentEntry::Active(torrent) => {
                         torrent.peer_manager.add_peers(&peers);
+                        self.invalidate_socket_cache();
                         log_lines.push(format!(
                             "DHT peers for {}: {} peers",
                             &infohash_hex[..8],
@@ -1456,6 +1493,7 @@ impl Session {
                     }
                     TorrentEntry::Magnet(torrent) => {
                         torrent.peer_manager.add_peers(&peers);
+                        self.invalidate_socket_cache();
                         log_lines.push(format!(
                             "DHT peers for {}: {} peers",
                             &infohash_hex[..8],
@@ -1469,14 +1507,10 @@ impl Session {
         log_lines
     }
 
-    /// Optimized tick for peer managers using select()-based readiness polling.
-    /// Reduces syscalls from O(N*peers) per tick to O(1) + O(ready_peers).
-    /// RFC-101 Step 1: Decoupled Readiness Polling.
-    fn tick_torrents_optimized(&mut self) -> Vec<String> {
-        let mut log_lines = Vec::new();
-
-        // Phase 1: Collect all socket handles across all active torrents
-        let mut all_handles: Vec<(String, SocketAddr, RawSocket)> = Vec::new();
+    /// Rebuilds the socket handle cache from all active torrents.
+    /// Called only when socket_cache_dirty is true (peers added/removed).
+    fn rebuild_socket_cache(&mut self) {
+        self.socket_handle_cache.clear();
 
         for (infohash, torrent) in self.torrents.iter() {
             let peer_manager = match torrent {
@@ -1486,9 +1520,34 @@ impl Session {
             };
 
             for (addr, handle) in peer_manager.get_socket_handles() {
-                all_handles.push((infohash.clone(), addr, handle));
+                self.socket_handle_cache.push((infohash.clone(), addr, handle));
             }
         }
+
+        self.socket_cache_dirty = false;
+    }
+
+    /// Marks the socket cache as dirty, forcing a rebuild on next tick.
+    /// Called whenever peers are added, removed, or connections change.
+    fn invalidate_socket_cache(&mut self) {
+        self.socket_cache_dirty = true;
+    }
+
+    /// Optimized tick for peer managers using select()-based readiness polling.
+    /// Reduces syscalls from O(N*peers) per tick to O(1) + O(ready_peers).
+    /// RFC-101 Step 1: Decoupled Readiness Polling.
+    ///
+    /// Issue #7 Fix: Caches socket handles between ticks to eliminate O(N) allocation
+    /// on every tick. Cache is only rebuilt when peers are added/removed (socket_cache_dirty).
+    fn tick_torrents_optimized(&mut self) -> Vec<String> {
+        let mut log_lines = Vec::new();
+
+        // Phase 1: Get socket handles (cached or rebuild if dirty)
+        if self.socket_cache_dirty {
+            self.rebuild_socket_cache();
+        }
+
+        let all_handles = &self.socket_handle_cache;
 
         if all_handles.is_empty() {
             // No connected peers, just run logic ticks
@@ -1542,14 +1601,28 @@ impl Session {
             match peer_manager.tick_peer(addr) {
                 Ok(blocks) => {
                     // Write received blocks to storage
+                    let mut write_failed = false;
                     if let Some(storage) = storage {
                         for (index, begin, data) in blocks {
-                            let _ = storage.write_block(index as u64, begin, &data);
+                            match storage.write_block(index as u64, begin, &data) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    let err_msg = e.to_string();
+                                    if err_msg.contains("too many pending pieces")
+                                        || err_msg.contains("pending memory limit exceeded")
+                                        || err_msg.contains("disk queue full") {
+                                        write_failed = true;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
 
-                    // Request more blocks if unchoked
-                    peer_manager.request_blocks_for_peer(addr);
+                    // Request more blocks only if write succeeded and peer is unchoked
+                    if !write_failed {
+                        peer_manager.request_blocks_for_peer(addr);
+                    }
                 }
                 Err(_) => {
                     peers_to_remove.push((infohash.clone(), *addr));
@@ -1588,13 +1661,16 @@ impl Session {
         }
 
         // Phase 5: Remove failed peers
-        for (infohash, addr) in peers_to_remove {
-            if let Some(torrent) = self.torrents.get_mut(&infohash) {
-                match torrent {
-                    TorrentEntry::Active(t) => t.peer_manager.remove_peer(&addr),
-                    TorrentEntry::Magnet(t) => t.peer_manager.remove_peer(&addr),
+        if !peers_to_remove.is_empty() {
+            for (infohash, addr) in peers_to_remove {
+                if let Some(torrent) = self.torrents.get_mut(&infohash) {
+                    match torrent {
+                        TorrentEntry::Active(t) => t.peer_manager.remove_peer(&addr),
+                        TorrentEntry::Magnet(t) => t.peer_manager.remove_peer(&addr),
+                    }
                 }
             }
+            self.invalidate_socket_cache();
         }
 
         log_lines

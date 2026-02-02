@@ -31,7 +31,9 @@ pub struct Session {
     peer_id: [u8; 20],
     listen_port: u16,
     dht: Option<DhtNode>,
-    dht_socket: Option<UdpSocket>,
+    dht_socket_v4: Option<UdpSocket>,
+    #[cfg(feature = "ipv6")]
+    dht_socket_v6: Option<UdpSocket>,
     announce_worker: AnnounceWorker,
     pending_announces: HashSet<String>,
     peer_listener: Option<PeerListener>,
@@ -108,16 +110,32 @@ impl Session {
         enable_utp: bool,
         max_active_torrents: u32,
     ) -> Self {
-        let (dht, dht_socket) = if enable_dht {
-            let socket = UdpSocket::bind(("0.0.0.0", listen_port))
+        let (dht, dht_socket_v4, dht_socket_v6) = if enable_dht {
+            let socket_v4 = UdpSocket::bind(("0.0.0.0", listen_port))
                 .ok()
                 .and_then(|s| {
                     s.set_nonblocking(true).ok()?;
                     Some(s)
                 });
-            (Some(DhtNode::new()), socket)
+            #[cfg(feature = "ipv6")]
+            let socket_v6 = UdpSocket::bind(("::", listen_port))
+                .ok()
+                .and_then(|s| {
+                    let _ = s.set_only_v6(true);
+                    s.set_nonblocking(true).ok()?;
+                    Some(s)
+                });
+            #[cfg(not(feature = "ipv6"))]
+            let socket_v6 = None;
+            #[cfg(feature = "ipv6")]
+            if socket_v6.is_some() {
+                eprintln!("DHT: IPv6 socket bound on port {}", listen_port);
+            } else {
+                eprintln!("DHT: IPv6 socket bind failed on port {}", listen_port);
+            }
+            (Some(DhtNode::new()), socket_v4, socket_v6)
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let peer_listener = PeerListener::new(listen_port).ok();
@@ -205,7 +223,9 @@ impl Session {
             peer_id: peer_id_20().expect("Failed to generate peer ID"),
             listen_port,
             dht,
-            dht_socket,
+            dht_socket_v4,
+            #[cfg(feature = "ipv6")]
+            dht_socket_v6,
             announce_worker: AnnounceWorker::new(),
             pending_announces: HashSet::new(),
             peer_listener,
@@ -861,8 +881,14 @@ impl Session {
                 }
             }
 
-            if let Some(socket) = self.dht_socket.as_ref() {
+            if let Some(socket) = self.dht_socket_v4.as_ref() {
                 for (addr, payload) in dht.take_pending_packets() {
+                    let _ = socket.send_to(&payload, addr);
+                }
+            }
+            #[cfg(feature = "ipv6")]
+            if let Some(socket) = self.dht_socket_v6.as_ref() {
+                for (addr, payload) in dht.take_pending_packets6() {
                     let _ = socket.send_to(&payload, addr);
                 }
             }
@@ -1317,9 +1343,6 @@ impl Session {
 
     fn process_dht_incoming(&mut self) -> Vec<String> {
         let mut log_lines = Vec::new();
-        let Some(socket) = self.dht_socket.as_ref() else {
-            return log_lines;
-        };
         let Some(dht) = self.dht.as_mut() else {
             return log_lines;
         };
@@ -1329,33 +1352,68 @@ impl Session {
         const MAX_PACKETS_PER_TICK: usize = 100;
         let mut all_discovered_peers: HashMap<[u8; 20], Vec<SocketAddr>> = HashMap::new();
 
-        loop {
-            if packets_processed >= MAX_PACKETS_PER_TICK {
-                break;
-            }
+        if let Some(socket) = self.dht_socket_v4.as_ref() {
+            loop {
+                if packets_processed >= MAX_PACKETS_PER_TICK {
+                    break;
+                }
 
-            match socket.recv_from(&mut buf) {
-                Ok((len, addr)) => {
-                    packets_processed += 1;
-                    if let std::net::SocketAddr::V4(v4_addr) = addr {
-                        if let Ok(outcome) = dht.handle_packet(v4_addr, &buf[..len]) {
-                            if let Some(response_msg) = outcome.response {
-                                use nimble_dht::rpc::encode_message;
-                                let response_payload = encode_message(&response_msg);
-                                let _ = socket.send_to(&response_payload, v4_addr);
-                            }
+                match socket.recv_from(&mut buf) {
+                    Ok((len, addr)) => {
+                        packets_processed += 1;
+                        if let std::net::SocketAddr::V4(v4_addr) = addr {
+                            if let Ok(outcome) = dht.handle_packet(v4_addr, &buf[..len]) {
+                                if let Some(response_msg) = outcome.response {
+                                    use nimble_dht::rpc::encode_message;
+                                    let response_payload = encode_message(&response_msg);
+                                    let _ = socket.send_to(&response_payload, v4_addr);
+                                }
 
-                            for (peer_addr, info_hash) in outcome.discovered_peers {
-                                all_discovered_peers
-                                    .entry(info_hash)
-                                    .or_insert_with(Vec::new)
-                                    .push(peer_addr);
+                                for (peer_addr, info_hash) in outcome.discovered_peers {
+                                    all_discovered_peers
+                                        .entry(info_hash)
+                                        .or_insert_with(Vec::new)
+                                        .push(peer_addr);
+                                }
                             }
                         }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
+            }
+        }
+
+        #[cfg(feature = "ipv6")]
+        if let Some(socket) = self.dht_socket_v6.as_ref() {
+            loop {
+                if packets_processed >= MAX_PACKETS_PER_TICK {
+                    break;
+                }
+
+                match socket.recv_from(&mut buf) {
+                    Ok((len, addr)) => {
+                        packets_processed += 1;
+                        if let std::net::SocketAddr::V6(v6_addr) = addr {
+                            if let Ok(outcome) = dht.handle_packet6(v6_addr, &buf[..len]) {
+                                if let Some(response_msg) = outcome.response {
+                                    use nimble_dht::rpc::encode_message;
+                                    let response_payload = encode_message(&response_msg);
+                                    let _ = socket.send_to(&response_payload, v6_addr);
+                                }
+
+                                for (peer_addr, info_hash) in outcome.discovered_peers {
+                                    all_discovered_peers
+                                        .entry(info_hash)
+                                        .or_insert_with(Vec::new)
+                                        .push(peer_addr);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
             }
         }
 
@@ -1515,5 +1573,35 @@ impl Session {
         }
 
         log_lines
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "ipv6")]
+    #[test]
+    fn dht_binds_ipv6_socket_when_enabled() {
+        if UdpSocket::bind(("::1", 0)).is_err() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session = Session::new(
+            temp.path().to_path_buf(),
+            0,
+            true,
+            false,
+            false,
+            false,
+            false,
+            0,
+        );
+
+        let Some(socket) = session.dht_socket_v6.as_ref() else {
+            panic!("expected IPv6 DHT socket to be bound");
+        };
+        assert!(socket.local_addr().expect("local addr").is_ipv6());
     }
 }

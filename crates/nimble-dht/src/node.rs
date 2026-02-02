@@ -103,6 +103,8 @@ pub struct DhtNode {
     peers: HashMap<[u8; 20], Vec<StoredPeer>>,
     peers_lru: VecDeque<[u8; 20]>,
     rate_limiter: RateLimiter,
+    #[cfg(feature = "ipv6")]
+    rate_limiter6: RateLimiter6,
     pending_outbound: Vec<(SocketAddrV4, Vec<u8>)>,
     #[cfg(feature = "ipv6")]
     pending_outbound6: Vec<(SocketAddrV6, Vec<u8>)>,
@@ -156,6 +158,8 @@ impl DhtNode {
             peers: HashMap::new(),
             peers_lru: VecDeque::new(),
             rate_limiter: RateLimiter::new(RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_QUERIES),
+            #[cfg(feature = "ipv6")]
+            rate_limiter6: RateLimiter6::new(RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_QUERIES),
             pending_outbound: Vec::new(),
             #[cfg(feature = "ipv6")]
             pending_outbound6: Vec::new(),
@@ -247,6 +251,19 @@ impl DhtNode {
                     refresh_targets.len()
                 ));
             }
+            #[cfg(feature = "ipv6")]
+            {
+                let refresh_targets6 = self.routing6.oldest_nodes(REFRESH_BATCH_SIZE);
+                if !refresh_targets6.is_empty() {
+                    for addr in refresh_targets6.iter().copied() {
+                        self.queue_ping6(addr, QueryType::RefreshPing, now_ms);
+                    }
+                    log_lines.push(format!(
+                        "DHT v6 refresh queued: {} nodes",
+                        refresh_targets6.len()
+                    ));
+                }
+            }
             self.next_refresh_ms = now_ms.saturating_add(REFRESH_INTERVAL_MS);
         }
 
@@ -293,7 +310,7 @@ impl DhtNode {
                             }
                             #[cfg(feature = "ipv6")]
                             for node in nodes6 {
-                                self.routing6.insert(node.id, node.addr);
+                                self.observe_node6(node.id, node.addr);
                             }
                         }
                         ResponseKind::GetPeers {
@@ -310,7 +327,7 @@ impl DhtNode {
                             }
                             #[cfg(feature = "ipv6")]
                             for node in nodes6 {
-                                self.routing6.insert(node.id, node.addr);
+                                self.observe_node6(node.id, node.addr);
                             }
                             if let QueryType::GetPeers(info_hash) = pending.query_type {
                                 for peer_addr in values {
@@ -339,6 +356,92 @@ impl DhtNode {
         }
         let response = match &message {
             Message::Query(query) => self.handle_query(source, query),
+            _ => None,
+        };
+        Ok(PacketOutcome {
+            message,
+            response,
+            discovered_peers,
+        })
+    }
+
+    #[cfg(feature = "ipv6")]
+    pub fn handle_packet6(
+        &mut self,
+        source: SocketAddrV6,
+        payload: &[u8],
+    ) -> Result<PacketOutcome, RpcError> {
+        let message = decode_message(payload)?;
+        let mut discovered_peers = Vec::new();
+
+        if let Message::Query(query) = &message {
+            if !self.rate_limiter6.allow(*source.ip()) {
+                let transaction_id = query.transaction_id.clone();
+                return Ok(PacketOutcome {
+                    message,
+                    response: Some(Message::Error(ErrorMessage {
+                        transaction_id,
+                        code: 202,
+                        message: b"rate limited".to_vec(),
+                    })),
+                    discovered_peers,
+                });
+            }
+        }
+
+        if let Message::Response(response) = &message {
+            if response.transaction_id.len() == 2 {
+                let mut tid = [0u8; 2];
+                tid.copy_from_slice(&response.transaction_id);
+                if let Some(pending) = self.pending_queries.remove(&tid) {
+                    match &response.kind {
+                        ResponseKind::FindNode { nodes, nodes6, .. } => {
+                            for node in nodes {
+                                self.observe_node(node.id, node.addr);
+                            }
+                            for node in nodes6 {
+                                self.observe_node6(node.id, node.addr);
+                            }
+                        }
+                        ResponseKind::GetPeers {
+                            nodes,
+                            values,
+                            nodes6,
+                            values6,
+                            ..
+                        } => {
+                            for node in nodes {
+                                self.observe_node(node.id, node.addr);
+                            }
+                            for node in nodes6 {
+                                self.observe_node6(node.id, node.addr);
+                            }
+                            if let QueryType::GetPeers(info_hash) = pending.query_type {
+                                for peer_addr in values {
+                                    discovered_peers.push((std::net::SocketAddr::V4(*peer_addr), info_hash));
+                                }
+                                for peer_addr in values6 {
+                                    discovered_peers.push((std::net::SocketAddr::V6(*peer_addr), info_hash));
+                                }
+                            }
+                        }
+                        ResponseKind::Ping { id } => {
+                            if let QueryType::VerificationPing(expected_id) = pending.query_type {
+                                if *id == expected_id {
+                                    self.routing6.mark_node_good(&expected_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(id) = message.sender_id() {
+            self.observe_node6(id, source);
+        }
+        let response = match &message {
+            Message::Query(query) => self.handle_query6(source, query),
             _ => None,
         };
         Ok(PacketOutcome {
@@ -425,6 +528,13 @@ impl DhtNode {
                 self.queue_get_peers(node.addr, info_hash, now_ms);
             }
         }
+        #[cfg(feature = "ipv6")]
+        {
+            let targets6 = self.routing6.find_closest(info_hash, 8);
+            for node in targets6 {
+                self.queue_get_peers6(node.addr, info_hash, now_ms);
+            }
+        }
     }
 
     fn generate_tid(&mut self) -> TransactionId {
@@ -457,6 +567,31 @@ impl DhtNode {
         self.pending_outbound.push((addr, payload));
     }
 
+    #[cfg(feature = "ipv6")]
+    fn queue_ping6(&mut self, addr: SocketAddrV6, query_type: QueryType, now_ms: u64) {
+        if self.pending_queries.len() >= MAX_PENDING_QUERIES {
+            return;
+        }
+
+        let tid = self.generate_tid();
+        let message = Message::Query(Query {
+            transaction_id: tid.to_vec(),
+            kind: QueryKind::Ping { id: self.node_id },
+        });
+        let payload = encode_message(&message);
+
+        self.pending_queries.insert(
+            tid,
+            PendingQuery {
+                query_type,
+                sent_at_ms: now_ms,
+                addr: std::net::SocketAddr::V6(addr),
+            },
+        );
+
+        self.pending_outbound6.push((addr, payload));
+    }
+
     fn queue_verification_ping(&mut self, addr: SocketAddrV4, node_id: [u8; 20], now_ms: u64) {
         self.queue_ping(addr, QueryType::VerificationPing(node_id), now_ms);
     }
@@ -486,6 +621,34 @@ impl DhtNode {
         );
 
         self.pending_outbound.push((addr, payload));
+    }
+
+    #[cfg(feature = "ipv6")]
+    fn queue_get_peers6(&mut self, addr: SocketAddrV6, info_hash: [u8; 20], now_ms: u64) {
+        if self.pending_queries.len() >= MAX_PENDING_QUERIES {
+            return;
+        }
+
+        let tid = self.generate_tid();
+        let message = Message::Query(Query {
+            transaction_id: tid.to_vec(),
+            kind: QueryKind::GetPeers {
+                id: self.node_id,
+                info_hash,
+            },
+        });
+        let payload = encode_message(&message);
+
+        self.pending_queries.insert(
+            tid,
+            PendingQuery {
+                query_type: QueryType::GetPeers(info_hash),
+                sent_at_ms: now_ms,
+                addr: std::net::SocketAddr::V6(addr),
+            },
+        );
+
+        self.pending_outbound6.push((addr, payload));
     }
 
     fn cleanup_stale_queries(&mut self, now_ms: u64) {
@@ -590,11 +753,106 @@ impl DhtNode {
         }
     }
 
+    #[cfg(feature = "ipv6")]
+    fn handle_query6(&mut self, source: SocketAddrV6, query: &Query) -> Option<Message> {
+        match &query.kind {
+            QueryKind::Ping { .. } => Some(Message::Response(Response {
+                transaction_id: query.transaction_id.clone(),
+                kind: ResponseKind::Ping { id: self.node_id },
+            })),
+            QueryKind::FindNode { target, .. } => {
+                let nodes6 = self.closest_nodes6(*target);
+                Some(Message::Response(Response {
+                    transaction_id: query.transaction_id.clone(),
+                    kind: ResponseKind::FindNode {
+                        id: self.node_id,
+                        nodes: Vec::new(),
+                        nodes6,
+                    },
+                }))
+            }
+            QueryKind::GetPeers { info_hash, .. } => {
+                let token = self.tokens.token_for_v6(*source.ip());
+                let all_peers = self
+                    .peers
+                    .get(info_hash)
+                    .map(|values| limit_peers(values))
+                    .unwrap_or_default();
+
+                let mut peers_v4 = Vec::new();
+                let mut peers_v6 = Vec::new();
+
+                for peer in all_peers {
+                    match peer {
+                        std::net::SocketAddr::V4(v4) => peers_v4.push(v4),
+                        std::net::SocketAddr::V6(v6) => peers_v6.push(v6),
+                    }
+                }
+
+                let nodes6 = if peers_v6.is_empty() {
+                    self.closest_nodes6(*info_hash)
+                } else {
+                    Vec::new()
+                };
+                Some(Message::Response(Response {
+                    transaction_id: query.transaction_id.clone(),
+                    kind: ResponseKind::GetPeers {
+                        id: self.node_id,
+                        token: Some(token),
+                        nodes: Vec::new(),
+                        values: peers_v4,
+                        nodes6,
+                        values6: peers_v6,
+                    },
+                }))
+            }
+            QueryKind::AnnouncePeer {
+                info_hash,
+                token,
+                port,
+                implied_port,
+                ..
+            } => {
+                let peer_port = if *implied_port { source.port() } else { *port };
+                if !self.tokens.validate_v6(*source.ip(), token) {
+                    return Some(Message::Error(ErrorMessage {
+                        transaction_id: query.transaction_id.clone(),
+                        code: 203,
+                        message: b"invalid token".to_vec(),
+                    }));
+                }
+                let peer_addr = std::net::SocketAddr::V6(SocketAddrV6::new(
+                    *source.ip(),
+                    peer_port,
+                    source.flowinfo(),
+                    source.scope_id(),
+                ));
+                self.store_peer(*info_hash, peer_addr);
+                Some(Message::Response(Response {
+                    transaction_id: query.transaction_id.clone(),
+                    kind: ResponseKind::Ping { id: self.node_id },
+                }))
+            }
+        }
+    }
+
     fn closest_nodes(&self, target: [u8; 20]) -> Vec<NodeEntry> {
         self.routing
             .find_closest(target, MAX_RESPONSE_NODES)
             .into_iter()
             .map(|node| NodeEntry {
+                id: node.id,
+                addr: node.addr,
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "ipv6")]
+    fn closest_nodes6(&self, target: [u8; 20]) -> Vec<NodeEntry6> {
+        self.routing6
+            .find_closest(target, MAX_RESPONSE_NODES)
+            .into_iter()
+            .map(|node| NodeEntry6 {
                 id: node.id,
                 addr: node.addr,
             })
@@ -676,6 +934,68 @@ impl RateLimiter {
     }
 
     fn allow_at(&mut self, ip: Ipv4Addr, now_ms: u64) -> bool {
+        self.cleanup(now_ms);
+        let entry = self.entries.entry(ip).or_insert(RateEntry {
+            window_start_ms: now_ms,
+            hits: 0,
+            last_seen_ms: now_ms,
+        });
+        if now_ms.saturating_sub(entry.window_start_ms) >= self.window_ms {
+            entry.window_start_ms = now_ms;
+            entry.hits = 0;
+        }
+        entry.last_seen_ms = now_ms;
+        if entry.hits >= self.max_hits {
+            return false;
+        }
+        entry.hits += 1;
+        true
+    }
+
+    fn cleanup(&mut self, now_ms: u64) {
+        self.entries
+            .retain(|_, entry| now_ms.saturating_sub(entry.last_seen_ms) <= RATE_LIMIT_STALE_MS);
+
+        while self.entries.len() > RATE_LIMIT_MAX_CLIENTS {
+            if let Some((oldest_ip, _)) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_seen_ms)
+                .map(|(ip, entry)| (*ip, entry.last_seen_ms))
+            {
+                self.entries.remove(&oldest_ip);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "ipv6")]
+struct RateLimiter6 {
+    window_ms: u64,
+    max_hits: u32,
+    start: Instant,
+    entries: HashMap<std::net::Ipv6Addr, RateEntry>,
+}
+
+#[cfg(feature = "ipv6")]
+impl RateLimiter6 {
+    fn new(window_ms: u64, max_hits: u32) -> Self {
+        Self {
+            window_ms,
+            max_hits,
+            start: Instant::now(),
+            entries: HashMap::new(),
+        }
+    }
+
+    fn allow(&mut self, ip: std::net::Ipv6Addr) -> bool {
+        let now_ms = self.start.elapsed().as_millis() as u64;
+        self.allow_at(ip, now_ms)
+    }
+
+    fn allow_at(&mut self, ip: std::net::Ipv6Addr, now_ms: u64) -> bool {
         self.cleanup(now_ms);
         let entry = self.entries.entry(ip).or_insert(RateEntry {
             window_start_ms: now_ms,

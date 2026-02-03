@@ -1,14 +1,14 @@
-use std::sync::{Arc, Mutex, OnceLock};
+use crossbeam_queue::SegQueue;
+use std::sync::{Arc, OnceLock};
 
 static GLOBAL_BUFFER_POOL: OnceLock<BufferPool> = OnceLock::new();
 
 /// Gets the global buffer pool instance.
-/// Pool is initialized on first access with 16KB buffers and max 256 buffers.
+/// Pool is initialized on first access with 16KB buffers.
 pub fn global_pool() -> &'static BufferPool {
     GLOBAL_BUFFER_POOL.get_or_init(|| {
         const BLOCK_SIZE: usize = 16384;
-        const MAX_BUFFERS: usize = 256;
-        BufferPool::new(BLOCK_SIZE, MAX_BUFFERS)
+        BufferPool::new(BLOCK_SIZE)
     })
 }
 
@@ -19,19 +19,14 @@ pub fn global_pool() -> &'static BufferPool {
 /// from a global pool, reducing GC pressure and improving throughput.
 #[derive(Clone)]
 pub struct BufferPool {
-    inner: Arc<Mutex<BufferPoolInner>>,
-}
-
-struct BufferPoolInner {
-    buffers: Vec<Vec<u8>>,
+    queue: Arc<SegQueue<Vec<u8>>>,
     buffer_size: usize,
-    max_buffers: usize,
 }
 
 /// RAII wrapper for a pooled buffer. Returns buffer to pool on drop.
 pub struct PooledBuffer {
     data: Option<Vec<u8>>,
-    pool: Arc<Mutex<BufferPoolInner>>,
+    pool: BufferPool,
 }
 
 impl BufferPool {
@@ -39,58 +34,40 @@ impl BufferPool {
     ///
     /// # Arguments
     /// * `buffer_size` - Size of each buffer (typically 16KB for blocks)
-    /// * `max_buffers` - Maximum number of buffers to keep in pool
-    pub fn new(buffer_size: usize, max_buffers: usize) -> Self {
+    pub fn new(buffer_size: usize) -> Self {
         BufferPool {
-            inner: Arc::new(Mutex::new(BufferPoolInner {
-                buffers: Vec::with_capacity(max_buffers),
-                buffer_size,
-                max_buffers,
-            })),
+            queue: Arc::new(SegQueue::new()),
+            buffer_size,
         }
     }
 
     /// Gets a buffer from the pool, or allocates a new one if pool is empty.
     ///
-    /// This method blocks on the pool mutex. For network threads that need
-    /// non-blocking behavior, use `try_get()` instead.
+    /// This method is lock-free. Use `try_get()` if you want to avoid
+    /// allocating a new buffer when the pool is empty.
     pub fn get(&self) -> PooledBuffer {
-        let mut inner = self.inner.lock().unwrap();
-        let data = inner.buffers.pop().unwrap_or_else(|| Vec::with_capacity(inner.buffer_size));
+        let data = self.queue.pop().unwrap_or_else(|| Vec::with_capacity(self.buffer_size));
 
         PooledBuffer {
             data: Some(data),
-            pool: self.inner.clone(),
+            pool: self.clone(),
         }
     }
 
-    /// Attempts to get a buffer from the pool without blocking.
+    /// Attempts to get a buffer from the pool without allocating.
     ///
-    /// Returns None if the pool mutex cannot be acquired immediately.
-    /// This prevents network threads from blocking on buffer allocation
-    /// during high contention scenarios.
     pub fn try_get(&self) -> Option<PooledBuffer> {
-        let mut inner = self.inner.try_lock().ok()?;
-        let data = inner.buffers.pop().unwrap_or_else(|| Vec::with_capacity(inner.buffer_size));
+        let data = self.queue.pop()?;
 
         Some(PooledBuffer {
             data: Some(data),
-            pool: self.inner.clone(),
+            pool: self.clone(),
         })
     }
 
-    /// Returns a buffer to the pool.
-    fn return_buffer(&self, mut buffer: Vec<u8>) {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.buffers.len() < inner.max_buffers {
-            buffer.clear();
-            inner.buffers.push(buffer);
-        }
-    }
-
-    /// Returns the number of buffers currently in the pool.
+    /// Returns the number of buffers currently in the pool (approximate).
     pub fn size(&self) -> usize {
-        self.inner.lock().unwrap().buffers.len()
+        self.queue.len()
     }
 }
 
@@ -120,11 +97,9 @@ impl PooledBuffer {
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
         if let Some(data) = self.data.take() {
-            let pool = self.pool.lock().unwrap();
-            if pool.buffers.len() < pool.max_buffers {
-                drop(pool);
-                BufferPool { inner: self.pool.clone() }.return_buffer(data);
-            }
+            let mut data = data;
+            data.clear();
+            self.pool.queue.push(data);
         }
     }
 }
@@ -135,7 +110,7 @@ mod tests {
 
     #[test]
     fn test_buffer_pool_reuse() {
-        let pool = BufferPool::new(1024, 10);
+        let pool = BufferPool::new(1024);
 
         {
             let mut buf = pool.get();
@@ -149,21 +124,8 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_pool_max_size() {
-        let pool = BufferPool::new(1024, 2);
-
-        {
-            let _buf1 = pool.get();
-            let _buf2 = pool.get();
-            let _buf3 = pool.get();
-        }
-
-        assert_eq!(pool.size(), 2);
-    }
-
-    #[test]
     fn test_buffer_take() {
-        let pool = BufferPool::new(1024, 10);
+        let pool = BufferPool::new(1024);
 
         let mut buf = pool.get();
         buf.as_mut().extend_from_slice(&[1, 2, 3]);

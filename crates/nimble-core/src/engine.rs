@@ -12,6 +12,15 @@ const TICK_INTERVAL_MS: u64 = 20;
 const STATS_UPDATE_INTERVAL_MS: u64 = 1000;
 const COMMAND_CHANNEL_SIZE: usize = 128;
 
+#[cfg(windows)]
+fn to_wide_null(s: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct EngineHandle {
     pub tx: CommandSender,
@@ -148,7 +157,7 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
 
                                     // Use "explore" verb instead of "open" to prevent executing files
                                     // "explore" always opens a folder view, never executes files
-                                    let verb_wide: Vec<u16> = "explore\0".encode_utf16().collect();
+                                    let verb_wide = to_wide_null("explore");
 
                                     let result = ShellExecuteW(
                                         0,
@@ -240,4 +249,16 @@ pub fn start(settings: EngineSettings) -> Result<(EngineHandle, EventReceiver)> 
     });
 
     Ok((EngineHandle { tx: cmd_tx }, evt_rx))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::to_wide_null;
+
+    #[test]
+    fn to_wide_null_appends_single_terminator() {
+        let buf = to_wide_null("explore");
+        assert_eq!(buf.last().copied(), Some(0));
+        assert_eq!(buf.len(), "explore".encode_utf16().count() + 1);
+    }
 }

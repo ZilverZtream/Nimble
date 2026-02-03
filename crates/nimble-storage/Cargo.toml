@@ -10,12 +10,19 @@ default = []
 cache = []
 prealloc = []
 
-        [dependencies]
-        anyhow = { workspace = true }
-        thiserror = { workspace = true }
-        nimble-util = { path = "../nimble-util" }
-        nimble-bencode = { path = "../nimble-bencode" }
-        sha1 = { workspace = true }
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+nimble-util = { path = "../nimble-util" }
+nimble-bencode = { path = "../nimble-bencode" }
+sha1 = { workspace = true }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }
 
         [dev-dependencies]
         tempfile = { workspace = true }

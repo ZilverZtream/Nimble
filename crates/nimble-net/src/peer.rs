@@ -299,15 +299,14 @@ impl PeerMessage {
                 let begin = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
 
                 // Use buffer pool for piece data to reduce allocations.
-                // Use try_get() to avoid blocking the network thread.
-                // If buffer pool is under contention, allocate directly to maintain forward progress.
+                // Use try_get() to avoid allocating when the pool is empty.
                 let block = match nimble_storage::buffer_pool::global_pool().try_get() {
                     Some(mut pooled_buf) => {
                         pooled_buf.as_mut().extend_from_slice(&data[9..]);
                         pooled_buf.take()
                     }
                     None => {
-                        // Pool mutex is contended, allocate directly to avoid blocking
+                        // Pool is empty, allocate directly to maintain forward progress.
                         data[9..].to_vec()
                     }
                 };
